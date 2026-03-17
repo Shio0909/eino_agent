@@ -1,0 +1,367 @@
+# ===========================================
+# Eino RAG Agent - Docker Compose
+# ===========================================
+# 架构：主服务 (app) + 卫星服务
+#
+# 服务拆分（参考 WeKnora 架构）：
+#   核心服务：   app, postgres, redis
+#   文档解析：   docreader (复用 WeKnora 镜像), minio
+#   重排序：     reranker (本地 Cross-Encoder 模型)
+#   可观测性：   jaeger (分布式链路追踪)
+#   前端 UI：    frontend (Nginx + Chat UI)
+#
+# 启动方式：
+#   make up             - 核心服务 (app + postgres + redis)
+#   make up-full        - 全部服务
+#   make up-frontend    - 核心 + 前端 UI
+#   make up-docreader   - 核心 + 文档解析 (docreader + minio)
+#
+# 默认端口：
+#   80    - 前端 UI (Nginx)
+#   8080  - 后端 API (Go/Gin)
+#   5432  - PostgreSQL + pgvector
+#   6379  - Redis
+#   50051 - DocReader (gRPC)
+#   8100  - Reranker (HTTP)
+#   9000  - MinIO API / 9001 - MinIO Console
+#   16686 - Jaeger UI
+
+services:
+  # ===========================================
+  # Frontend (React + Vite)
+  # ===========================================
+  frontend:
+    build:
+      context: ./frontend-react
+    container_name: eino-rag-frontend
+    ports:
+      - "${FRONTEND_PORT:-80}:80"
+    environment:
+      - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-50}
+      - MAX_FILE_SIZE=${MAX_FILE_SIZE:-50m}
+      - APP_HOST=${APP_HOST:-app}
+      - APP_PORT=${APP_BACKEND_PORT:-8080}
+      - APP_SCHEME=${APP_SCHEME:-http}
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - eino-network
+    restart: unless-stopped
+    profiles:
+      - frontend
+      - full
+
+  # ===========================================
+  # App - Eino RAG 主服务 (Go Backend)
+  # 【核心】Eino Graph 编排 + ReAct Agent + Agentic RAG
+  # ===========================================
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app
+    container_name: eino-rag-app
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    environment:
+      - GIN_MODE=${GIN_MODE:-release}
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8080
+      # Auth
+      - AUTH_ENABLED=${AUTH_ENABLED:-false}
+      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+      - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-120}
+      - ADMIN_TENANT_ID=${ADMIN_TENANT_ID:-1}
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
+      - USER_TENANT_ID=${USER_TENANT_ID:-1}
+      - USER_USERNAME=${USER_USERNAME:-user}
+      - USER_PASSWORD=${USER_PASSWORD:-user123}
+      # Database
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=${DB_USER:-eino}
+      - DB_PASSWORD=${DB_PASSWORD:-eino123}
+      - DB_NAME=${DB_NAME:-eino_rag}
+      - DB_SSLMODE=disable
+      # Redis
+      - REDIS_ADDR=redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      # LLM (支持 OpenAI 兼容接口: DeepSeek, 智谱, Kimi, Ollama 等)
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+      # Embedding
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-openai}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-small}
+      - EMBEDDING_BASE_URL=${EMBEDDING_BASE_URL:-}
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-}
+      # Reranker (Jina API 或本地 reranker 服务)
+      - RERANKER_ENABLED=${RERANKER_ENABLED:-true}
+      - RERANKER_PROVIDER=${RERANKER_PROVIDER:-jina}
+      - RERANKER_BASE_URL=${RERANKER_BASE_URL:-https://api.jina.ai}
+      - RERANKER_API_KEY=${RERANKER_API_KEY:-}
+      - RERANKER_MODEL=${RERANKER_MODEL:-jina-reranker-v2-base-multilingual}
+      - JINA_API_KEY=${JINA_API_KEY:-}
+      # DocReader (gRPC 文档解析) - 默认启用，连接宿主机的 WeKnora-docreader
+      - DOCREADER_ENABLED=${DOCREADER_ENABLED:-true}
+      - DOCREADER_ADDR=${DOCREADER_ADDR:-host.docker.internal:50051}
+      # MinIO (对象存储)
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-minioadmin}
+      - MINIO_BUCKET=${MINIO_BUCKET:-eino-files}
+      # MCP (Model Context Protocol)
+      - MCP_ENABLED=${MCP_ENABLED:-false}
+      # Web Search
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      # Agentic RAG (Graph 有环编排)
+      - AGENTIC_RAG_ENABLED=${AGENTIC_RAG_ENABLED:-true}
+      # GraphRAG (Neo4j 知识图谱增强检索)
+      - NEO4J_ENABLE=${NEO4J_ENABLE:-false}
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USERNAME=${NEO4J_USERNAME:-neo4j}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-password}
+      # Ollama (本地 LLM)
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    volumes:
+      - app-data:/app/data
+      - ./configs:/app/configs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - eino-network
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ===========================================
+  # PostgreSQL + pgvector (向量数据库)
+  # ===========================================
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: eino-rag-postgres
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    environment:
+      - POSTGRES_USER=${DB_USER:-eino}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-eino123}
+      - POSTGRES_DB=${DB_NAME:-eino_rag}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-eino} -d ${DB_NAME:-eino_rag}"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - eino-network
+    restart: unless-stopped
+    stop_grace_period: 1m
+
+  # ===========================================
+  # Redis (会话管理 & 缓存 & Memory)
+  # ===========================================
+  redis:
+    image: redis:7-alpine
+    container_name: eino-rag-redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    command: >
+      redis-server
+      --appendonly yes
+      ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - eino-network
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: eino-rag-rabbitmq
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    networks:
+      - eino-network
+    restart: unless-stopped
+
+  # ===========================================
+  # DocReader (Python gRPC - 文档解析/OCR)
+  # 【复用 WeKnora】直接拉取 WeKnora 官方镜像
+  # 支持: PDF, Word, Excel, PPT, Markdown, HTML, 图片 OCR
+  # ===========================================
+  docreader:
+    image: wechatopenai/weknora-docreader:${WEKNORA_VERSION:-latest}
+    container_name: eino-rag-docreader
+    ports:
+      - "${DOCREADER_PORT:-50051}:50051"
+    environment:
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_PUBLIC_ENDPOINT=http://localhost:${MINIO_PORT:-9000}
+      - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-50}
+    healthcheck:
+      test: ["CMD", "grpc_health_probe", "-addr=:50051"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - eino-network
+    restart: unless-stopped
+    profiles:
+      - docreader
+      - full
+
+  # ===========================================
+  # Reranker (Python FastAPI - 重排序微服务)
+  # 本地部署 Cross-Encoder 模型，替代 Jina API
+  # 参考 WeKnora rerank_server_demo.py
+  # ===========================================
+  reranker:
+    build:
+      context: ./docker/reranker
+    container_name: eino-rag-reranker
+    ports:
+      - "${RERANKER_PORT:-8100}:8100"
+    environment:
+      - MODEL_PATH=${RERANKER_MODEL_PATH:-BAAI/bge-reranker-v2-m3}
+      - DEVICE=${RERANKER_DEVICE:-cpu}
+    volumes:
+      - reranker-models:/root/.cache
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8100/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    networks:
+      - eino-network
+    restart: unless-stopped
+    profiles:
+      - reranker
+      - full
+
+  # ===========================================
+  # MinIO (Object Storage - 文件/文档存储)
+  # ===========================================
+  minio:
+    image: minio/minio:latest
+    container_name: eino-rag-minio
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ACCESS_KEY:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_SECRET_KEY:-minioadmin}
+    command: server --console-address ":9001" /data
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - eino-network
+    restart: unless-stopped
+    profiles:
+      - minio
+      - docreader
+      - full
+
+  # ===========================================
+  # Neo4j (GraphRAG - 知识图谱增强检索)
+  # 【GraphRAG 核心】存储实体-关系图谱，支持实体关系类检索
+  # 参考 WeKnora 架构，使用 APOC 插件实现批量 merge/delete
+  # ===========================================
+  neo4j:
+    image: neo4j:2025.10.1
+    container_name: eino-rag-neo4j
+    ports:
+      - "${NEO4J_HTTP_PORT:-7474}:7474"
+      - "${NEO4J_BOLT_PORT:-7687}:7687"
+    environment:
+      - NEO4J_AUTH=${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-password}
+      - NEO4J_apoc_export_file_enabled=true
+      - NEO4J_apoc_import_file_enabled=true
+      - NEO4J_apoc_import_file_use__neo4j__config=true
+      - NEO4JLABS_PLUGINS=["apoc"]
+    volumes:
+      - neo4j-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - eino-network
+    restart: unless-stopped
+    profiles:
+      - neo4j
+      - graphrag
+      - full
+
+  # ===========================================
+  # Jaeger (分布式链路追踪)
+  # ===========================================
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    container_name: eino-rag-jaeger
+    ports:
+      - "16686:16686"   # Web UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    volumes:
+      - jaeger-data:/var/lib/jaeger
+    networks:
+      - eino-network
+    restart: unless-stopped
+    profiles:
+      - jaeger
+      - full
+
+networks:
+  eino-network:
+    driver: bridge
+
+volumes:
+  app-data:
+  postgres-data:
+  redis-data:
+  rabbitmq-data:
+  minio-data:
+  reranker-models:
+  jaeger-data:
+  neo4j-data:

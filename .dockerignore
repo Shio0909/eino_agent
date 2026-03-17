@@ -1,0 +1,35 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Build artifacts
+bin/
+*.exe
+*.out
+
+# Test
+*_test.go
+coverage.out
+
+# Documentation
+*.md
+ai_docs/
+# Note: docs/ is NOT ignored — it contains generated Swagger files needed at build time
+
+# WeKnora reference (don't copy to Docker image)
+WeKnora/
+
+# Environment files (secrets!)
+.env
+.env.local
+
+# Temporary files
+tmp/
+*.tmp
+*.log

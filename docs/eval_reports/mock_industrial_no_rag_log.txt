@@ -1,0 +1,16 @@
+[eval] No-RAG baseline 模式：LLM 将不依赖检索结果回答
+[eval] 检索策略已切换为: vector
+[eval] mock-01 ok latency=116962ms recall=0.000 hit=0
+[eval] mock-02 ok latency=21525ms recall=0.000 hit=0
+[eval] mock-03 ok latency=25562ms recall=0.000 hit=0
+[eval] mock-04 ok latency=20741ms recall=0.000 hit=0
+[eval] mock-05 ok latency=91573ms recall=0.000 hit=0
+[eval] mock-06 ok latency=46816ms recall=0.000 hit=0
+[eval] mock-07 ok latency=52594ms recall=0.000 hit=0
+========================================
+Eino RAG Eval
+========================================
+mode: pipeline
+strategy: vector
+samples: 7
+report: docs/eval_reports/benchmark_mock_industrial_no_rag.md

@@ -1,0 +1,4 @@
+
+[1/12] Running: mode=pipeline strategy=vector
+  Report: docs/eval_reports/benchmark_pipeline_vector.md
+  Started: 19:51:24

@@ -1,0 +1,51 @@
+# 环境配置
+.env
+.env.*
+configs/config.yaml
+
+# AI 文档（面试材料、架构分析等）
+ai_docs/
+
+# 依赖
+node_modules/
+
+# 构建产物
+server
+server.exe
+*.exe
+*.exe~
+dist/
+frontend-react/dist/
+eino-rag
+
+# 数据目录
+data/
+*.db
+
+# 测试文件
+test_upload.*
+.tmp_*
+nul
+
+# 截图/临时图片
+*.png
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+
+# Docker
+docker-compose.override.yml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+*.tmp
+*.log

@@ -1,0 +1,294 @@
+// Package graphrag - 图抽取器
+//
+// 【核心流程】文档 Chunk → LLM 抽取实体和关系 → 解析 JSON → 存入 Neo4j
+//
+// 参考 WeKnora:
+// - internal/application/service/chat_pipline/extract_entity.go (Extractor/Formater)
+// - internal/application/service/graph.go (BuildGraph 批量抽取)
+package graphrag
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"regexp"
+	"strings"
+
+	"github.com/cloudwego/eino/components/model"
+	"github.com/cloudwego/eino/schema"
+)
+
+// ── Prompt 模板 ──
+
+// 实体和关系抽取 Prompt（参考 WeKnora config/config.yaml extract_graph.description）
+const extractGraphPrompt = `请基于给定文本，按以下步骤完成信息提取任务，确保逻辑清晰、信息完整准确：
+
+## 一、实体提取与属性补充
+1. **提取核心实体**：通读文本，按逻辑顺序提取所有核心实体（人物、组织、概念、技术、地点等）。
+2. **补充实体属性**：针对每个实体，补充文本中明确提及的属性信息。
+
+## 二、关系提取与验证
+1. **提取有效关系**：基于已提取的实体，识别文本中真实存在的关系，确保关系符合文本事实。
+2. **明确关系类型**：使用简洁的关系类型标签，如"作者"、"属于"、"包含"、"使用"等。
+3. **明确关系主体**：对每组关系，清晰标注两个关联实体。
+
+## 输出格式
+以 JSON 数组格式输出，每个元素为以下两种之一：
+
+实体格式：
+{"entity": "实体名称", "entity_attributes": ["属性1", "属性2"]}
+
+关系格式：
+{"entity1": "源实体", "entity2": "目标实体", "relation": "关系类型"}
+
+## 示例
+
+Q: 《红楼梦》，又名《石头记》，是清代作家曹雪芹创作的中国古典四大名著之一。
+
+A: ` + "```json" + `
+[
+  {"entity": "红楼梦", "entity_attributes": ["中国古典四大名著之一", "又名《石头记》"]},
+  {"entity": "石头记", "entity_attributes": ["《红楼梦》的别名"]},
+  {"entity": "曹雪芹", "entity_attributes": ["清代作家"]},
+  {"entity1": "红楼梦", "entity2": "曹雪芹", "relation": "作者"},
+  {"entity1": "红楼梦", "entity2": "石头记", "relation": "别名"}
+]
+` + "```"
+
+// 查询时实体抽取 Prompt（参考 WeKnora extract_entity.description）
+const extractEntityPrompt = `请基于用户给的问题，按以下步骤处理关键信息提取任务：
+1. 梳理逻辑关联：分析问题内容，明确核心逻辑关系；
+2. 提取关键实体：围绕核心逻辑，精准提取问题中的关键实体；
+3. 排序实体优先级：按与核心问题的关联程度排序。
+
+## 输出格式
+以 JSON 数组格式输出实体列表：
+
+` + "```json" + `
+[
+  {"entity": "实体1"},
+  {"entity": "实体2"}
+]
+` + "```" + `
+
+## 示例
+
+Q: 《红楼梦》的作者是谁？
+A: ` + "```json" + `
+[
+  {"entity": "红楼梦"},
+  {"entity": "作者"}
+]
+` + "```"
+
+// ── Extractor 实体/关系抽取器 ──
+
+// Extractor 从文本中抽取实体和关系
+type Extractor struct {
+	chatModel model.ChatModel
+	temp      float64
+}
+
+// NewExtractor 创建抽取器
+func NewExtractor(chatModel model.ChatModel, temperature float64) *Extractor {
+	if temperature <= 0 {
+		temperature = 0.1 // 低温度保证抽取一致性
+	}
+	return &Extractor{chatModel: chatModel, temp: temperature}
+}
+
+// ExtractFromChunk 从文档 Chunk 中抽取实体和关系
+func (e *Extractor) ExtractFromChunk(ctx context.Context, content string) (*GraphData, error) {
+	if content == "" {
+		return &GraphData{}, nil
+	}
+
+	messages := []*schema.Message{
+		{Role: schema.System, Content: extractGraphPrompt},
+		{Role: schema.User, Content: content},
+	}
+
+	resp, err := e.chatModel.Generate(ctx, messages,
+		model.WithTemperature(float32(e.temp)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("LLM 实体抽取失败: %w", err)
+	}
+
+	graph, err := ParseGraphJSON(resp.Content)
+	if err != nil {
+		log.Printf("[GraphRAG] 解析抽取结果失败: %v, 原始响应: %s", err, truncateStr(resp.Content, 200))
+		return &GraphData{}, nil // 解析失败不中断流程
+	}
+
+	return graph, nil
+}
+
+// ExtractEntitiesFromQuery 从用户查询中抽取实体名称列表
+func (e *Extractor) ExtractEntitiesFromQuery(ctx context.Context, query string) ([]string, error) {
+	messages := []*schema.Message{
+		{Role: schema.System, Content: extractEntityPrompt},
+		{Role: schema.User, Content: fmt.Sprintf("# Question\nQ: %s\nA: ", query)},
+	}
+
+	resp, err := e.chatModel.Generate(ctx, messages,
+		model.WithTemperature(float32(e.temp)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("LLM 实体抽取失败: %w", err)
+	}
+
+	return parseEntityNames(resp.Content), nil
+}
+
+// ── JSON 解析器 ──
+// 参考 WeKnora: Formater.ParseGraph / Formater.parseOutput
+
+var fenceRE = regexp.MustCompile("```(?:[A-Za-z0-9_+-]+)?\\s*\\n?([\\s\\S]*?)```")
+
+// ParseGraphJSON 解析 LLM 返回的 JSON 抽取结果
+func ParseGraphJSON(text string) (*GraphData, error) {
+	content := extractJSONContent(text)
+	if content == "" {
+		return nil, fmt.Errorf("未找到有效 JSON 内容")
+	}
+
+	var items []map[string]interface{}
+	if err := json.Unmarshal([]byte(content), &items); err != nil {
+		return nil, fmt.Errorf("JSON 解析失败: %w", err)
+	}
+
+	var nodes []*GraphNode
+	var relations []*GraphRelation
+
+	for _, item := range items {
+		if entity, ok := item["entity"]; ok {
+			// 实体
+			attrs := extractStringArray(item["entity_attributes"])
+			nodes = append(nodes, &GraphNode{
+				Name:       fmt.Sprintf("%v", entity),
+				Attributes: attrs,
+			})
+		} else if e1, ok1 := item["entity1"]; ok1 {
+			if e2, ok2 := item["entity2"]; ok2 {
+				// 关系
+				relType := "RELATED_TO"
+				if r, ok := item["relation"]; ok {
+					relType = fmt.Sprintf("%v", r)
+				}
+				relations = append(relations, &GraphRelation{
+					Node1: fmt.Sprintf("%v", e1),
+					Node2: fmt.Sprintf("%v", e2),
+					Type:  relType,
+				})
+			}
+		}
+	}
+
+	graph := &GraphData{Node: nodes, Relation: relations}
+	rebuildGraph(graph)
+	return graph, nil
+}
+
+// parseEntityNames 从 LLM 响应中解析实体名称列表
+func parseEntityNames(text string) []string {
+	content := extractJSONContent(text)
+	if content == "" {
+		return nil
+	}
+
+	var items []map[string]interface{}
+	if err := json.Unmarshal([]byte(content), &items); err != nil {
+		return nil
+	}
+
+	var names []string
+	for _, item := range items {
+		if name, ok := item["entity"]; ok {
+			names = append(names, fmt.Sprintf("%v", name))
+		} else if name, ok := item["name"]; ok {
+			names = append(names, fmt.Sprintf("%v", name))
+		}
+	}
+	return names
+}
+
+// extractJSONContent 从可能带 code fence 的文本中提取 JSON 内容
+func extractJSONContent(text string) string {
+	// 尝试从 ```json ... ``` 中提取
+	matches := fenceRE.FindAllStringSubmatch(text, -1)
+	if len(matches) > 0 {
+		return strings.TrimSpace(matches[0][1])
+	}
+
+	// 尝试直接解析
+	text = strings.TrimSpace(text)
+	if strings.HasPrefix(text, "[") || strings.HasPrefix(text, "{") {
+		return text
+	}
+
+	return ""
+}
+
+// rebuildGraph 清理图数据：去重节点、修复缺失节点
+// 参考 WeKnora: Formater.rebuildGraph
+func rebuildGraph(graph *GraphData) {
+	nodeMap := make(map[string]*GraphNode)
+	nodes := make([]*GraphNode, 0, len(graph.Node))
+	for _, node := range graph.Node {
+		if existing, ok := nodeMap[node.Name]; ok {
+			// 合并属性
+			existing.Attributes = append(existing.Attributes, node.Attributes...)
+			continue
+		}
+		nodeMap[node.Name] = node
+		nodes = append(nodes, node)
+	}
+
+	relations := make([]*GraphRelation, 0, len(graph.Relation))
+	for _, rel := range graph.Relation {
+		if rel.Node1 == rel.Node2 {
+			continue // 跳过自环
+		}
+		// 确保关系的两端节点存在
+		if _, ok := nodeMap[rel.Node1]; !ok {
+			n := &GraphNode{Name: rel.Node1}
+			nodes = append(nodes, n)
+			nodeMap[rel.Node1] = n
+		}
+		if _, ok := nodeMap[rel.Node2]; !ok {
+			n := &GraphNode{Name: rel.Node2}
+			nodes = append(nodes, n)
+			nodeMap[rel.Node2] = n
+		}
+		relations = append(relations, rel)
+	}
+
+	graph.Node = nodes
+	graph.Relation = relations
+}
+
+// extractStringArray 从 interface{} 中提取字符串数组
+func extractStringArray(v interface{}) []string {
+	if v == nil {
+		return nil
+	}
+	arr, ok := v.([]interface{})
+	if !ok {
+		return nil
+	}
+	result := make([]string, 0, len(arr))
+	for _, item := range arr {
+		result = append(result, fmt.Sprintf("%v", item))
+	}
+	return result
+}
+
+func truncateStr(s string, maxLen int) string {
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	return string(runes[:maxLen]) + "..."
+}

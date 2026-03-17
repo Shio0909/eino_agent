@@ -1,0 +1,330 @@
+// Package graphrag - Neo4j Repository 实现
+//
+// 【Cypher 操作】使用 APOC 插件的 merge 语义实现 Upsert，
+// 批量删除使用 apoc.periodic.iterate 防止大事务
+//
+// 参考 WeKnora: internal/application/repository/retriever/neo4j/repository.go
+package graphrag
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
+)
+
+// Neo4jRepository Neo4j 图存储实现
+type Neo4jRepository struct {
+	driver     neo4j.DriverWithContext
+	nodePrefix string
+}
+
+// NewNeo4jRepository 创建 Neo4j Repository
+func NewNeo4jRepository(driver neo4j.DriverWithContext) GraphRepository {
+	return &Neo4jRepository{driver: driver, nodePrefix: "ENTITY"}
+}
+
+// removeHyphen 去除连字符（Neo4j 标签不支持连字符）
+func removeHyphen(s string) string {
+	return strings.ReplaceAll(s, "-", "_")
+}
+
+// Labels 返回命名空间对应的 Neo4j 标签列表
+func (r *Neo4jRepository) Labels(namespace NameSpace) []string {
+	res := make([]string, 0)
+	for _, label := range namespace.Labels() {
+		res = append(res, r.nodePrefix+removeHyphen(label))
+	}
+	return res
+}
+
+// Label 返回命名空间对应的标签表达式（用于 Cypher）
+func (r *Neo4jRepository) Label(namespace NameSpace) string {
+	labels := r.Labels(namespace)
+	return strings.Join(labels, ":")
+}
+
+// AddGraph 将图数据写入 Neo4j
+// 使用 apoc.merge.node / apoc.merge.relationship 实现 Upsert
+func (r *Neo4jRepository) AddGraph(ctx context.Context, namespace NameSpace, graphs []*GraphData) error {
+	if r.driver == nil {
+		log.Println("[GraphRAG] Neo4j 未启用，跳过 AddGraph")
+		return nil
+	}
+	for _, graph := range graphs {
+		if err := r.addGraph(ctx, namespace, graph); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Neo4jRepository) addGraph(ctx context.Context, namespace NameSpace, graph *GraphData) error {
+	session := r.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		// ── 导入节点（使用 apoc.merge.node 实现 Upsert）──
+		nodeImportQuery := `
+			UNWIND $data AS row
+			CALL apoc.merge.node(row.labels, {name: row.name, kg: row.knowledge_id}, row.props, {}) YIELD node
+			SET node.chunks = apoc.coll.union(node.chunks, row.chunks)
+			RETURN distinct 'done' AS result
+		`
+		nodeData := make([]map[string]interface{}, 0, len(graph.Node))
+		for _, node := range graph.Node {
+			nodeData = append(nodeData, map[string]interface{}{
+				"name":         node.Name,
+				"knowledge_id": namespace.Knowledge,
+				"props":        map[string][]string{"attributes": node.Attributes},
+				"chunks":       node.Chunks,
+				"labels":       r.Labels(namespace),
+			})
+		}
+		if len(nodeData) > 0 {
+			if _, err := tx.Run(ctx, nodeImportQuery, map[string]interface{}{"data": nodeData}); err != nil {
+				return nil, fmt.Errorf("创建节点失败: %w", err)
+			}
+		}
+
+		// ── 导入关系（使用 apoc.merge.relationship）──
+		relImportQuery := `
+			UNWIND $data AS row
+			CALL apoc.merge.node(row.source_labels, {name: row.source, kg: row.knowledge_id}, {}, {}) YIELD node as source
+			CALL apoc.merge.node(row.target_labels, {name: row.target, kg: row.knowledge_id}, {}, {}) YIELD node as target
+			CALL apoc.merge.relationship(source, row.type, {}, row.attributes, target) YIELD rel
+			RETURN distinct 'done'
+		`
+		relData := make([]map[string]interface{}, 0, len(graph.Relation))
+		for _, rel := range graph.Relation {
+			relType := rel.Type
+			if relType == "" {
+				relType = "RELATED_TO"
+			}
+			// Neo4j 关系类型不能含空格/特殊字符
+			relType = strings.ReplaceAll(relType, " ", "_")
+			relData = append(relData, map[string]interface{}{
+				"source":        rel.Node1,
+				"target":        rel.Node2,
+				"knowledge_id":  namespace.Knowledge,
+				"type":          relType,
+				"source_labels": r.Labels(namespace),
+				"target_labels": r.Labels(namespace),
+				"attributes":    map[string]interface{}{},
+			})
+		}
+		if len(relData) > 0 {
+			if _, err := tx.Run(ctx, relImportQuery, map[string]interface{}{"data": relData}); err != nil {
+				return nil, fmt.Errorf("创建关系失败: %w", err)
+			}
+		}
+		return nil, nil
+	})
+	if err != nil {
+		log.Printf("[GraphRAG] AddGraph 失败: %v", err)
+		return err
+	}
+	return nil
+}
+
+// DelGraph 删除指定命名空间的图数据
+// 使用 apoc.periodic.iterate 批量删除，避免大事务
+func (r *Neo4jRepository) DelGraph(ctx context.Context, namespaces []NameSpace) error {
+	if r.driver == nil {
+		return nil
+	}
+	session := r.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		for _, namespace := range namespaces {
+			labelExpr := r.Label(namespace)
+
+			// 先删关系
+			deleteRelsQuery := `
+				CALL apoc.periodic.iterate(
+					"MATCH (n:` + labelExpr + ` {kg: $knowledge_id})-[r]-(m:` + labelExpr + ` {kg: $knowledge_id}) RETURN r",
+					"DELETE r",
+					{batchSize: 1000, parallel: true, params: {knowledge_id: $knowledge_id}}
+				) YIELD batches, total
+				RETURN total
+			`
+			if _, err := tx.Run(ctx, deleteRelsQuery, map[string]interface{}{
+				"knowledge_id": namespace.Knowledge,
+			}); err != nil {
+				return nil, fmt.Errorf("删除关系失败: %w", err)
+			}
+
+			// 再删节点
+			deleteNodesQuery := `
+				CALL apoc.periodic.iterate(
+					"MATCH (n:` + labelExpr + ` {kg: $knowledge_id}) RETURN n",
+					"DELETE n",
+					{batchSize: 1000, parallel: true, params: {knowledge_id: $knowledge_id}}
+				) YIELD batches, total
+				RETURN total
+			`
+			if _, err := tx.Run(ctx, deleteNodesQuery, map[string]interface{}{
+				"knowledge_id": namespace.Knowledge,
+			}); err != nil {
+				return nil, fmt.Errorf("删除节点失败: %w", err)
+			}
+		}
+		return nil, nil
+	})
+	if err != nil {
+		log.Printf("[GraphRAG] DelGraph 失败: %v", err)
+		return err
+	}
+	return nil
+}
+
+// SearchNode 根据实体名称列表在 Neo4j 中检索
+// 使用 CONTAINS 匹配，返回匹配节点及其关系和关联的 Chunk IDs
+func (r *Neo4jRepository) SearchNode(
+	ctx context.Context,
+	namespace NameSpace,
+	nodes []string,
+) (*GraphData, error) {
+	if r.driver == nil {
+		return nil, nil
+	}
+	session := r.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
+	defer session.Close(ctx)
+
+	result, err := session.ExecuteRead(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		labelExpr := r.Label(namespace)
+		query := `
+			MATCH (n:` + labelExpr + `)-[r]-(m:` + labelExpr + `)
+			WHERE ANY(nodeText IN $nodes WHERE n.name CONTAINS nodeText)
+			RETURN n, r, m
+		`
+		params := map[string]interface{}{"nodes": nodes}
+		result, err := tx.Run(ctx, query, params)
+		if err != nil {
+			return nil, fmt.Errorf("Cypher 查询失败: %w", err)
+		}
+
+		graphData := &GraphData{}
+		nodeSeen := make(map[string]bool)
+		for result.Next(ctx) {
+			record := result.Record()
+			node, _ := record.Get("n")
+			rel, _ := record.Get("r")
+			targetNode, _ := record.Get("m")
+
+			nodeData := node.(neo4j.Node)
+			targetNodeData := targetNode.(neo4j.Node)
+
+			// 收集节点（去重）
+			for _, n := range []neo4j.Node{nodeData, targetNodeData} {
+				nameStr, _ := n.Props["name"].(string)
+				if nameStr == "" {
+					continue
+				}
+				if !nodeSeen[nameStr] {
+					nodeSeen[nameStr] = true
+					graphData.Node = append(graphData.Node, &GraphNode{
+						Name:       nameStr,
+						Chunks:     listToStrings(n.Props["chunks"]),
+						Attributes: listToStrings(n.Props["attributes"]),
+					})
+				}
+			}
+
+			// 收集关系
+			relData := rel.(neo4j.Relationship)
+			sourceName, _ := nodeData.Props["name"].(string)
+			targetName, _ := targetNodeData.Props["name"].(string)
+			graphData.Relation = append(graphData.Relation, &GraphRelation{
+				Node1: sourceName,
+				Node2: targetName,
+				Type:  relData.Type,
+			})
+		}
+		return graphData, nil
+	})
+	if err != nil {
+		log.Printf("[GraphRAG] SearchNode 失败: %v", err)
+		return nil, err
+	}
+	return result.(*GraphData), nil
+}
+
+// listToStrings 将 Neo4j 返回的 []interface{} 转为 []string
+func listToStrings(v interface{}) []string {
+	if v == nil {
+		return nil
+	}
+	list, ok := v.([]interface{})
+	if !ok {
+		return nil
+	}
+	result := make([]string, 0, len(list))
+	for _, item := range list {
+		result = append(result, fmt.Sprintf("%v", item))
+	}
+	return result
+}
+
+// ── Neo4j 连接工厂 ──
+
+// InitNeo4jDriver 初始化 Neo4j 驱动（带重试）
+// 参考 WeKnora: internal/container/container.go initNeo4jClient
+func InitNeo4jDriver(ctx context.Context) (neo4j.DriverWithContext, error) {
+	if strings.ToLower(os.Getenv("NEO4J_ENABLE")) != "true" {
+		log.Println("[GraphRAG] Neo4j 未启用 (NEO4J_ENABLE != true)")
+		return nil, nil
+	}
+
+	uri := os.Getenv("NEO4J_URI")
+	username := os.Getenv("NEO4J_USERNAME")
+	password := os.Getenv("NEO4J_PASSWORD")
+
+	if uri == "" {
+		uri = "bolt://localhost:7687"
+	}
+	if username == "" {
+		username = "neo4j"
+	}
+	if password == "" {
+		password = "password"
+	}
+
+	maxRetries := 15
+	retryInterval := 2 * time.Second
+
+	var driver neo4j.DriverWithContext
+	var err error
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		driver, err = neo4j.NewDriverWithContext(uri, neo4j.BasicAuth(username, password, ""))
+		if err != nil {
+			log.Printf("[GraphRAG] 创建 Neo4j 驱动失败 (尝试 %d/%d): %v", attempt, maxRetries, err)
+			time.Sleep(retryInterval)
+			continue
+		}
+
+		err = driver.VerifyConnectivity(ctx)
+		if err == nil {
+			if attempt > 1 {
+				log.Printf("[GraphRAG] Neo4j 连接成功 (经过 %d 次尝试)", attempt)
+			} else {
+				log.Printf("[GraphRAG] Neo4j 连接成功: %s", uri)
+			}
+			return driver, nil
+		}
+
+		log.Printf("[GraphRAG] Neo4j 连接验证失败 (尝试 %d/%d): %v", attempt, maxRetries, err)
+		driver.Close(ctx)
+		time.Sleep(retryInterval)
+	}
+
+	return nil, fmt.Errorf("Neo4j 连接失败 (尝试 %d 次): %w", maxRetries, err)
+}
+
+

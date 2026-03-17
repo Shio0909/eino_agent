@@ -1,0 +1,57 @@
+[eval] No-RAG baseline 模式：LLM 将不依赖检索结果回答
+[eval] 检索策略已切换为: vector
+[eval] go-01 ok latency=34913ms recall=0.000 hit=0
+[eval] go-02 ok latency=60073ms recall=0.000 hit=0
+[eval] go-03 ok latency=44644ms recall=0.000 hit=0
+[eval] go-04 ok latency=24686ms recall=0.000 hit=0
+[eval] go-05 ok latency=61203ms recall=0.000 hit=0
+[eval] go-06 ok latency=65022ms recall=0.000 hit=0
+[eval] gin-01 ok latency=33883ms recall=0.000 hit=0
+[eval] gin-02 ok latency=27640ms recall=0.000 hit=0
+[eval] gin-03 ok latency=26577ms recall=0.000 hit=0
+[eval] gin-04 ok latency=32094ms recall=0.000 hit=0
+[eval] gin-05 ok latency=11695ms recall=0.000 hit=0
+[eval] gin-06 ok latency=74752ms recall=0.000 hit=0
+[eval] grpc-01 ok latency=108448ms recall=0.000 hit=0
+[eval] grpc-02 ok latency=71002ms recall=0.000 hit=0
+[eval] grpc-03 ok latency=50661ms recall=0.000 hit=0
+[eval] grpc-04 ok latency=85320ms recall=0.000 hit=0
+[eval] grpc-05 ok latency=57145ms recall=0.000 hit=0
+[eval] grpc-06 ok latency=41213ms recall=0.000 hit=0
+[eval] openapi-01 ok latency=17875ms recall=0.000 hit=0
+[eval] openapi-02 ok latency=151687ms recall=0.000 hit=0
+[eval] openapi-03 ok latency=58273ms recall=0.000 hit=0
+[eval] openapi-04 ok latency=19653ms recall=0.000 hit=0
+[eval] openapi-05 ok latency=43204ms recall=0.000 hit=0
+[eval] openapi-06 ok latency=86872ms recall=0.000 hit=0
+[eval] pg-01 ok latency=38727ms recall=0.000 hit=0
+[eval] pg-02 ok latency=21954ms recall=0.000 hit=0
+[eval] pg-03 ok latency=22665ms recall=0.000 hit=0
+[eval] pg-04 ok latency=18548ms recall=0.000 hit=0
+[eval] pg-05 ok latency=16003ms recall=0.000 hit=0
+[eval] pg-06 ok latency=76386ms recall=0.000 hit=0
+[eval] redis-01 ok latency=60752ms recall=0.000 hit=0
+[eval] redis-02 ok latency=51409ms recall=0.000 hit=0
+[eval] redis-03 ok latency=63426ms recall=0.000 hit=0
+[eval] redis-04 ok latency=14257ms recall=0.000 hit=0
+[eval] redis-05 ok latency=63827ms recall=0.000 hit=0
+[eval] redis-06 ok latency=53383ms recall=0.000 hit=0
+[eval] docker-01 ok latency=89679ms recall=0.000 hit=0
+[eval] docker-02 ok latency=60777ms recall=0.000 hit=0
+[eval] docker-03 ok latency=23110ms recall=0.000 hit=0
+[eval] docker-04 ok latency=61065ms recall=0.000 hit=0
+[eval] docker-05 ok latency=13744ms recall=0.000 hit=0
+[eval] docker-06 ok latency=58909ms recall=0.000 hit=0
+[eval] k8s-01 ok latency=16375ms recall=0.000 hit=0
+[eval] k8s-02 ok latency=24688ms recall=0.000 hit=0
+[eval] k8s-03 ok latency=39526ms recall=0.000 hit=0
+[eval] k8s-04 ok latency=23360ms recall=0.000 hit=0
+[eval] k8s-05 ok latency=43902ms recall=0.000 hit=0
+[eval] k8s-06 ok latency=67407ms recall=0.000 hit=0
+========================================
+Eino RAG Eval
+========================================
+mode: pipeline
+strategy: vector
+samples: 48
+report: docs/eval_reports/benchmark_no_rag_baseline.md

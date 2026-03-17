@@ -1,0 +1,157 @@
+# ===========================================
+# Eino RAG Agent - 开发环境
+# ===========================================
+# 只启动基础设施服务，app 和 frontend 在本地运行
+#
+# 使用方式：
+#   make dev-infra     - 启动基础设施
+#   make dev           - 本地运行 app (连接容器化的 postgres/redis)
+#
+# 本地开发时 app 直接连接容器网络暴露的端口：
+#   PostgreSQL: localhost:5432
+#   Redis:      localhost:6379
+#   MinIO:      localhost:9000
+#   DocReader:  localhost:50051
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: eino-rag-postgres-dev
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    environment:
+      - POSTGRES_USER=${DB_USER:-eino}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-eino123}
+      - POSTGRES_DB=${DB_NAME:-eino_rag}
+    volumes:
+      - postgres-data-dev:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-eino}"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - eino-network-dev
+    restart: unless-stopped
+    stop_grace_period: 1m
+
+  redis:
+    image: redis:7-alpine
+    container_name: eino-rag-redis-dev
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data-dev:/data
+    networks:
+      - eino-network-dev
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: eino-rag-rabbitmq-dev
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq-data-dev:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    networks:
+      - eino-network-dev
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    container_name: eino-rag-minio-dev
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ACCESS_KEY:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_SECRET_KEY:-minioadmin}
+    command: server --console-address ":9001" /data
+    volumes:
+      - minio-data-dev:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - eino-network-dev
+    profiles:
+      - minio
+      - full
+
+  docreader:
+    image: wechatopenai/weknora-docreader:${WEKNORA_VERSION:-latest}
+    container_name: eino-rag-docreader-dev
+    ports:
+      - "${DOCREADER_PORT:-50051}:50051"
+    environment:
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_PUBLIC_ENDPOINT=http://localhost:${MINIO_PORT:-9000}
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - eino-network-dev
+    profiles:
+      - docreader
+      - full
+
+  neo4j:
+    image: neo4j:2025.10.1
+    container_name: eino-rag-neo4j-dev
+    ports:
+      - "${NEO4J_HTTP_PORT:-7474}:7474"
+      - "${NEO4J_BOLT_PORT:-7687}:7687"
+    environment:
+      - NEO4J_AUTH=${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-password}
+      - NEO4J_apoc_export_file_enabled=true
+      - NEO4J_apoc_import_file_enabled=true
+      - NEO4J_apoc_import_file_use__neo4j__config=true
+      - NEO4JLABS_PLUGINS=["apoc"]
+    volumes:
+      - neo4j-data-dev:/data
+    networks:
+      - eino-network-dev
+    profiles:
+      - neo4j
+      - graphrag
+      - full
+
+  reranker:
+    build:
+      context: ./docker/reranker
+    container_name: eino-rag-reranker-dev
+    ports:
+      - "${RERANKER_PORT:-8100}:8100"
+    environment:
+      - MODEL_PATH=${RERANKER_MODEL_PATH:-BAAI/bge-reranker-v2-m3}
+      - DEVICE=cpu
+    volumes:
+      - reranker-models-dev:/root/.cache
+    networks:
+      - eino-network-dev
+    profiles:
+      - reranker
+      - full
+
+networks:
+  eino-network-dev:
+    driver: bridge
+
+volumes:
+  postgres-data-dev:
+  redis-data-dev:
+  rabbitmq-data-dev:
+  minio-data-dev:
+  reranker-models-dev:
+  neo4j-data-dev:

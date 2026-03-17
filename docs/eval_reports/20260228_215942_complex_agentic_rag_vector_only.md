@@ -1,0 +1,43 @@
+# Eino RAG 评测报告
+
+- 时间: 2026-02-28T22:06:36+08:00
+- 模式: agentic_rag
+- 服务: http://127.0.0.1:19093
+- 样本数: 15
+
+## 总体指标
+
+- Recall@K: 0.0000
+- Precision@K: 0.0000
+- Hit@K: 0.0000
+- MRR@K: 0.0000
+- nDCG@K: 0.0000
+- Answer Keyword Rate: 0.6500
+- Avg Latency (ms): 5778.07
+- P50 Latency (ms): 5595
+- P95 Latency (ms): 9886
+- Error Rate: 0.0000
+- Retrieval标注样本: 0
+- Retrieval标注覆盖率: 0.00%
+
+> ⚠️ 当前评测集中未提供 gold_docs，Recall/Precision/Hit/MRR/nDCG 仅为占位值，不可用于检索效果结论。
+
+## 明细
+
+| id | category | latency_ms | recall | precision | hit | mrr | ndcg | answer_kw_rate | retrieval_labeled | status |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| cx_q1 | conflict-current-version | 4022 | 0.000 | 0.000 | 0 | 0.000 | 0.000 | 1.000 | false | ok |
+| cx_q2 | conflict-current-version | 3281 | 0.000 | 0.000 | 0 | 0.000 | 0.000 | 0.500 | false | ok |
+| cx_q3 | version-diff | 7322 | 0.000 | 0.000 | 0 | 0.000 | 0.000 | 1.000 | false | ok |
+| cx_q4 | exception-rule | 2909 | 0.000 | 0.000 | 0 | 0.000 | 0.000 | 0.500 | false | ok |
+| cx_q5 | incident-root-cause | 6842 | 0.000 | 0.000 | 0 | 0.000 | 0.000 | 0.500 | false | ok |
+| cx_q6 | negative-evidence | 9824 | 0.000 | 0.000 | 0 | 0.000 | 0.000 | 0.000 | false | ok |
+| cx_q7 | param-change | 2326 | 0.000 | 0.000 | 0 | 0.000 | 0.000 | 1.000 | false | ok |
+| cx_q8 | runbook-step | 5932 | 0.000 | 0.000 | 0 | 0.000 | 0.000 | 0.000 | false | ok |
+| cx_q9 | api-contract | 3283 | 0.000 | 0.000 | 0 | 0.000 | 0.000 | 0.667 | false | ok |
+| cx_q10 | api-contract | 5595 | 0.000 | 0.000 | 0 | 0.000 | 0.000 | 1.000 | false | ok |
+| cx_q11 | multi-fact | 3427 | 0.000 | 0.000 | 0 | 0.000 | 0.000 | 1.000 | false | ok |
+| cx_q12 | multi-hop-summary | 9794 | 0.000 | 0.000 | 0 | 0.000 | 0.000 | 0.250 | false | ok |
+| cx_q13 | noise-resistance | 7593 | 0.000 | 0.000 | 0 | 0.000 | 0.000 | 0.667 | false | ok |
+| cx_q14 | noise-resistance | 9886 | 0.000 | 0.000 | 0 | 0.000 | 0.000 | 0.667 | false | ok |
+| cx_q15 | multi-hop-current-policy | 4635 | 0.000 | 0.000 | 0 | 0.000 | 0.000 | 1.000 | false | ok |
