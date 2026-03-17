@@ -70,7 +70,7 @@ export interface AgentStep {
   timestamp?: string
 }
 
-export type ChatMode = 'pipeline' | 'agent' | 'agentic_rag'
+export type ChatMode = 'auto' | 'pipeline' | 'agent' | 'agentic_rag'
 
 export interface LLMSettings {
   model: string

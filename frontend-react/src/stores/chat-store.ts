@@ -7,6 +7,7 @@ interface ChatState {
   currentSessionId: string
   messages: Message[]
   mode: ChatMode
+  resolvedMode: string
   streaming: boolean
   streamContent: string
   agentSteps: AgentStep[]
@@ -36,7 +37,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   sessions: [],
   currentSessionId: '',
   messages: [],
-  mode: 'agent',
+  mode: 'auto',
+  resolvedMode: '',
   streaming: false,
   streamContent: '',
   agentSteps: [],
@@ -47,7 +49,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   selectedSkills: ['citation-generator'],
   selectedKBIds: [],
 
-  setMode: (m) => set({ mode: m }),
+  setMode: (m) => set({ mode: m, resolvedMode: '' }),
   setForceCitation: (enabled) => set({ forceCitation: enabled }),
   setEnableSkills: (enabled) => set({ enableSkills: enabled }),
   toggleSkill: (name) =>
@@ -140,6 +142,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         if (evt.type === 'session_id' && evt.session_id) {
           sessionId = evt.session_id
           set({ currentSessionId: sessionId })
+        } else if (evt.type === 'mode_resolved' && (evt as any).resolved_mode) {
+          set({ resolvedMode: (evt as any).resolved_mode })
         } else if (evt.type === 'content' && evt.content) {
           fullContent += evt.content
           set({ streamContent: fullContent })

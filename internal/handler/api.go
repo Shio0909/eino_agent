@@ -325,11 +325,10 @@ func (h *Handler) Chat(c *gin.Context) {
 	}
 
 	// 调用聊天服务
-	useAgent := req.UseAgent || strings.EqualFold(req.Mode, "agent")
 	serviceReq := &service.ChatRequest{
 		Message:          msg,
 		SessionID:        req.SessionID,
-		UseAgent:         useAgent,
+		UseAgent:         req.UseAgent,
 		Mode:             req.Mode,
 		TenantID:         h.getTenantID(c),
 		UserID:           h.getUserID(c),
@@ -387,11 +386,10 @@ func (h *Handler) ChatStream(c *gin.Context) {
 	c.Header("X-Accel-Buffering", "no")
 
 	// 使用流式响应
-	useAgent := req.UseAgent || strings.EqualFold(req.Mode, "agent")
 	serviceReq := &service.ChatRequest{
 		Message:          msg,
 		SessionID:        req.SessionID,
-		UseAgent:         useAgent,
+		UseAgent:         req.UseAgent,
 		Mode:             req.Mode,
 		TenantID:         h.getTenantID(c),
 		UserID:           h.getUserID(c),
