@@ -782,14 +782,14 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 		if dotIdx := strings.LastIndex(header.Filename, "."); dotIdx >= 0 {
 			fileType = strings.ToLower(header.Filename[dotIdx+1:])
 		}
-	// 使用 docreader 解析文件
-	result, err := h.docReaderCli.ParseReader(
-		c.Request.Context(),
-		file,
-		header.Filename,
-		fileType,
-		docreader.DefaultParseOptions(),
-	)
+		// 使用 docreader 解析文件
+		result, err := h.docReaderCli.ParseReader(
+			c.Request.Context(),
+			file,
+			header.Filename,
+			fileType,
+			docreader.DefaultParseOptions(),
+		)
 		if err != nil {
 			h.markKnowledgeFailed(c.Request.Context(), knowledge.ID, 0, err)
 			h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error(), "filename": header.Filename})

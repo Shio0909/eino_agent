@@ -204,8 +204,8 @@ type AgenticRAGConfig struct {
 // DocReaderConfig DocReader 文档解析服务配置
 type DocReaderConfig struct {
 	Enabled     bool   `yaml:"enabled"`
-	Mode        string `yaml:"mode"`        // local, grpc, auto
-	Endpoint    string `yaml:"endpoint"`    // gRPC 地址，如 localhost:50051
+	Mode        string `yaml:"mode"`          // local, grpc, auto
+	Endpoint    string `yaml:"endpoint"`      // gRPC 地址，如 localhost:50051
 	MaxFileSize int64  `yaml:"max_file_size"` // 最大文件大小 (MB)
 
 	// MinIO 配置 (用于存储解析后的图片)
@@ -221,10 +221,10 @@ type DocReaderConfig struct {
 	VLMModel         string `yaml:"vlm_model"`
 
 	// Web URL 解析配置
-	UserAgent             string                 `yaml:"user_agent"`
-	RequestTimeoutSeconds int                    `yaml:"request_timeout_seconds"`
-	MaxDownloadBytes      int64                  `yaml:"max_download_bytes"`
-	RenderMode            string                 `yaml:"render_mode"` // disabled, auto, always
+	UserAgent             string                    `yaml:"user_agent"`
+	RequestTimeoutSeconds int                       `yaml:"request_timeout_seconds"`
+	MaxDownloadBytes      int64                     `yaml:"max_download_bytes"`
+	RenderMode            string                    `yaml:"render_mode"` // disabled, auto, always
 	Playwright            DocReaderPlaywrightConfig `yaml:"playwright"`
 }
 

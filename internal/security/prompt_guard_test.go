@@ -4,11 +4,11 @@ import "testing"
 
 func TestEvaluatePromptRisk(t *testing.T) {
 	tests := []struct {
-		name             string
-		input            string
-		wantLevel        RiskLevel
-		wantBlock        bool
-		wantDisableTools bool
+		name              string
+		input             string
+		wantLevel         RiskLevel
+		wantBlock         bool
+		wantDisableTools  bool
 		wantForceCitation bool
 	}{
 		{
