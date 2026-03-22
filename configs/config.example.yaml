@@ -70,6 +70,16 @@ agent:
         quality_threshold: 0.6
         enable_web_fallback: false
         max_run_steps: 20
+security:
+    prompt_guard:
+        enabled: true
+        block_on_high: true
+        downgrade_on_medium: true
+        force_citation_on_medium: true
+        # 自定义高风险规则（Go regexp 语法），为空则使用内置规则。
+        high_risk_patterns: []
+        # 自定义中风险规则（Go regexp 语法），为空则使用内置规则。
+        medium_risk_patterns: []
 memory:
     enabled: true
     window_size: 8
@@ -80,6 +90,7 @@ memory:
     max_context_chars: 3000
 docreader:
     enabled: true
+    mode: local
     endpoint: localhost:50051
     max_file_size: 50
     minio_endpoint: ""
@@ -90,6 +101,18 @@ docreader:
     vlm_base_url: ""
     vlm_api_key: ""
     vlm_model: ""
+    user_agent: Mozilla/5.0 (compatible; EinoAgent/1.0)
+    request_timeout_seconds: 60
+    max_download_bytes: 10485760
+    render_mode: auto
+    playwright:
+        enabled: false
+        command: node
+        args:
+            - scripts/playwright-docreader.js
+        timeout_seconds: 90
+        wait_until: networkidle
+        max_html_bytes: 2097152
 redis:
     addr: 127.0.0.1:6379
     password: ""

@@ -20,12 +20,39 @@ type Config struct {
 	Database    DatabaseConfig    `yaml:"database"`
 	RAG         RAGConfig         `yaml:"rag"`
 	Agent       AgentConfig       `yaml:"agent"`
+	Security    SecurityConfig    `yaml:"security"`
 	Memory      MemoryConfig      `yaml:"memory"`
 	DocReader   DocReaderConfig   `yaml:"docreader"`
 	Redis       RedisConfig       `yaml:"redis"`
 	ImportQueue ImportQueueConfig `yaml:"import_queue"`
 	MCP         MCPConfig         `yaml:"mcp"`
 	GraphRAG    GraphRAGConfig    `yaml:"graphrag"`
+}
+
+// SecurityConfig 安全策略配置。
+type SecurityConfig struct {
+	PromptGuard PromptGuardConfig `yaml:"prompt_guard"`
+	URLPolicy   URLPolicyConfig   `yaml:"url_policy"`
+}
+
+// URLPolicyConfig URL 导入安全策略。
+type URLPolicyConfig struct {
+	AllowPrivateNetworks bool     `yaml:"allow_private_networks"`
+	AllowedSchemes       []string `yaml:"allowed_schemes"`
+	BlockedHosts         []string `yaml:"blocked_hosts"`
+	AllowedDomains       []string `yaml:"allowed_domains"`
+	BlockedDomains       []string `yaml:"blocked_domains"`
+	MaxRedirects         int      `yaml:"max_redirects"`
+}
+
+// PromptGuardConfig Prompt 注入/越权调用防护配置。
+type PromptGuardConfig struct {
+	Enabled               *bool    `yaml:"enabled"`
+	BlockOnHigh           *bool    `yaml:"block_on_high"`
+	DowngradeOnMedium     *bool    `yaml:"downgrade_on_medium"`
+	ForceCitationOnMedium *bool    `yaml:"force_citation_on_medium"`
+	HighRiskPatterns      []string `yaml:"high_risk_patterns"`
+	MediumRiskPatterns    []string `yaml:"medium_risk_patterns"`
 }
 
 // ImportQueueConfig 异步导入队列配置
@@ -177,7 +204,8 @@ type AgenticRAGConfig struct {
 // DocReaderConfig DocReader 文档解析服务配置
 type DocReaderConfig struct {
 	Enabled     bool   `yaml:"enabled"`
-	Endpoint    string `yaml:"endpoint"`      // gRPC 地址，如 localhost:50051
+	Mode        string `yaml:"mode"`        // local, grpc, auto
+	Endpoint    string `yaml:"endpoint"`    // gRPC 地址，如 localhost:50051
 	MaxFileSize int64  `yaml:"max_file_size"` // 最大文件大小 (MB)
 
 	// MinIO 配置 (用于存储解析后的图片)
@@ -191,6 +219,23 @@ type DocReaderConfig struct {
 	VLMBaseURL       string `yaml:"vlm_base_url"`
 	VLMAPIKey        string `yaml:"vlm_api_key"`
 	VLMModel         string `yaml:"vlm_model"`
+
+	// Web URL 解析配置
+	UserAgent             string                 `yaml:"user_agent"`
+	RequestTimeoutSeconds int                    `yaml:"request_timeout_seconds"`
+	MaxDownloadBytes      int64                  `yaml:"max_download_bytes"`
+	RenderMode            string                 `yaml:"render_mode"` // disabled, auto, always
+	Playwright            DocReaderPlaywrightConfig `yaml:"playwright"`
+}
+
+// DocReaderPlaywrightConfig Playwright 浏览器渲染配置。
+type DocReaderPlaywrightConfig struct {
+	Enabled        bool     `yaml:"enabled"`
+	Command        string   `yaml:"command"`
+	Args           []string `yaml:"args"`
+	TimeoutSeconds int      `yaml:"timeout_seconds"`
+	WaitUntil      string   `yaml:"wait_until"`
+	MaxHTMLBytes   int64    `yaml:"max_html_bytes"`
 }
 
 // RedisConfig Redis 配置
@@ -354,6 +399,32 @@ func setDefaults(cfg *Config) {
 		cfg.Agent.MaxSteps = 10
 	}
 
+	if cfg.Security.PromptGuard.Enabled == nil {
+		v := true
+		cfg.Security.PromptGuard.Enabled = &v
+	}
+	if cfg.Security.PromptGuard.BlockOnHigh == nil {
+		v := true
+		cfg.Security.PromptGuard.BlockOnHigh = &v
+	}
+	if cfg.Security.PromptGuard.DowngradeOnMedium == nil {
+		v := true
+		cfg.Security.PromptGuard.DowngradeOnMedium = &v
+	}
+	if cfg.Security.PromptGuard.ForceCitationOnMedium == nil {
+		v := true
+		cfg.Security.PromptGuard.ForceCitationOnMedium = &v
+	}
+	if len(cfg.Security.URLPolicy.AllowedSchemes) == 0 {
+		cfg.Security.URLPolicy.AllowedSchemes = []string{"http", "https"}
+	}
+	if len(cfg.Security.URLPolicy.BlockedHosts) == 0 {
+		cfg.Security.URLPolicy.BlockedHosts = []string{"localhost", "127.0.0.1", "::1"}
+	}
+	if cfg.Security.URLPolicy.MaxRedirects == 0 {
+		cfg.Security.URLPolicy.MaxRedirects = 5
+	}
+
 	// Memory 默认值
 	if cfg.Memory.WindowSize == 0 {
 		cfg.Memory.WindowSize = 8
@@ -380,6 +451,38 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Agent.AgenticRAG.MaxRunSteps == 0 {
 		cfg.Agent.AgenticRAG.MaxRunSteps = 20
+	}
+
+	// Redis 默认值
+	if cfg.DocReader.Mode == "" {
+		cfg.DocReader.Mode = "auto"
+	}
+	if cfg.DocReader.RequestTimeoutSeconds == 0 {
+		cfg.DocReader.RequestTimeoutSeconds = 60
+	}
+	if cfg.DocReader.MaxDownloadBytes == 0 {
+		cfg.DocReader.MaxDownloadBytes = 10 << 20
+	}
+	if cfg.DocReader.UserAgent == "" {
+		cfg.DocReader.UserAgent = "Mozilla/5.0 (compatible; EinoAgent/1.0)"
+	}
+	if cfg.DocReader.RenderMode == "" {
+		cfg.DocReader.RenderMode = "auto"
+	}
+	if cfg.DocReader.Playwright.TimeoutSeconds == 0 {
+		cfg.DocReader.Playwright.TimeoutSeconds = 90
+	}
+	if cfg.DocReader.Playwright.WaitUntil == "" {
+		cfg.DocReader.Playwright.WaitUntil = "networkidle"
+	}
+	if cfg.DocReader.Playwright.MaxHTMLBytes == 0 {
+		cfg.DocReader.Playwright.MaxHTMLBytes = 2 << 20
+	}
+	if cfg.DocReader.Playwright.Command == "" {
+		cfg.DocReader.Playwright.Command = "node"
+	}
+	if len(cfg.DocReader.Playwright.Args) == 0 {
+		cfg.DocReader.Playwright.Args = []string{"scripts/playwright-docreader.js"}
 	}
 
 	// Redis 默认值

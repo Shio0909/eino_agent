@@ -11,7 +11,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"strings"
 	"time"
 
 	"github.com/cloudwego/eino/components/retriever"
@@ -127,10 +126,10 @@ type RAGRequest struct {
 
 // RAGResponse RAG 响应
 type RAGResponse struct {
-	Answer     string            // 生成的回答
-	Sources    []Source          // 引用来源
-	RewriteQ   string            // 重写后的查询（如果启用）
-	Metadata   map[string]string // 附加元数据
+	Answer   string            // 生成的回答
+	Sources  []Source          // 引用来源
+	RewriteQ string            // 重写后的查询（如果启用）
+	Metadata map[string]string // 附加元数据
 }
 
 // Source 来源信息
@@ -274,36 +273,25 @@ func (p *RAGPipeline) RunStream(ctx context.Context, req *RAGRequest) (<-chan St
 			return
 		}
 
-		// 重排序（与 Run 保持一致）
-		passages := extractPassages(docs)
-		rerankedIdx := make([]int, len(passages))
-		for i := range rerankedIdx {
-			rerankedIdx[i] = i
-		}
-		if p.config.EnableRerank && p.reranker != nil && len(passages) > 0 {
-			idx, rerankErr := p.reranker.Rerank(ctx, query, passages)
-			if rerankErr == nil {
-				rerankedIdx = idx
+		// 发送来源信息
+		for i, doc := range docs {
+			if i >= p.config.RerankTopK {
+				break
+			}
+			ch <- StreamChunk{
+				Type:    ChunkTypeSource,
+				Content: doc.Content,
+				DocID:   doc.ID,
 			}
 		}
 
-		topK := p.config.RerankTopK
-		if topK > len(rerankedIdx) {
-			topK = len(rerankedIdx)
-		}
-
-		// 发送来源信息（按重排序后的顺序）
-		var contextBuilder strings.Builder
-		for i := 0; i < topK; i++ {
-			idx := rerankedIdx[i]
-			if idx < len(docs) {
-				ch <- StreamChunk{
-					Type:    ChunkTypeSource,
-					Content: docs[idx].Content,
-					DocID:   docs[idx].ID,
-				}
-				contextBuilder.WriteString(fmt.Sprintf("[%d] %s\n\n", i+1, docs[idx].Content))
+		// 构建上下文
+		var contextBuilder string
+		for i, doc := range docs {
+			if i >= p.config.RerankTopK {
+				break
 			}
+			contextBuilder += fmt.Sprintf("[%d] %s\n\n", i+1, doc.Content)
 		}
 
 		// 流式生成
@@ -317,7 +305,7 @@ func (p *RAGPipeline) RunStream(ctx context.Context, req *RAGRequest) (<-chan St
 			generationQuery = req.Query + "\n\n" + req.GenerationInstruction
 		}
 
-		stream, err := p.generator.GenerateStream(ctx, generationQuery, contextBuilder.String())
+		stream, err := p.generator.GenerateStream(ctx, generationQuery, contextBuilder)
 		if err != nil {
 			ch <- StreamChunk{Type: ChunkTypeError, Content: err.Error()}
 			return

@@ -21,7 +21,6 @@ package pipeline
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"strings"
 	"time"
@@ -366,7 +365,7 @@ func (p *AgenticRAGPipeline) retrieve(ctx context.Context, query string) (string
 }
 
 // evaluate 评估检索质量
-// 三级评估：规则判断 → 向量分数（<1ms） → LLM 兜底（仅在无分数时）
+// 两级评估：规则判断优先（零延迟），LLM 评估兜底
 func (p *AgenticRAGPipeline) evaluate(ctx context.Context, retrieveOutput string) (string, error) {
 	startTime := time.Now()
 	var docs []*schema.Document
@@ -391,18 +390,13 @@ func (p *AgenticRAGPipeline) evaluate(ctx context.Context, retrieveOutput string
 		score = 0.3
 		log.Printf("[AgenticRAG][Evaluate] 规则判定：文档过少(%d)，score=0.3", len(docs))
 	} else {
-		// ── 向量分数评估（优先，<1ms） ──
-		score = p.scoreBasedEvaluate(docs)
-		if score >= 0 {
-			log.Printf("[AgenticRAG][Evaluate] 向量分数评估: score=%.2f (docs=%d)", score, len(docs))
-		} else {
-			// 向量分数不可用，降级到 LLM 评估
-			var err error
-			score, err = p.llmEvaluate(ctx, currentQuery, docs)
-			if err != nil {
-				log.Printf("[AgenticRAG][Evaluate] LLM 评估失败: %v，使用默认分数 0.5", err)
-				score = 0.5
-			}
+		// ── LLM 评估（兜底，更准确） ──
+		var err error
+		score, err = p.llmEvaluate(ctx, currentQuery, docs)
+		if err != nil {
+			// LLM 评估失败时，给一个中等分数让流程继续
+			log.Printf("[AgenticRAG][Evaluate] LLM 评估失败: %v，使用默认分数 0.5", err)
+			score = 0.5
 		}
 	}
 
@@ -420,46 +414,6 @@ func (p *AgenticRAGPipeline) evaluate(ctx context.Context, retrieveOutput string
 	log.Printf("[AgenticRAG][Evaluate] 最终评估分数: %.2f (阈值: %.2f)", score, threshold)
 	log.Printf("[Timing][AgenticRAG] stage=evaluate duration_ms=%d docs=%d score=%.2f threshold=%.2f", time.Since(startTime).Milliseconds(), len(docs), score, threshold)
 	return retrieveOutput, nil
-}
-
-// scoreBasedEvaluate 基于向量检索分数评估质量（<1ms，零 LLM 调用）
-// 返回 -1 表示文档没有携带分数，需要降级到 LLM 评估
-func (p *AgenticRAGPipeline) scoreBasedEvaluate(docs []*schema.Document) float64 {
-	// 取 top-5 文档的分数
-	limit := 5
-	if len(docs) < limit {
-		limit = len(docs)
-	}
-
-	var sum float64
-	var count int
-	for i := 0; i < limit; i++ {
-		s := docs[i].Score()
-		if s > 0 {
-			sum += s
-			count++
-		}
-	}
-
-	if count == 0 {
-		// 没有任何文档携带分数 → 返回 -1 触发 LLM 降级
-		return -1
-	}
-
-	avg := sum / float64(count)
-
-	// 向量相似度分数通常在 0~1 之间（余弦相似度）
-	// 映射到评估分数：avg >= 0.8 → 高质量, 0.5~0.8 → 中等, < 0.5 → 低质量
-	// 同时考虑 top-1 分数（最相关文档的质量很重要）
-	top1 := docs[0].Score()
-
-	// 加权：60% 平均分 + 40% top-1 分数
-	weighted := avg*0.6 + top1*0.4
-
-	log.Printf("[AgenticRAG][ScoreEval] top1=%.3f avg=%.3f weighted=%.3f (docs_with_score=%d/%d)",
-		top1, avg, weighted, count, limit)
-
-	return weighted
 }
 
 // llmEvaluate 使用 LLM 评估检索结果与查询的相关性
@@ -600,35 +554,23 @@ func (p *AgenticRAGPipeline) Run(ctx context.Context, query string) (*AgenticRAG
 }
 
 // RunStream 流式执行 Agentic RAG
-// 【Eino 特点】使用 Graph 的 Stream 方法实现真正的逐 token 流式输出
 func (p *AgenticRAGPipeline) RunStream(ctx context.Context, query string) (<-chan AgenticStreamEvent, error) {
 	ch := make(chan AgenticStreamEvent, 100)
 
 	go func() {
 		defer close(ch)
 
+		// 目前使用 Invoke 模式，后续可升级为 Stream
+		// TODO: 利用 Eino Graph 的 Stream 能力实现真正的流式输出
 		ch <- AgenticStreamEvent{Type: AgenticEventStatus, Content: "正在分析问题..."}
 
-		reader, err := p.runnable.Stream(ctx, query)
+		answer, err := p.runnable.Invoke(ctx, query)
 		if err != nil {
 			ch <- AgenticStreamEvent{Type: AgenticEventError, Content: err.Error()}
 			return
 		}
-		defer reader.Close()
 
-		for {
-			chunk, err := reader.Recv()
-			if err != nil {
-				if err != io.EOF {
-					ch <- AgenticStreamEvent{Type: AgenticEventError, Content: err.Error()}
-				}
-				break
-			}
-			if chunk != "" {
-				ch <- AgenticStreamEvent{Type: AgenticEventContent, Content: chunk}
-			}
-		}
-
+		ch <- AgenticStreamEvent{Type: AgenticEventContent, Content: answer}
 		ch <- AgenticStreamEvent{Type: AgenticEventDone}
 	}()
 

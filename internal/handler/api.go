@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	einoembedding "github.com/cloudwego/eino/components/embedding"
@@ -28,6 +27,7 @@ import (
 	"eino_agent/internal/importqueue"
 	mcpmanager "eino_agent/internal/mcp"
 	"eino_agent/internal/rediscache"
+	"eino_agent/internal/security"
 	"eino_agent/internal/service"
 )
 
@@ -35,7 +35,6 @@ import (
 type Handler struct {
 	cfg              *config.Config
 	configPath       string
-	cfgMu            sync.RWMutex // 保护 cfg 的并发读写
 	chatService      *service.ChatService
 	embedding        einoembedding.Embedder
 	vectorDB         container.VectorDBProvider
@@ -131,9 +130,6 @@ func NewHandler(
 
 // RegisterRoutes 注册路由
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
-	// 全局中间件
-	r.Use(RequestLogger())
-
 	// 健康检查
 	r.GET("/health", h.HealthCheck)
 
@@ -316,6 +312,12 @@ func (h *Handler) Chat(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "query 或 message 不能为空"})
 		return
 	}
+	decision := h.evaluatePromptRisk(msg)
+	if decision.Block {
+		log.Printf("[Security][Chat] blocked request: level=%s rules=%v", decision.Level, decision.MatchedRules)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求触发安全策略，请调整问题后重试"})
+		return
+	}
 
 	startTime := time.Now()
 	if req.SessionID != "" && h.sessionRepo != nil {
@@ -325,14 +327,22 @@ func (h *Handler) Chat(c *gin.Context) {
 	}
 
 	// 调用聊天服务
+	useAgent := req.UseAgent || strings.EqualFold(req.Mode, "agent")
+	if decision.DisableToolCalls {
+		log.Printf("[Security][Chat] downgrade to pipeline: level=%s rules=%v", decision.Level, decision.MatchedRules)
+		useAgent = false
+		if strings.EqualFold(req.Mode, "agent") || strings.EqualFold(req.Mode, "agentic_rag") {
+			req.Mode = "pipeline"
+		}
+	}
 	serviceReq := &service.ChatRequest{
 		Message:          msg,
 		SessionID:        req.SessionID,
-		UseAgent:         req.UseAgent,
+		UseAgent:         useAgent,
 		Mode:             req.Mode,
 		TenantID:         h.getTenantID(c),
 		UserID:           h.getUserID(c),
-		ForceCitation:    req.ForceCitation,
+		ForceCitation:    req.ForceCitation || decision.ForceCitation,
 		KnowledgeBaseIDs: req.KnowledgeBaseIDs,
 		DocumentIDs:      req.DocumentIDs,
 		EnableLongTerm:   req.EnableLongTerm,
@@ -373,27 +383,42 @@ func (h *Handler) ChatStream(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "query 或 message 不能为空"})
 		return
 	}
+	decision := h.evaluatePromptRisk(msg)
+	if decision.Block {
+		log.Printf("[Security][ChatStream] blocked request: level=%s rules=%v", decision.Level, decision.MatchedRules)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求触发安全策略，请调整问题后重试"})
+		return
+	}
+
+	// 设置 SSE headers
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+
 	if req.SessionID != "" && h.sessionRepo != nil {
 		if _, ok := h.ensureSessionAccess(c, req.SessionID); !ok {
 			return
 		}
 	}
 
-	// 设置 SSE headers（在所有校验通过后）
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Header("X-Accel-Buffering", "no")
-
 	// 使用流式响应
+	useAgent := req.UseAgent || strings.EqualFold(req.Mode, "agent")
+	if decision.DisableToolCalls {
+		log.Printf("[Security][ChatStream] downgrade to pipeline: level=%s rules=%v", decision.Level, decision.MatchedRules)
+		useAgent = false
+		if strings.EqualFold(req.Mode, "agent") || strings.EqualFold(req.Mode, "agentic_rag") {
+			req.Mode = "pipeline"
+		}
+	}
 	serviceReq := &service.ChatRequest{
 		Message:          msg,
 		SessionID:        req.SessionID,
-		UseAgent:         req.UseAgent,
+		UseAgent:         useAgent,
 		Mode:             req.Mode,
 		TenantID:         h.getTenantID(c),
 		UserID:           h.getUserID(c),
-		ForceCitation:    req.ForceCitation,
+		ForceCitation:    req.ForceCitation || decision.ForceCitation,
 		KnowledgeBaseIDs: req.KnowledgeBaseIDs,
 		DocumentIDs:      req.DocumentIDs,
 		EnableLongTerm:   req.EnableLongTerm,
@@ -404,19 +429,8 @@ func (h *Handler) ChatStream(c *gin.Context) {
 		return
 	}
 
-	heartbeat := time.NewTimer(15 * time.Second)
-	defer heartbeat.Stop()
-	ctx := c.Request.Context()
-
 	c.Stream(func(w io.Writer) bool {
-		select {
-		case <-ctx.Done():
-			return false
-		case event, ok := <-ch:
-			if !ok {
-				c.SSEvent("done", gin.H{})
-				return false
-			}
+		if event, ok := <-ch; ok {
 			data := gin.H{"type": event.Type}
 			if event.Content != "" {
 				data["content"] = event.Content
@@ -431,14 +445,10 @@ func (h *Handler) ChatStream(c *gin.Context) {
 				data["doc_id"] = event.DocID
 			}
 			c.SSEvent("message", data)
-			heartbeat.Reset(15 * time.Second)
-			return true
-		case <-heartbeat.C:
-			// SSE heartbeat to prevent proxy timeout
-			c.SSEvent("heartbeat", gin.H{})
-			heartbeat.Reset(15 * time.Second)
 			return true
 		}
+		c.SSEvent("done", gin.H{})
+		return false
 	})
 }
 
@@ -493,6 +503,35 @@ func (h *Handler) toReferences(sources []service.Source) []ReferenceDocument {
 		})
 	}
 	return refs
+}
+
+func (h *Handler) evaluatePromptRisk(input string) security.PromptDecision {
+	guardCfg := security.DefaultGuardConfig()
+	if h == nil || h.cfg == nil {
+		return security.EvaluatePromptRiskWithConfig(input, guardCfg)
+	}
+
+	cfg := h.cfg.Security.PromptGuard
+	if cfg.Enabled != nil {
+		guardCfg.Enabled = *cfg.Enabled
+	}
+	if cfg.BlockOnHigh != nil {
+		guardCfg.BlockOnHigh = *cfg.BlockOnHigh
+	}
+	if cfg.DowngradeOnMedium != nil {
+		guardCfg.DowngradeOnMedium = *cfg.DowngradeOnMedium
+	}
+	if cfg.ForceCitationOnMedium != nil {
+		guardCfg.ForceCitationOnMedium = *cfg.ForceCitationOnMedium
+	}
+	if len(cfg.HighRiskPatterns) > 0 {
+		guardCfg.HighRiskPatterns = cfg.HighRiskPatterns
+	}
+	if len(cfg.MediumRiskPatterns) > 0 {
+		guardCfg.MediumRiskPatterns = cfg.MediumRiskPatterns
+	}
+
+	return security.EvaluatePromptRiskWithConfig(input, guardCfg)
 }
 
 // KnowledgeBaseRequest 知识库请求
@@ -743,14 +782,14 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 		if dotIdx := strings.LastIndex(header.Filename, "."); dotIdx >= 0 {
 			fileType = strings.ToLower(header.Filename[dotIdx+1:])
 		}
-		// 使用 docreader 解析文件
-		result, err := h.docReaderCli.ParseReader(
-			c.Request.Context(),
-			file,
-			header.Filename,
-			fileType,
-			docreader.DefaultParseOptions(),
-		)
+	// 使用 docreader 解析文件
+	result, err := h.docReaderCli.ParseReader(
+		c.Request.Context(),
+		file,
+		header.Filename,
+		fileType,
+		docreader.DefaultParseOptions(),
+	)
 		if err != nil {
 			h.markKnowledgeFailed(c.Request.Context(), knowledge.ID, 0, err)
 			h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error(), "filename": header.Filename})
@@ -842,10 +881,10 @@ func (h *Handler) UploadDocumentURL(c *gin.Context) {
 		return
 	}
 
-	parsedURL, err := url.ParseRequestURI(strings.TrimSpace(req.URL))
-	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
-		h.audit(c, "doc.upload_url", kbID, false, map[string]interface{}{"error": "url 非法", "url": req.URL})
-		c.JSON(http.StatusBadRequest, gin.H{"error": "url 非法，仅支持 http/https"})
+	parsedURL, err := security.ValidateExternalURL(strings.TrimSpace(req.URL), h.cfg.Security.URLPolicy)
+	if err != nil {
+		h.audit(c, "doc.upload_url", kbID, false, map[string]interface{}{"error": err.Error(), "url": req.URL})
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -868,12 +907,6 @@ func (h *Handler) UploadDocumentURL(c *gin.Context) {
 			"knowledge_id": knowledge.ID,
 			"status":       knowledge.ParseStatus,
 		})
-		return
-	}
-
-	if h.docReaderCli == nil {
-		h.audit(c, "doc.upload_url", kbID, false, map[string]interface{}{"error": "docreader 不可用"})
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "docreader 不可用，无法解析 URL"})
 		return
 	}
 
@@ -1831,9 +1864,6 @@ func (h *Handler) DeleteModel(c *gin.Context) {
 // @Success 200 {object} map[string]interface{}
 // @Router /settings [get]
 func (h *Handler) GetSettings(c *gin.Context) {
-	h.cfgMu.RLock()
-	defer h.cfgMu.RUnlock()
-
 	// API Key 脱敏显示
 	maskedAPIKey := ""
 	if k := h.cfg.LLM.APIKey; len(k) > 8 {
@@ -1910,8 +1940,10 @@ func (h *Handler) GetSettings(c *gin.Context) {
 			"server_count": len(h.cfg.MCP.Servers),
 		},
 		"docreader": gin.H{
-			"enabled":  h.cfg.DocReader.Enabled,
-			"endpoint": h.cfg.DocReader.Endpoint,
+			"enabled":     h.cfg.DocReader.Enabled,
+			"mode":        h.cfg.DocReader.Mode,
+			"endpoint":    h.cfg.DocReader.Endpoint,
+			"render_mode": h.cfg.DocReader.RenderMode,
 		},
 		// 前端使用 graph_rag 作为 key
 		"graph_rag": gin.H{
@@ -2025,9 +2057,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-
-	h.cfgMu.Lock()
-	defer h.cfgMu.Unlock()
 
 	changed := []string{}
 

@@ -1,4 +1,3 @@
-// Package docreader 提供文档解析 gRPC 客户端
 package docreader
 
 import (
@@ -7,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -15,92 +15,197 @@ import (
 	pb "eino_agent/internal/docreader/proto"
 )
 
-// Config docreader 客户端配置
+// Config docreader 客户端配置。
 type Config struct {
-	Endpoint    string        // gRPC 服务地址，如 "localhost:50051"
-	Timeout     time.Duration // 请求超时
-	MaxFileSize int64         // 最大文件大小 (bytes)
+	Mode        string
+	Endpoint    string
+	Timeout     time.Duration
+	MaxFileSize int64
 
-	// 默认分块配置
 	ChunkSize    int
 	ChunkOverlap int
 
-	// 多模态配置
 	EnableMultimodal bool
 	VLMBaseURL       string
 	VLMAPIKey        string
 	VLMModel         string
 
-	// MinIO 配置 (用于存储解析后的图片)
 	MinIOEndpoint  string
 	MinIOAccessKey string
 	MinIOSecretKey string
 	MinIOBucket    string
+
+	RenderMode            string
+	UserAgent             string
+	MaxDownloadBytes      int64
+	RequestTimeout        time.Duration
+	MaxRedirects          int
+	AllowPrivateNetworks  bool
+	AllowedDomains        []string
+	BlockedDomains        []string
+	PlaywrightCommand     string
+	PlaywrightArgs        []string
+	PlaywrightTimeout     time.Duration
+	PlaywrightWaitUntil   string
+	PlaywrightMaxHTMLSize int64
 }
 
-// DefaultConfig 返回默认配置
+// DefaultConfig 返回默认配置。
 func DefaultConfig() *Config {
 	return &Config{
-		Endpoint:         "localhost:50051",
-		Timeout:          5 * time.Minute,
-		MaxFileSize:      50 * 1024 * 1024, // 50MB
-		ChunkSize:        500,
-		ChunkOverlap:     50,
-		EnableMultimodal: false,
+		Mode:                  "local",
+		Endpoint:              "localhost:50051",
+		Timeout:               5 * time.Minute,
+		MaxFileSize:           50 * 1024 * 1024,
+		ChunkSize:             500,
+		ChunkOverlap:          50,
+		EnableMultimodal:      false,
+		RenderMode:            "auto",
+		UserAgent:             "Mozilla/5.0 (compatible; EinoAgent/1.0)",
+		MaxDownloadBytes:      10 << 20,
+		RequestTimeout:        60 * time.Second,
+		MaxRedirects:          5,
+		PlaywrightCommand:     "node",
+		PlaywrightArgs:        []string{"scripts/playwright-docreader.js"},
+		PlaywrightTimeout:     90 * time.Second,
+		PlaywrightWaitUntil:   "networkidle",
+		PlaywrightMaxHTMLSize: 2 << 20,
 	}
 }
 
-// Client docreader gRPC 客户端
+// Client docreader 客户端外观。
 type Client struct {
-	conn   *grpc.ClientConn
-	client pb.DocReaderClient
-	config *Config
+	conn       *grpc.ClientConn
+	grpcClient pb.DocReaderClient
+	config     *Config
+	engine     Engine
 }
 
-// NewClient 创建新的 docreader 客户端
+// NewClient 创建新的 docreader 客户端。
 func NewClient(cfg *Config) (*Client, error) {
 	if cfg == nil {
 		cfg = DefaultConfig()
 	}
+	applyConfigDefaults(cfg)
 
-	// 连接 gRPC 服务
+	c := &Client{config: cfg}
+	local := newLocalEngine(cfg)
+
+	switch strings.ToLower(strings.TrimSpace(cfg.Mode)) {
+	case "", "local":
+		c.engine = local
+		return c, nil
+	case "grpc":
+		if err := c.initGRPC(); err != nil {
+			return nil, err
+		}
+		c.engine = newGRPCEngine(c.grpcClient, cfg)
+		return c, nil
+	case "grpc_with_fallback", "auto":
+		if err := c.initGRPC(); err != nil {
+			c.engine = local
+			return c, nil
+		}
+		c.engine = newFallbackEngine(newGRPCEngine(c.grpcClient, cfg), local)
+		return c, nil
+	default:
+		return nil, fmt.Errorf("unsupported docreader mode: %s", cfg.Mode)
+	}
+}
+
+func applyConfigDefaults(cfg *Config) {
+	defaults := DefaultConfig()
+	if cfg.Mode == "" {
+		cfg.Mode = defaults.Mode
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = defaults.Timeout
+	}
+	if cfg.MaxFileSize <= 0 {
+		cfg.MaxFileSize = defaults.MaxFileSize
+	}
+	if cfg.ChunkSize <= 0 {
+		cfg.ChunkSize = defaults.ChunkSize
+	}
+	if cfg.ChunkOverlap < 0 {
+		cfg.ChunkOverlap = defaults.ChunkOverlap
+	}
+	if cfg.UserAgent == "" {
+		cfg.UserAgent = defaults.UserAgent
+	}
+	if cfg.MaxDownloadBytes <= 0 {
+		cfg.MaxDownloadBytes = defaults.MaxDownloadBytes
+	}
+	if cfg.RequestTimeout <= 0 {
+		cfg.RequestTimeout = defaults.RequestTimeout
+	}
+	if cfg.MaxRedirects <= 0 {
+		cfg.MaxRedirects = defaults.MaxRedirects
+	}
+	if cfg.RenderMode == "" {
+		cfg.RenderMode = defaults.RenderMode
+	}
+	if cfg.PlaywrightTimeout <= 0 {
+		cfg.PlaywrightTimeout = defaults.PlaywrightTimeout
+	}
+	if cfg.PlaywrightWaitUntil == "" {
+		cfg.PlaywrightWaitUntil = defaults.PlaywrightWaitUntil
+	}
+	if cfg.PlaywrightMaxHTMLSize <= 0 {
+		cfg.PlaywrightMaxHTMLSize = defaults.PlaywrightMaxHTMLSize
+	}
+	if cfg.PlaywrightCommand == "" && len(cfg.PlaywrightArgs) == 0 {
+		cfg.PlaywrightCommand = defaults.PlaywrightCommand
+		cfg.PlaywrightArgs = append([]string(nil), defaults.PlaywrightArgs...)
+	}
+}
+
+func (c *Client) initGRPC() error {
+	if strings.TrimSpace(c.config.Endpoint) == "" {
+		return fmt.Errorf("docreader grpc endpoint is empty")
+	}
 	conn, err := grpc.NewClient(
-		cfg.Endpoint,
+		c.config.Endpoint,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(int(cfg.MaxFileSize)+1024*1024), // 文件大小 + 1MB 余量
-			grpc.MaxCallSendMsgSize(int(cfg.MaxFileSize)+1024*1024),
+			grpc.MaxCallRecvMsgSize(int(c.config.MaxFileSize)+1024*1024),
+			grpc.MaxCallSendMsgSize(int(c.config.MaxFileSize)+1024*1024),
 		),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("连接 docreader 服务失败: %w", err)
+		return fmt.Errorf("连接 docreader 服务失败: %w", err)
 	}
-
-	return &Client{
-		conn:   conn,
-		client: pb.NewDocReaderClient(conn),
-		config: cfg,
-	}, nil
+	c.conn = conn
+	c.grpcClient = pb.NewDocReaderClient(conn)
+	return nil
 }
 
-// Close 关闭客户端连接
+// Close 关闭客户端连接。
 func (c *Client) Close() error {
+	if c == nil {
+		return nil
+	}
+	if c.engine != nil {
+		if err := c.engine.Close(); err != nil {
+			return err
+		}
+	}
 	if c.conn != nil {
 		return c.conn.Close()
 	}
 	return nil
 }
 
-// ParsedChunk 解析后的文档块
+// ParsedChunk 解析后的文档块。
 type ParsedChunk struct {
-	Content string       `json:"content"`
-	Seq     int          `json:"seq"`
-	Start   int          `json:"start"`
-	End     int          `json:"end"`
-	Images  []ImageInfo  `json:"images,omitempty"`
+	Content string      `json:"content"`
+	Seq     int         `json:"seq"`
+	Start   int         `json:"start"`
+	End     int         `json:"end"`
+	Images  []ImageInfo `json:"images,omitempty"`
 }
 
-// ImageInfo 图片信息
+// ImageInfo 图片信息。
 type ImageInfo struct {
 	URL         string `json:"url"`
 	Caption     string `json:"caption"`
@@ -110,13 +215,13 @@ type ImageInfo struct {
 	End         int    `json:"end"`
 }
 
-// ParseResult 解析结果
+// ParseResult 解析结果。
 type ParseResult struct {
 	Chunks []ParsedChunk `json:"chunks"`
 	Error  string        `json:"error,omitempty"`
 }
 
-// ParseOptions 解析选项
+// ParseOptions 解析选项。
 type ParseOptions struct {
 	ChunkSize        int
 	ChunkOverlap     int
@@ -124,7 +229,7 @@ type ParseOptions struct {
 	EnableMultimodal bool
 }
 
-// DefaultParseOptions 返回默认解析选项
+// DefaultParseOptions 返回默认解析选项。
 func DefaultParseOptions() *ParseOptions {
 	return &ParseOptions{
 		ChunkSize:        500,
@@ -134,83 +239,53 @@ func DefaultParseOptions() *ParseOptions {
 	}
 }
 
-// ParseFile 解析文件
+// ParseFile 解析文件。
 func (c *Client) ParseFile(ctx context.Context, filePath string, opts *ParseOptions) (*ParseResult, error) {
-	if opts == nil {
-		opts = DefaultParseOptions()
-	}
-
-	// 读取文件内容
 	content, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("读取文件失败: %w", err)
 	}
-
-	// 检查文件大小
 	if int64(len(content)) > c.config.MaxFileSize {
 		return nil, fmt.Errorf("文件大小超过限制: %d > %d", len(content), c.config.MaxFileSize)
 	}
-
-	// 获取文件类型
 	fileName := filepath.Base(filePath)
 	fileType := getFileType(filePath)
-
 	return c.ParseBytes(ctx, content, fileName, fileType, opts)
 }
 
-// ParseBytes 解析字节内容
+// ParseBytes 解析字节内容。
 func (c *Client) ParseBytes(ctx context.Context, content []byte, fileName, fileType string, opts *ParseOptions) (*ParseResult, error) {
+	if c == nil || c.engine == nil {
+		return nil, fmt.Errorf("docreader 不可用")
+	}
 	if opts == nil {
 		opts = DefaultParseOptions()
 	}
-
-	// 设置超时
 	ctx, cancel := context.WithTimeout(ctx, c.config.Timeout)
 	defer cancel()
-
-	// 构建请求
-	req := &pb.ReadFromFileRequest{
-		FileContent: content,
-		FileName:    fileName,
-		FileType:    fileType,
-		RequestId:   fmt.Sprintf("req-%d", time.Now().UnixNano()),
-		ReadConfig:  c.buildReadConfig(opts),
+	if int64(len(content)) > c.config.MaxFileSize {
+		return nil, fmt.Errorf("文件大小超过限制: %d > %d", len(content), c.config.MaxFileSize)
 	}
-
-	// 调用 gRPC
-	resp, err := c.client.ReadFromFile(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("调用 docreader 服务失败: %w", err)
+	if strings.TrimSpace(fileType) == "" {
+		fileType = getFileType(fileName)
 	}
-
-	return c.convertResponse(resp), nil
+	return c.engine.ParseBytes(ctx, content, fileName, fileType, opts)
 }
 
-// ParseURL 解析 URL
+// ParseURL 解析 URL。
 func (c *Client) ParseURL(ctx context.Context, url, title string, opts *ParseOptions) (*ParseResult, error) {
+	if c == nil || c.engine == nil {
+		return nil, fmt.Errorf("docreader 不可用")
+	}
 	if opts == nil {
 		opts = DefaultParseOptions()
 	}
-
 	ctx, cancel := context.WithTimeout(ctx, c.config.Timeout)
 	defer cancel()
-
-	req := &pb.ReadFromURLRequest{
-		Url:        url,
-		Title:      title,
-		RequestId:  fmt.Sprintf("req-%d", time.Now().UnixNano()),
-		ReadConfig: c.buildReadConfig(opts),
-	}
-
-	resp, err := c.client.ReadFromURL(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("调用 docreader 服务失败: %w", err)
-	}
-
-	return c.convertResponse(resp), nil
+	return c.engine.ParseURL(ctx, url, title, opts)
 }
 
-// ParseReader 从 io.Reader 解析
+// ParseReader 从 io.Reader 解析。
 func (c *Client) ParseReader(ctx context.Context, r io.Reader, fileName, fileType string, opts *ParseOptions) (*ParseResult, error) {
 	content, err := io.ReadAll(r)
 	if err != nil {
@@ -219,72 +294,8 @@ func (c *Client) ParseReader(ctx context.Context, r io.Reader, fileName, fileTyp
 	return c.ParseBytes(ctx, content, fileName, fileType, opts)
 }
 
-// buildReadConfig 构建读取配置
-func (c *Client) buildReadConfig(opts *ParseOptions) *pb.ReadConfig {
-	cfg := &pb.ReadConfig{
-		ChunkSize:       int32(opts.ChunkSize),
-		ChunkOverlap:    int32(opts.ChunkOverlap),
-		Separators:      opts.Separators,
-		EnableMultimodal: opts.EnableMultimodal,
-	}
-
-	// 添加 MinIO 配置
-	if c.config.MinIOEndpoint != "" {
-		cfg.StorageConfig = &pb.StorageConfig{
-			Provider:        pb.StorageProvider_MINIO,
-			BucketName:      c.config.MinIOBucket,
-			AccessKeyId:     c.config.MinIOAccessKey,
-			SecretAccessKey: c.config.MinIOSecretKey,
-		}
-	}
-
-	// 添加 VLM 配置
-	if opts.EnableMultimodal && c.config.VLMBaseURL != "" {
-		cfg.VlmConfig = &pb.VLMConfig{
-			ModelName:     c.config.VLMModel,
-			BaseUrl:       c.config.VLMBaseURL,
-			ApiKey:        c.config.VLMAPIKey,
-			InterfaceType: "openai",
-		}
-	}
-
-	return cfg
-}
-
-// convertResponse 转换响应
-func (c *Client) convertResponse(resp *pb.ReadResponse) *ParseResult {
-	result := &ParseResult{
-		Error: resp.Error,
-	}
-
-	for _, chunk := range resp.Chunks {
-		pc := ParsedChunk{
-			Content: chunk.Content,
-			Seq:     int(chunk.Seq),
-			Start:   int(chunk.Start),
-			End:     int(chunk.End),
-		}
-
-		for _, img := range chunk.Images {
-			pc.Images = append(pc.Images, ImageInfo{
-				URL:         img.Url,
-				Caption:     img.Caption,
-				OCRText:     img.OcrText,
-				OriginalURL: img.OriginalUrl,
-				Start:       int(img.Start),
-				End:         int(img.End),
-			})
-		}
-
-		result.Chunks = append(result.Chunks, pc)
-	}
-
-	return result
-}
-
-// getFileType 根据文件扩展名获取文件类型
 func getFileType(filePath string) string {
-	ext := filepath.Ext(filePath)
+	ext := strings.ToLower(filepath.Ext(filePath))
 	switch ext {
 	case ".pdf":
 		return "pdf"
@@ -296,12 +307,14 @@ func getFileType(filePath string) string {
 		return "excel"
 	case ".csv":
 		return "csv"
-	case ".md":
+	case ".md", ".markdown":
 		return "markdown"
-	case ".txt":
+	case ".txt", ".log":
 		return "text"
 	case ".html", ".htm":
 		return "html"
+	case ".json":
+		return "json"
 	case ".png", ".jpg", ".jpeg", ".gif", ".webp":
 		return "image"
 	default:
@@ -309,10 +322,11 @@ func getFileType(filePath string) string {
 	}
 }
 
-// SupportedFileTypes 返回支持的文件类型列表
+// SupportedFileTypes 返回支持的文件类型列表。
 func SupportedFileTypes() []string {
 	return []string{
 		"pdf", "docx", "doc", "xlsx", "xls", "csv",
-		"md", "txt", "html", "png", "jpg", "jpeg", "gif", "webp",
+		"md", "markdown", "txt", "log", "json", "html",
+		"png", "jpg", "jpeg", "gif", "webp",
 	}
 }

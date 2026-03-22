@@ -25,7 +25,6 @@ import (
 	"eino_agent/internal/database/repository"
 	"eino_agent/internal/filter"
 	"eino_agent/internal/pipeline"
-	"eino_agent/internal/router"
 	internalTool "eino_agent/internal/tool"
 )
 
@@ -873,35 +872,6 @@ func (s *ChatService) saveAssistantMessage(ctx context.Context, sessionID, conte
 	s.refreshSessionCache(ctx, sessionID, msg)
 }
 
-// availableModes 返回当前已初始化的模式列表
-func (s *ChatService) availableModes() []string {
-	modes := make([]string, 0, 3)
-	if s.pipeline != nil {
-		modes = append(modes, "pipeline")
-	}
-	if s.agent != nil {
-		modes = append(modes, "agent")
-	}
-	if s.agenticRAG != nil {
-		modes = append(modes, "agentic_rag")
-	}
-	return modes
-}
-
-// resolveMode 解析请求模式：auto 时调用路由器，否则直接返回
-func (s *ChatService) resolveMode(req *ChatRequest) (mode string, reason string) {
-	if req.Mode != "auto" && req.Mode != "" {
-		// 兼容旧的 UseAgent 标志
-		if req.UseAgent && req.Mode == "" {
-			return "agent", ""
-		}
-		return req.Mode, ""
-	}
-	result := router.RouteQuery(req.Message, s.availableModes())
-	log.Printf("[AutoMode] query=%q → mode=%s reason=%s", req.Message, result.Mode, result.Reason)
-	return result.Mode, result.Reason
-}
-
 // Chat 执行聊天
 func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
 	startTime := time.Now()
@@ -918,11 +888,8 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 	var resp *ChatResponse
 	var err error
 
-	// 解析模式（auto 时自动路由）
-	resolvedMode, _ := s.resolveMode(req)
-
 	// Agentic RAG 模式
-	if resolvedMode == "agentic_rag" && s.agenticRAG != nil {
+	if req.Mode == "agentic_rag" && s.agenticRAG != nil {
 		modeStart := time.Now()
 		runtimeAgentic := s.agenticRAG
 		if runtimeRetriever != s.retriever {
@@ -948,7 +915,8 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 		}
 		log.Printf("[Timing][ChatService] mode=agentic_rag stage=total duration_ms=%d", time.Since(modeStart).Milliseconds())
 		err = nil
-	} else if resolvedMode == "agent" && s.agent != nil {
+	} else if req.UseAgent && s.agent != nil {
+		// Agent 模式
 		modeStart := time.Now()
 		runtimeAgent := s.agent
 		kt := s.knowledgeTool
@@ -1062,25 +1030,18 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 		ch <- StreamEvent{Type: "session_id", SessionID: sessionID}
 	}
 
-	// 解析模式（auto 时自动路由）
-	resolvedMode, routeReason := s.resolveMode(req)
-
-	// 发送 mode_resolved 事件（仅 auto 模式时）
-	if req.Mode == "auto" || req.Mode == "" {
-		ch <- StreamEvent{Type: "mode_resolved", ResolvedMode: resolvedMode, Content: routeReason}
-	}
-
 	go func() {
 		defer close(ch)
 
 		startTime := time.Now()
+		firstTokenLogged := false
 		var fullResponse strings.Builder
 
 		// 创建流式 think 标签过滤器
 		thinkFilter := filter.NewThinkTagStreamFilter()
 
 		// Agentic RAG 模式
-		if resolvedMode == "agentic_rag" && s.agenticRAG != nil {
+		if req.Mode == "agentic_rag" && s.agenticRAG != nil {
 			runtimeAgentic := s.agenticRAG
 			if runtimeRetriever != s.retriever {
 				created, createErr := s.buildRuntimeAgenticRAG(ctx, runtimeRetriever)
@@ -1102,6 +1063,10 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 				case pipeline.AgenticEventContent:
 					filtered := thinkFilter.Filter(event.Content)
 					if filtered != "" {
+						if !firstTokenLogged {
+							log.Printf("[Timing][ChatService] mode=agentic_rag stage=first_token duration_ms=%d", time.Since(startTime).Milliseconds())
+							firstTokenLogged = true
+						}
 						fullResponse.WriteString(filtered)
 						ch <- StreamEvent{Type: "content", Content: filtered}
 					}
@@ -1125,7 +1090,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 		}
 
 		// Agent 模式
-		if resolvedMode == "agent" && s.agent != nil {
+		if req.UseAgent && s.agent != nil {
 			runtimeAgent := s.agent
 			if runtimeRetriever != s.retriever {
 				created, _, createErr := s.buildRuntimeAgent(ctx, runtimeRetriever)
@@ -1162,6 +1127,10 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 
 				filtered := thinkFilter.Filter(chunk.Content)
 				if filtered != "" {
+					if !firstTokenLogged {
+						log.Printf("[Timing][ChatService] mode=agent stage=first_token duration_ms=%d", time.Since(startTime).Milliseconds())
+						firstTokenLogged = true
+					}
 					fullResponse.WriteString(filtered)
 					ch <- StreamEvent{Type: "content", Content: filtered}
 				}
@@ -1201,6 +1170,10 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 					// 流式过滤 认
 					filtered := thinkFilter.Filter(chunk.Content)
 					if filtered != "" {
+						if !firstTokenLogged {
+							log.Printf("[Timing][ChatService] mode=pipeline stage=first_token duration_ms=%d", time.Since(startTime).Milliseconds())
+							firstTokenLogged = true
+						}
 						fullResponse.WriteString(filtered)
 						ch <- StreamEvent{
 							Type:    string(chunk.Type),
@@ -1236,10 +1209,9 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 
 // StreamEvent 流式事件
 type StreamEvent struct {
-	Type         string `json:"type"`
-	Content      string `json:"content,omitempty"`
-	DocID        string `json:"doc_id,omitempty"`
-	Error        string `json:"error,omitempty"`
-	SessionID    string `json:"session_id,omitempty"`
-	ResolvedMode string `json:"resolved_mode,omitempty"`
+	Type      string `json:"type"`
+	Content   string `json:"content,omitempty"`
+	DocID     string `json:"doc_id,omitempty"`
+	Error     string `json:"error,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
 }

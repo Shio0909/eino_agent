@@ -170,7 +170,10 @@ func (r *CompositeRetriever) getQueryEmbedding(ctx context.Context, query string
 		if err != nil {
 			log.Printf("[Retriever] 读取 embedding 缓存失败，降级到实时向量化: %v", err)
 		} else if hit && len(cachedVector) > 0 {
+			log.Printf("[Cache][Embedding] hit model=%s", modelID)
 			return cachedVector, nil
+		} else {
+			log.Printf("[Cache][Embedding] miss model=%s", modelID)
 		}
 
 		vector, err := EmbedFloat32(ctx, r.embedding, query)
@@ -196,8 +199,10 @@ func (r *CompositeRetriever) getCachedRetrievalDocuments(ctx context.Context, qu
 		return nil, false, err
 	}
 	if !hit || result == nil || len(result.Documents) == 0 {
+		log.Printf("[Cache][Retrieval] miss mode=%s", map[bool]string{true: "hybrid", false: "vector"}[hybrid])
 		return nil, false, nil
 	}
+	log.Printf("[Cache][Retrieval] hit mode=%s docs=%d", map[bool]string{true: "hybrid", false: "vector"}[hybrid], len(result.Documents))
 	return retrievalCacheDocsToDocuments(result.Documents), true, nil
 }
 
