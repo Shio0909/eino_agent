@@ -27,6 +27,7 @@ import (
 	"eino_agent/internal/importqueue"
 	mcpmanager "eino_agent/internal/mcp"
 	"eino_agent/internal/rediscache"
+	"eino_agent/internal/graphrag"
 	"eino_agent/internal/security"
 	"eino_agent/internal/service"
 )
@@ -47,6 +48,7 @@ type Handler struct {
 	retrievalCache   cachepkg.RetrievalCache
 	importStateStore cachepkg.ImportStateStore
 	auditLogger      *AuditLogger
+	graphRAGService  *graphrag.Service
 
 	// Repositories
 	kbRepo        repository.KnowledgeBaseRepository
@@ -79,6 +81,11 @@ func (h *Handler) SetRetrievalCache(retrievalCache cachepkg.RetrievalCache) {
 // SetImportStateStore 设置异步导入任务状态存储。
 func (h *Handler) SetImportStateStore(importStateStore cachepkg.ImportStateStore) {
 	h.importStateStore = importStateStore
+}
+
+// SetGraphRAGService 设置 GraphRAG 服务。
+func (h *Handler) SetGraphRAGService(svc *graphrag.Service) {
+	h.graphRAGService = svc
 }
 
 // NewHandler 创建新的处理器
@@ -210,6 +217,14 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		{
 			eval.GET("/reports", h.ListEvalReports)
 		}
+
+		// GraphRAG 管理
+		graphragAPI := protected.Group("/graphrag")
+		{
+			graphragAPI.GET("/status", h.GetGraphRAGStatus)
+			graphragAPI.POST("/build/:kbId", h.BuildGraphForKB)
+			graphragAPI.DELETE("/:kbId", h.DeleteGraphForKB)
+		}
 	}
 
 	// 兼容旧 API
@@ -239,12 +254,82 @@ func (h *Handler) HealthCheck(c *gin.Context) {
 			"docreader":    h.docReaderCli != nil,
 			"redis":        h.redisClient != nil && h.redisClient.Status(c.Request.Context()).Available,
 			"import_queue": h.importQueue != nil,
+			"graphrag":     h.graphRAGService != nil,
 		},
 	}
 	if h.redisClient != nil {
 		status["redis"] = h.redisClient.Status(c.Request.Context())
 	}
 	c.JSON(http.StatusOK, status)
+}
+
+// ── GraphRAG Endpoints ──
+
+// GetGraphRAGStatus 获取 GraphRAG 服务状态
+func (h *Handler) GetGraphRAGStatus(c *gin.Context) {
+	if h.graphRAGService == nil {
+		c.JSON(http.StatusOK, gin.H{"enabled": false, "message": "GraphRAG 未启用"})
+		return
+	}
+	c.JSON(http.StatusOK, h.graphRAGService.GetStatus())
+}
+
+// BuildGraphForKB 为知识库构建图谱（手动触发，接受 chunks）
+func (h *Handler) BuildGraphForKB(c *gin.Context) {
+	if h.graphRAGService == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "GraphRAG 未启用"})
+		return
+	}
+	kbID := c.Param("kbId")
+	if kbID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少知识库 ID"})
+		return
+	}
+
+	var req struct {
+		Chunks []struct {
+			ID      string `json:"id"`
+			Content string `json:"content"`
+		} `json:"chunks"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || len(req.Chunks) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请提供 chunks 数组"})
+		return
+	}
+
+	chunks := make([]*graphrag.ChunkForGraph, 0, len(req.Chunks))
+	for _, ch := range req.Chunks {
+		chunks = append(chunks, &graphrag.ChunkForGraph{ID: ch.ID, Content: ch.Content})
+	}
+
+	result, err := h.graphRAGService.BuildGraph(c.Request.Context(), &graphrag.BuildGraphRequest{
+		Namespace: &graphrag.NameSpace{KnowledgeBase: kbID},
+		Chunks:    chunks,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("构建图谱失败: %v", err)})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "图谱构建完成", "result": result})
+}
+
+// DeleteGraphForKB 删除知识库对应的图谱
+func (h *Handler) DeleteGraphForKB(c *gin.Context) {
+	if h.graphRAGService == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "GraphRAG 未启用"})
+		return
+	}
+	kbID := c.Param("kbId")
+	if kbID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少知识库 ID"})
+		return
+	}
+
+	if err := h.graphRAGService.DeleteGraph(c.Request.Context(), &graphrag.NameSpace{KnowledgeBase: kbID}); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("删除图谱失败: %v", err)})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "图谱已删除"})
 }
 
 // ChatRequest 聊天请求
@@ -1366,7 +1451,28 @@ func (h *Handler) processAndStoreChunks(ctx context.Context, kbID, knowledgeID s
 	}
 
 	// 存储
-	return h.vectorDB.Upsert(ctx, docs)
+	if err := h.vectorDB.Upsert(ctx, docs); err != nil {
+		return err
+	}
+
+	// 异步构建 GraphRAG 图谱
+	if h.graphRAGService != nil {
+		graphChunks := make([]*graphrag.ChunkForGraph, len(docs))
+		for i, d := range docs {
+			graphChunks[i] = &graphrag.ChunkForGraph{ID: d.ID, Content: d.Content}
+		}
+		go func() {
+			bgCtx := context.Background()
+			if _, err := h.graphRAGService.BuildGraph(bgCtx, &graphrag.BuildGraphRequest{
+				Namespace: &graphrag.NameSpace{KnowledgeBase: kbID},
+				Chunks:    graphChunks,
+			}); err != nil {
+				log.Printf("[GraphRAG] 异步构建图谱失败 kbID=%s: %v", kbID, err)
+			}
+		}()
+	}
+
+	return nil
 }
 
 // ListDocuments 获取知识库文档列表
