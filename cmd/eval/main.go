@@ -17,11 +17,10 @@ import (
 )
 
 type EvalSample struct {
-	ID             string   `json:"id"`
-	Question       string   `json:"question"`
-	GoldDocs       []string `json:"gold_docs,omitempty"`
-	AnswerKeywords []string `json:"answer_keywords,omitempty"`
-	Category       string   `json:"category,omitempty"`
+	ID       string   `json:"id"`
+	Question string   `json:"question"`
+	GoldDocs []string `json:"gold_docs,omitempty"`
+	Category string   `json:"category,omitempty"`
 }
 
 type loginRequest struct {
@@ -66,9 +65,8 @@ type sampleResult struct {
 	Precision         float64
 	Hit               float64
 	MRR               float64
-	NDCG              float64
-	AnswerKeywordRate float64
-	RetrievalLabeled  bool
+	NDCG             float64
+	RetrievalLabeled bool
 	Error             string
 }
 
@@ -370,7 +368,6 @@ func runSample(client *http.Client, baseURL, bearer, mode string, sample EvalSam
 	}
 
 	result.Recall, result.Precision, result.Hit, result.MRR, result.NDCG, result.RetrievalLabeled = retrievalMetrics(sample.GoldDocs, refs)
-	result.AnswerKeywordRate = answerKeywordRate(sample.AnswerKeywords, cr.Answer)
 	return result
 }
 
@@ -488,25 +485,7 @@ func matchGoldToReference(goldSet map[string]struct{}, ref reference) []string {
 	return matches
 }
 
-func answerKeywordRate(keywords []string, answer string) float64 {
-	if len(keywords) == 0 {
-		if strings.TrimSpace(answer) == "" {
-			return 0
-		}
-		return 1
-	}
-	answerLower := strings.ToLower(answer)
-	hit := 0
-	for _, kw := range keywords {
-		if kw == "" {
-			continue
-		}
-		if strings.Contains(answerLower, strings.ToLower(kw)) {
-			hit++
-		}
-	}
-	return float64(hit) / float64(len(keywords))
-}
+
 
 func parseCSVList(raw string) []string {
 	parts := strings.Split(raw, ",")
@@ -526,7 +505,7 @@ func parseCSVList(raw string) []string {
 
 func buildReport(mode, strategy, baseURL string, results []sampleResult) string {
 	latencies := make([]int64, 0, len(results))
-	var recallSum, precisionSum, hitSum, mrrSum, ndcgSum, ansSum float64
+	var recallSum, precisionSum, hitSum, mrrSum, ndcgSum float64
 	errCount := 0
 	retrievalLabeled := 0
 
@@ -536,7 +515,6 @@ func buildReport(mode, strategy, baseURL string, results []sampleResult) string 
 			continue
 		}
 		latencies = append(latencies, r.LatencyMs)
-		ansSum += r.AnswerKeywordRate
 		if r.RetrievalLabeled {
 			retrievalLabeled++
 			recallSum += r.Recall
@@ -564,7 +542,6 @@ func buildReport(mode, strategy, baseURL string, results []sampleResult) string 
 		mrrAtK = mrrSum / retrievalDenom
 		ndcgAtK = ndcgSum / retrievalDenom
 	}
-	answerRate := ansSum / denom
 	errorRate := float64(errCount) / float64(max(1, len(results)))
 
 	var b strings.Builder
@@ -583,7 +560,6 @@ func buildReport(mode, strategy, baseURL string, results []sampleResult) string 
 	b.WriteString(fmt.Sprintf("- Hit@K: %.4f\n", hitAtK))
 	b.WriteString(fmt.Sprintf("- MRR@K: %.4f\n", mrrAtK))
 	b.WriteString(fmt.Sprintf("- nDCG@K: %.4f\n", ndcgAtK))
-	b.WriteString(fmt.Sprintf("- Answer Keyword Rate: %.4f\n", answerRate))
 	b.WriteString(fmt.Sprintf("- Avg Latency (ms): %.2f\n", avgLatency))
 	b.WriteString(fmt.Sprintf("- P50 Latency (ms): %d\n", p50))
 	b.WriteString(fmt.Sprintf("- P95 Latency (ms): %d\n", p95))
@@ -596,15 +572,15 @@ func buildReport(mode, strategy, baseURL string, results []sampleResult) string 
 	}
 
 	b.WriteString("## 明细\n\n")
-	b.WriteString("| id | category | latency_ms | recall | precision | hit | mrr | ndcg | answer_kw_rate | retrieval_labeled | status |\n")
-	b.WriteString("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|\n")
+	b.WriteString("| id | category | latency_ms | recall | precision | hit | mrr | ndcg | retrieval_labeled | status |\n")
+	b.WriteString("|---|---|---:|---:|---:|---:|---:|---:|---:|---|\n")
 	for _, r := range results {
 		status := "ok"
 		if r.Error != "" {
 			status = "error"
 		}
-		b.WriteString(fmt.Sprintf("| %s | %s | %d | %.3f | %.3f | %.0f | %.3f | %.3f | %.3f | %t | %s |\n",
-			r.ID, r.Category, r.LatencyMs, r.Recall, r.Precision, r.Hit, r.MRR, r.NDCG, r.AnswerKeywordRate, r.RetrievalLabeled, status))
+		b.WriteString(fmt.Sprintf("| %s | %s | %d | %.3f | %.3f | %.0f | %.3f | %.3f | %t | %s |\n",
+			r.ID, r.Category, r.LatencyMs, r.Recall, r.Precision, r.Hit, r.MRR, r.NDCG, r.RetrievalLabeled, status))
 	}
 
 	return b.String()
