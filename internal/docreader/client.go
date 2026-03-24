@@ -48,6 +48,9 @@ type Config struct {
 	PlaywrightTimeout     time.Duration
 	PlaywrightWaitUntil   string
 	PlaywrightMaxHTMLSize int64
+
+	// MinerU HTTP 服务端点，Mode="mineru" 时使用，如 http://mineru:8000
+	MinerUEndpoint string
 }
 
 // DefaultConfig 返回默认配置。
@@ -107,6 +110,19 @@ func NewClient(cfg *Config) (*Client, error) {
 			return c, nil
 		}
 		c.engine = newFallbackEngine(newGRPCEngine(c.grpcClient, cfg), local)
+		return c, nil
+	case "mineru":
+		if strings.TrimSpace(cfg.MinerUEndpoint) == "" {
+			return nil, fmt.Errorf("docreader: MinerUEndpoint must be set when mode=mineru")
+		}
+		c.engine = newMineruEngine(cfg)
+		return c, nil
+	case "mineru_with_fallback":
+		if strings.TrimSpace(cfg.MinerUEndpoint) == "" {
+			c.engine = local
+			return c, nil
+		}
+		c.engine = newFallbackEngine(newMineruEngine(cfg), local)
 		return c, nil
 	default:
 		return nil, fmt.Errorf("unsupported docreader mode: %s", cfg.Mode)

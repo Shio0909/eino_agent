@@ -1,86 +1,95 @@
-# Eino RAG
+# Eino RAG Agent
 
-基于字节跳动 [Eino](https://github.com/cloudwego/eino) 框架构建的企业级 RAG (检索增强生成) 系统。
+基于字节跳动 [Eino](https://github.com/cloudwego/eino) 框架构建的多范式知识库问答平台，使用 Go 语言实现。
 
-参考腾讯 [WeKnora](https://github.com/Tencent/WeKnora) 架构设计，使用 Go 语言实现。
+## 核心特性
 
-## 项目特点
+- **三种问答模式**：Pipeline（线性 RAG）、ReAct Agent（工具调用）、Agentic RAG（带评估与自动重试的 Graph 编排）
+- **混合检索**：向量检索 + BM25 全文检索融合，支持 pgvector
+- **流式输出**：所有模式均支持 SSE 流式响应，内置 DeepSeek `<think>` 标签过滤
+- **多租户**：JWT 鉴权 + 租户隔离，知识库和会话均按租户隔离
+- **MCP 工具**：通过 MCP 协议动态挂载远程工具
+- **Eino Skill**：渐进式披露（Progressive Disclosure）skill 中间件，支持按请求动态选择技能
+- **记忆系统**：Redis 短期缓存 + PostgreSQL 长期记忆（跨会话）
+- **安全防护**：Prompt Injection 检测 + SSRF 防护（URL 白名单/黑名单）
+- **GraphRAG**：Neo4j 实体关系图谱增强检索（可选）
+- **异步导入**：RabbitMQ + gRPC DocReader 支持 PDF 等多格式文档异步解析入库
 
-### 【Eino 特点】核心优势
+## 技术栈
 
-1. **Graph 编排** - 使用声明式的 Graph 编排 RAG 流程，支持条件分支和并行执行
-2. **ReAct Agent** - 基于 ReAct 模式的智能体，支持工具调用
-3. **流式输出** - 原生支持流式输出，利用 LLM 流式能力无缝集成
-4. **Callback 机制** - 完善的回调系统，便于监控和调试
-5. **组件解耦** - 模块化的组件设计，容易扩展和替换
+| 层 | 技术 |
+|----|------|
+| AI 框架 | [Eino v0.7](https://github.com/cloudwego/eino) |
+| Web | Gin + Swagger |
+| 数据库 | PostgreSQL + pgvector |
+| 缓存 | Redis |
+| 消息队列 | RabbitMQ |
+| 工具协议 | MCP (mark3labs/mcp-go) |
+| 文档解析 | gRPC DocReader |
+| 知识图谱 | Neo4j |
 
-### 与 WeKnora 架构对比
+## 问答模式链路
 
-详见 [架构对比文档](docs/ARCHITECTURE_COMPARISON.md)
+### Pipeline 模式（线性 RAG）
+```
+查询 → 查询重写 → 混合检索 → 重排序 → 构建上下文 → LLM 生成 → 回答
+```
+
+### Agent 模式（ReAct 工具调用）
+```
+查询 → ReAct Agent → [Thought → 工具调用(知识库/Web搜索/MCP) → Observe] × N → 回答
+```
+
+### Agentic RAG 模式（Corrective RAG）
+```
+查询 → 查询重写 → 检索 → 质量评估 → (不足则重写重试) → LLM 生成 → 回答
+                              ↑___________________________|
+```
 
 ## 项目结构
 
 ```
 eino_agent/
-├── cmd/
-│   └── server/
-│       └── main.go              # 服务入口
-├── configs/
-│   └── config.yaml              # 配置文件
+├── cmd/server/              # 服务入口
+├── configs/                 # 配置文件
 ├── internal/
-│   ├── agent/                   # Agent 层
-│   │   └── rag_agent.go         # 【Eino 特点】ReAct Agent 封装
-│   ├── chatpipeline/            # Chat Pipeline
-│   │   └── pipeline.go          # 插件化流水线
-│   ├── component/               # Eino 组件
-│   │   ├── retriever/           # 检索器组件
-│   │   └── reranker/            # 重排序组件
-│   ├── config/                  # 配置层
-│   │   └── config.go            # 配置加载
-│   ├── container/               # 依赖注入容器
-│   │   ├── container.go         # 容器核心
-│   │   ├── llm_provider.go      # LLM 提供者
-│   │   ├── embedding_provider.go # Embedding 提供者
-│   │   ├── vectordb_provider.go # 向量数据库提供者
-│   │   ├── retriever_provider.go # 检索器提供者
-│   │   └── reranker_provider.go # 重排序提供者
-│   ├── document/                # 文档处理
-│   │   └── loader.go            # 加载和分块
-│   ├── handler/                 # HTTP 处理器
-│   │   └── chat.go              # 聊天接口
-│   ├── pipeline/                # RAG Pipeline
-│   │   ├── rag.go               # 【Eino 特点】RAG Pipeline
-│   │   ├── rewrite.go           # 查询重写
-│   │   └── generate.go          # 生成器
-│   ├── prompt/                  # Prompt 管理
-│   │   └── manager.go           # 模板管理器
-│   ├── service/                 # 业务服务
-│   │   └── chat.go              # 聊天服务
-│   ├── tool/                    # 工具层
-│   │   ├── knowledge.go         # 【Eino 特点】知识库工具
-│   │   └── web_search.go        # Web 搜索工具
-│   └── types/                   # 类型定义
-│       └── types.go             # 通用类型
-├── docs/
-│   └── ARCHITECTURE_COMPARISON.md # 架构对比
-└── WeKnora/                     # WeKnora 源码参考
+│   ├── config/              # 配置结构体
+│   ├── container/           # 依赖注入容器（懒加载）
+│   ├── handler/             # Gin HTTP 处理器
+│   ├── service/             # 业务服务层
+│   │   ├── chat.go          # 核心 ChatService，三模式路由
+│   │   ├── chat_types.go    # 请求/响应类型
+│   │   ├── chat_memory.go   # 短期/长期记忆
+│   │   ├── chat_persistence.go # 会话消息持久化
+│   │   └── runtime_agent.go # per-request Agent 构建（skill + event sink）
+│   ├── pipeline/            # RAG Pipeline & Agentic RAG Graph
+│   ├── prompt/              # Prompt 模板管理
+│   ├── tool/                # KnowledgeTool / WebSearchTool
+│   ├── security/            # Prompt Guard + URL Policy
+│   ├── filter/              # 流式 think 标签过滤
+│   ├── cache/               # Session/Retrieval/ImportState 缓存接口
+│   ├── memory/              # 记忆相关
+│   ├── database/            # PostgreSQL Repository
+│   ├── docreader/           # gRPC 文档解析客户端
+│   ├── graphrag/            # Neo4j GraphRAG
+│   ├── importqueue/         # RabbitMQ 异步导入队列
+│   └── mcp/                 # MCP 工具管理器
+└── frontend-react/          # React 前端
 ```
 
 ## 快速开始
 
 ### 1. 配置
 
-复制配置文件并修改：
-
 ```bash
-cp configs/config.yaml.example configs/config.yaml
+cp configs/config.example.yaml configs/config.yaml
 ```
 
-编辑 `configs/config.yaml`：
+编辑 `configs/config.yaml`，至少填写：
 
 ```yaml
 llm:
-  provider: "openai"  # 或 deepseek, moonshot, qwen 等
+  provider: "openai"          # openai / deepseek / doubao / ollama 等
   base_url: "https://api.openai.com/v1"
   api_key: "your-api-key"
   model_id: "gpt-4o-mini"
@@ -91,202 +100,88 @@ embedding:
   api_key: "your-api-key"
   model_id: "text-embedding-3-small"
   dimensions: 1536
+
+database:
+  host: "localhost"
+  port: 5432
+  dbname: "eino_rag"
+  user: "postgres"
+  password: "your-password"
+
+auth:
+  enabled: true
+  jwt_secret: "your-strong-secret-here"   # 生产环境必填，不可使用默认值
 ```
 
-### 2. 运行
+### 2. 启动依赖
 
 ```bash
-# 直接运行
-go run cmd/server/main.go
-
-# 带文档加载
-go run cmd/server/main.go -load-docs -config configs/config.yaml
-
-# 编译后运行
-go build -o eino-rag cmd/server/main.go
-./eino-rag
+docker-compose up -d   # 启动 PostgreSQL + Redis
 ```
 
-### 3. API 使用
-
-**普通聊天**
+### 3. 运行服务
 
 ```bash
-curl -X POST http://localhost:8080/api/chat \
+go run cmd/server/main.go -config configs/config.yaml
+```
+
+Swagger 文档：`http://localhost:8080/swagger/index.html`
+
+### 4. API 示例
+
+**登录获取 Token**
+```bash
+curl -X POST http://localhost:8080/api/v1/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"message": "你好", "use_agent": false}'
+  -d '{"username": "admin", "password": "admin123"}'
 ```
 
-**Agent 模式（工具调用）**
-
+**流式聊天（Pipeline 模式）**
 ```bash
-curl -X POST http://localhost:8080/api/chat \
+curl -X POST http://localhost:8080/api/v1/chat/stream \
   -H "Content-Type: application/json" \
-  -d '{"message": "搜索知识库关于RAG的内容", "use_agent": true}'
+  -H "Authorization: Bearer <token>" \
+  -d '{"message": "RAG 的工作原理是什么？", "mode": "pipeline"}'
 ```
 
-**流式聊天**
-
+**Agent 模式**
 ```bash
-curl -X POST http://localhost:8080/api/chat/stream \
+curl -X POST http://localhost:8080/api/v1/chat/stream \
   -H "Content-Type: application/json" \
-  -d '{"message": "详细解释RAG的工作原理", "use_agent": true}'
+  -H "Authorization: Bearer <token>" \
+  -d '{"message": "帮我搜索最新资料", "use_agent": true}'
 ```
 
 **健康检查**
-
 ```bash
 curl http://localhost:8080/health
-```
-
-## 架构说明
-
-### RAG 流水线
-
-```
-用户查询
-    │
-    ▼
-┌─────────────┐
-│  查询重写    │  ← 【Eino 特点】LLM 重写 / HyDE / 多查询
-└─────────────┘
-    │
-    ▼
-┌─────────────┐
-│  向量检索    │  ← 【Eino 特点】Eino Retriever 组件
-└─────────────┘
-    │
-    ▼
-┌─────────────┐
-│  重排序      │  ← Jina / Cohere / 本地
-└─────────────┘
-    │
-    ▼
-┌─────────────┐
-│  LLM 生成    │  ← 【Eino 特点】Eino ChatModel + 流式
-└─────────────┘
-    │
-    ▼
-  回答
-```
-
-### Agent 模式
-
-```
-用户查询
-    │
-    ▼
-┌─────────────────────────────────────┐
-│           ReAct Agent               │
-│  ┌─────────────────────────────┐   │
-│  │ Thought → Action → Observe  │   │
-│  └─────────────────────────────┘   │
-│         │                          │
-│         ▼                          │
-│  ┌─────────────┐                  │
-│  │   工具调用   │                  │
-│  │ - 知识库搜索 │                  │
-│  │ - Web 搜索   │                  │
-│  └─────────────┘                  │
-└─────────────────────────────────────┘
-    │
-    ▼
-  回答
-```
-
-### 依赖注入容器
-
-```
-Container
-├── LLMProvider         ← 懒加载
-├── EmbeddingProvider   ← 懒加载
-├── VectorDBProvider    ← 懒加载
-├── RetrieverProvider   ← 依赖 Embedding + VectorDB
-└── RerankerProvider    ← 可选
 ```
 
 ## 配置说明
 
 ### 支持的 LLM 提供商
 
-| 提供商 | provider | base_url |
-|--------|----------|----------|
-| OpenAI | openai | https://api.openai.com/v1 |
-| DeepSeek | deepseek | https://api.deepseek.com/v1 |
-| 智谱 AI | qwen | https://open.bigmodel.cn/api/paas/v4 |
-| 月之暗面 | moonshot | https://api.moonshot.cn/v1 |
-| 字节豆包 | doubao | https://ark.cn-beijing.volces.com/api/v3 |
-| Ollama | ollama | http://localhost:11434 |
+| 提供商 | provider | 说明 |
+|--------|----------|------|
+| OpenAI | `openai` | GPT-4o / GPT-4o-mini 等 |
+| DeepSeek | `deepseek` | deepseek-chat / deepseek-reasoner |
+| 字节豆包 | `doubao` | Doubao-pro 系列 |
+| 月之暗面 | `moonshot` | moonshot-v1 系列 |
+| 智谱 AI | `qwen` | GLM-4 系列 |
+| Ollama | `ollama` | 本地模型 |
 
 ### 支持的 Embedding 提供商
 
-| 提供商 | 模型 | 维度 |
-|--------|------|------|
+| 提供商 | 推荐模型 | 维度 |
+|--------|----------|------|
 | OpenAI | text-embedding-3-small | 1536 |
 | Jina | jina-embeddings-v3 | 1024 |
 | 智谱 AI | embedding-3 | 2048 |
 | Ollama | nomic-embed-text | 768 |
 
-## 开发指南
-
-### 添加新工具
-
-```go
-// internal/tool/my_tool.go
-type MyTool struct{}
-
-func (t *MyTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
-    return &schema.ToolInfo{
-        Name: "my_tool",
-        Desc: "我的自定义工具",
-        ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
-            "param1": {
-                Type: schema.String,
-                Desc: "参数描述",
-            },
-        }),
-    }, nil
-}
-
-func (t *MyTool) InvokableRun(ctx context.Context, input string, opts ...tool.Option) (string, error) {
-    // 工具实现
-    return "result", nil
-}
-```
-
-### 添加新 Pipeline 插件
-
-```go
-// internal/chatpipeline/my_plugin.go
-type MyPlugin struct{}
-
-func (p *MyPlugin) Name() string { return "my_plugin" }
-
-func (p *MyPlugin) ActivationEvents() []EventType {
-    return []EventType{EventAfterSearch}
-}
-
-func (p *MyPlugin) OnEvent(ctx context.Context, event EventType, chatCtx *ChatContext, next func() error) error {
-    // 前置处理
-    err := next()
-    // 后置处理
-    return err
-}
-```
-
-## 后续计划
-
-- [ ] PostgreSQL + pgvector 集成
-- [ ] 集成 WeKnora docreader
-- [ ] 集成 WeKnora 前端
-- [ ] Docker 支持
-- [ ] Knowledge Graph (Neo4j)
-- [ ] 认证授权
-
 ## 参考
 
 - [Eino 框架](https://github.com/cloudwego/eino)
-- [WeKnora](https://github.com/Tencent/WeKnora)
 - [Eino 文档](https://www.cloudwego.io/zh/docs/eino/)
 
 ## License

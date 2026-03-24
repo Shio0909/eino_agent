@@ -107,6 +107,8 @@ services:
       # DocReader (gRPC 文档解析) - 默认启用，连接宿主机的 WeKnora-docreader
       - DOCREADER_ENABLED=${DOCREADER_ENABLED:-true}
       - DOCREADER_ADDR=${DOCREADER_ADDR:-host.docker.internal:50051}
+      # MinerU (高精度 PDF 解析)
+      - MINERU_ENDPOINT=${MINERU_ENDPOINT:-http://mineru:8000}
       # MinIO (对象存储)
       - MINIO_ENDPOINT=minio:9000
       - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-minioadmin}
@@ -242,6 +244,36 @@ services:
       - full
 
   # ===========================================
+  # MinerU (高精度 PDF/文档解析微服务)
+  # 【本地部署】基于上海 AI Lab MinerU (Apache 2.0)
+  # 支持: PDF 高精度解析、表格、公式(LaTeX)、多栏排版
+  # 注意: 首次启动会下载模型 (~5-10 GB)，建议挂载 mineru-models 卷
+  # ===========================================
+  mineru:
+    build:
+      context: ./docker/mineru
+    container_name: eino-rag-mineru
+    ports:
+      - "${MINERU_PORT:-8500}:8000"
+    environment:
+      - MINERU_DEVICE=${MINERU_DEVICE:-cpu}
+      - MINERU_METHOD=${MINERU_METHOD:-auto}
+    volumes:
+      - mineru-models:/root/.mineru
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 300s
+    networks:
+      - eino-network
+    restart: unless-stopped
+    profiles:
+      - mineru
+      - full
+
+  # ===========================================
   # Reranker (Python FastAPI - 重排序微服务)
   # 本地部署 Cross-Encoder 模型，替代 Jina API
   # 参考 WeKnora rerank_server_demo.py
@@ -363,5 +395,6 @@ volumes:
   rabbitmq-data:
   minio-data:
   reranker-models:
+  mineru-models:
   jaeger-data:
   neo4j-data:

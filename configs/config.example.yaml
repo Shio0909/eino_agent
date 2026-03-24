@@ -90,8 +90,17 @@ memory:
     max_context_chars: 3000
 docreader:
     enabled: true
+    # mode 可选: local | grpc | auto | mineru | mineru_with_fallback
+    #   local                - 纯 Go 本地解析（轻量，PDF 质量一般）
+    #   grpc / auto          - 连接 WeKnora gRPC docreader
+    #   mineru               - 连接 MinerU HTTP 微服务（高精度 PDF）
+    #   mineru_with_fallback - MinerU 失败时降级到本地解析
     mode: local
     endpoint: localhost:50051
+    # MinerU HTTP 服务端点（mode=mineru 或 mineru_with_fallback 时需填写）
+    # Docker 内部地址: http://mineru:8000
+    # 宿主机直接运行:  http://localhost:8500
+    mineru_endpoint: ""
     max_file_size: 50
     minio_endpoint: ""
     minio_access_key: your-minio-access-key

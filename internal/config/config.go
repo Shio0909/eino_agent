@@ -205,9 +205,12 @@ type AgenticRAGConfig struct {
 // DocReaderConfig DocReader 文档解析服务配置
 type DocReaderConfig struct {
 	Enabled     bool   `yaml:"enabled"`
-	Mode        string `yaml:"mode"`          // local, grpc, auto
+	Mode        string `yaml:"mode"`          // local, grpc, auto, mineru, mineru_with_fallback
 	Endpoint    string `yaml:"endpoint"`      // gRPC 地址，如 localhost:50051
 	MaxFileSize int64  `yaml:"max_file_size"` // 最大文件大小 (MB)
+
+	// MinerU HTTP 服务端点（mode=mineru 或 mineru_with_fallback 时使用）
+	MinerUEndpoint string `yaml:"mineru_endpoint"` // 如 http://mineru:8000
 
 	// MinIO 配置 (用于存储解析后的图片)
 	MinIOEndpoint  string `yaml:"minio_endpoint"`

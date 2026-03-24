@@ -1,0 +1,7 @@
+# MinerU (magic-pdf) 高精度文档解析
+# magic-pdf[full] 包含 OCR/表格/公式等完整能力
+# 注意：首次启动会自动下载模型 (~5-10 GB)，建议挂载 ~/.mineru 目录
+magic-pdf[full]>=0.9.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9

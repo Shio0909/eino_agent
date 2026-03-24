@@ -9,9 +9,9 @@ ai_docs/
 # 依赖
 node_modules/
 
-# 构建产物
-server
-server.exe
+# 构建产物 (根目录下的编译二进制)
+/server
+/server.exe
 *.exe
 *.exe~
 dist/
