@@ -103,9 +103,10 @@ type GraphRAGConfig struct {
 
 // ServerConfig 服务器配置
 type ServerConfig struct {
-	Host string `yaml:"host"`
-	Port int    `yaml:"port"`
-	Mode string `yaml:"mode"` // debug, release
+	Host        string   `yaml:"host"`
+	Port        int      `yaml:"port"`
+	Mode        string   `yaml:"mode"` // debug, release
+	CORSOrigins []string `yaml:"cors_origins"`
 }
 
 // LLMConfig LLM 配置
