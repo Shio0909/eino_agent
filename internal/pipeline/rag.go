@@ -51,7 +51,7 @@ func DefaultConfig() *Config {
 		TopK:          10,
 		RerankTopK:    5,
 		ModelID:       "gpt-4o-mini",
-		SystemPrompt:  "你是一个智能助手，请根据提供的上下文回答用户问题。",
+		SystemPrompt:  "你是一个专业的知识库问答助手，请严格基于提供的上下文回答用户问题。回答必须且只能基于参考资料，严禁使用训练知识补充。资料不足时请明确说明。",
 	}
 }
 
@@ -203,7 +203,7 @@ func (p *RAGPipeline) Run(ctx context.Context, req *RAGRequest) (*RAGResponse, e
 	for i := 0; i < topK; i++ {
 		idx := rerankedIdx[i]
 		if idx < len(docs) {
-			contextBuilder += fmt.Sprintf("[%d] %s\n\n", i+1, docs[idx].Content)
+			contextBuilder += fmt.Sprintf("[来源%d] %s\n\n", i+1, docs[idx].Content)
 			resp.Sources = append(resp.Sources, Source{
 				Content: docs[idx].Content,
 				DocID:   docs[idx].ID,

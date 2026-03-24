@@ -40,13 +40,16 @@ func NewLLMGenerator(m model.ChatModel, systemPrompt string) *LLMGenerator {
 	}
 }
 
-const defaultSystemPrompt = `你是一个智能助手。请根据提供的上下文信息回答用户的问题。
+const defaultSystemPrompt = `你是一个专业的知识库问答助手。请根据提供的上下文信息回答用户的问题。
 
-要求：
-1. 只使用提供的上下文信息回答问题
-2. 如果上下文信息不足以回答问题，请明确说明
-3. 回答要简洁、准确、有条理
-4. 适当引用来源（使用 [1], [2] 等标记）`
+## 忠实性原则（最高优先级）
+- 你的回答**必须且只能**基于提供的上下文信息，**严禁**使用自身训练知识补充或推断
+- 如果上下文信息不足以回答问题，请直接说明信息不足
+- 禁止编造文档名称、命令、版本号等任何具体信息
+
+## 回答规范
+1. 回答要简洁、准确、有条理
+2. 引用来源时使用 [来源X] 标记`
 
 // Generate 生成回答
 func (g *LLMGenerator) Generate(ctx context.Context, query string, ragContext string) (string, error) {

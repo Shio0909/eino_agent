@@ -275,20 +275,20 @@ func (p *AgenticRAGPipeline) queryRewrite(ctx context.Context, query string) (st
 
 	log.Printf("[AgenticRAG][Rewrite] retry=%d current_query=%q", retryCount, currentQuery)
 
-	prompt := fmt.Sprintf(`You are improving a retrieval query for a knowledge search system.
+	prompt := fmt.Sprintf(`你正在为知识检索系统改进检索查询。
 
-Original user question:
+用户原始问题：
 %s
 
-Current query that did not retrieve strong enough evidence:
+当前查询未能检索到足够有力的证据：
 %s
 
-Rewrite the query to improve retrieval quality.
-Guidelines:
-- preserve the user's intent
-- use clearer or more common terminology
-- expand or narrow the scope only when helpful
-- return a single rewritten query and nothing else`, originalQuery, currentQuery)
+请重写查询以提高检索质量。
+要求：
+- 保持用户的原始意图
+- 使用更清晰或更常用的术语
+- 仅在有助于检索时扩展或缩小范围
+- 只返回一条重写后的查询，不要附加解释`, originalQuery, currentQuery)
 
 	resp, err := p.chatModel.Generate(ctx, []*schema.Message{
 		{Role: schema.User, Content: prompt},
@@ -398,21 +398,21 @@ func (p *AgenticRAGPipeline) llmEvaluate(ctx context.Context, query string, docs
 		if i >= 5 {
 			break
 		}
-		docsText.WriteString(fmt.Sprintf("Document %d:\n%s\n\n", i+1, truncate(doc.Content, 300)))
+		docsText.WriteString(fmt.Sprintf("文档%d：\n%s\n\n", i+1, truncate(doc.Content, 300)))
 	}
 
-	prompt := fmt.Sprintf(`You are grading retrieval quality for a question answering system.
+	prompt := fmt.Sprintf(`你正在为问答系统评估检索质量。
 
-User question:
+用户问题：
 %s
 
-Retrieved documents:
+检索到的文档：
 %s
 
-Return exactly one label:
-- high: the documents strongly support answering the question
-- medium: the documents are somewhat relevant but incomplete
-- low: the documents are mostly not relevant`, query, docsText.String())
+请返回以下标签之一：
+- high：文档能有力支撑回答该问题
+- medium：文档有一定相关性但不够完整
+- low：文档与问题基本无关`, query, docsText.String())
 
 	resp, err := p.chatModel.Generate(ctx, []*schema.Message{
 		{Role: schema.User, Content: prompt},
@@ -461,33 +461,33 @@ func (p *AgenticRAGPipeline) generate(ctx context.Context, evaluateOutput string
 		if i >= 5 {
 			break
 		}
-		contextBuilder.WriteString(fmt.Sprintf("[Source %d] %s\n\n", i+1, doc.Content))
+		contextBuilder.WriteString(fmt.Sprintf("[来源%d] %s\n\n", i+1, doc.Content))
 	}
 
 	if systemPrompt == "" {
-		systemPrompt = `You are a grounded knowledge-base assistant.
-Answer using the provided sources when possible.
-If the sources are insufficient, say so clearly.
-When citing evidence, reference the source number such as [Source 1].`
+		systemPrompt = `你是一个专业的知识库问答助手。
+回答**必须且只能**基于提供的来源资料，**严禁**使用自身训练知识补充。
+如果来源资料不足，请直接说明信息不足。
+引用证据时使用 [来源X] 标注。`
 	}
 
 	qualityNote := ""
 	if retrievalScore < qualityThreshold {
-		qualityNote = "\n\nNote: retrieval quality is below the preferred threshold, so the answer may be incomplete."
+		qualityNote = "\n\n注意：检索质量未达到理想阈值，回答可能不完整。"
 	}
 
 	retryNote := ""
 	if retryCount > 1 {
-		retryNote = fmt.Sprintf("\nThe system retried retrieval %d times before answering.", retryCount)
+		retryNote = fmt.Sprintf("\n系统在回答前进行了 %d 次重试检索。", retryCount)
 	}
 
-	userPrompt := fmt.Sprintf(`Reference material:
+	userPrompt := fmt.Sprintf(`参考资料：
 %s
 
-User question:
+用户问题：
 %s%s%s
 
-Answer the question using the reference material above.`, contextBuilder.String(), originalQuery, qualityNote, retryNote)
+请严格基于上述参考资料回答问题。`, contextBuilder.String(), originalQuery, qualityNote, retryNote)
 
 	resp, err := p.chatModel.Generate(ctx, []*schema.Message{
 		{Role: schema.System, Content: systemPrompt},
