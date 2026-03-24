@@ -7,6 +7,16 @@
 1. **业务内测集（必做）**：你自己的真实问题分布，最能证明项目价值。
 2. **公开基准（加分）**：验证不是只对你自己的数据有效。
 
+当前仓库已新增一个可直接运行的公开检索 benchmark 命令：
+
+- `go run ./cmd/beir_eval -config configs/config.yaml -dataset data/beir_scifact_small -strategy vector`
+- `go run ./cmd/beir_eval -config configs/config.yaml -dataset data/beir_scifact_small -strategy hybrid`
+- `go run ./cmd/beir_eval -config configs/config.yaml -dataset data/beir_scifact_small -strategy hybrid_rerank`
+
+输出：
+- Markdown 报告：`docs/eval_reports/*_beir_<strategy>.md`
+- JSON 结果：`docs/eval_reports/*_beir_<strategy>.json`
+
 适合中文/通用 RAG 的公开基准可选：
 
 - `MIRACL`（多语言检索）

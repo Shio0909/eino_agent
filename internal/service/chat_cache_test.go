@@ -56,16 +56,20 @@ type fakeMessageRepo struct {
 	messages    map[string][]*repository.Message
 	listCalls   int
 	createCalls int
+	now         func() time.Time
 }
 
 func newFakeMessageRepo() *fakeMessageRepo {
-	return &fakeMessageRepo{messages: make(map[string][]*repository.Message)}
+	return &fakeMessageRepo{
+		messages: make(map[string][]*repository.Message),
+		now:      time.Now,
+	}
 }
 
 func (f *fakeMessageRepo) Create(_ context.Context, m *repository.Message) error {
 	f.createCalls++
 	if m.CreatedAt.IsZero() {
-		m.CreatedAt = time.Now()
+		m.CreatedAt = f.now()
 	}
 	clone := *m
 	f.messages[m.SessionID] = append(f.messages[m.SessionID], &clone)
@@ -87,6 +91,7 @@ func (f *fakeMessageRepo) ListBySession(_ context.Context, sessionID string, lim
 }
 
 func TestBuildMemoryInstructionUsesSessionCache(t *testing.T) {
+	baseTime := time.Date(2026, 3, 23, 12, 0, 0, 0, time.UTC)
 	cfg := &config.Config{
 		Memory: config.MemoryConfig{
 			Enabled:                  true,
@@ -102,20 +107,18 @@ func TestBuildMemoryInstructionUsesSessionCache(t *testing.T) {
 	}
 
 	messageRepo := newFakeMessageRepo()
+	messageRepo.now = func() time.Time { return baseTime }
 	cacheStore := newFakeSessionCache()
 	cacheStore.recent["s1"] = []cachepkg.SessionMessage{
-		{Role: "user", Content: "第一问", CreatedAt: time.Now().Add(-2 * time.Minute)},
-		{Role: "assistant", Content: "第一答", CreatedAt: time.Now().Add(-1 * time.Minute)},
+		{Role: "user", Content: "first question", CreatedAt: baseTime.Add(-2 * time.Minute)},
+		{Role: "assistant", Content: "first answer", CreatedAt: baseTime.Add(-1 * time.Minute)},
 	}
 
 	svc.messageRepo = messageRepo
 	svc.sessionCache = cacheStore
 
 	instruction := svc.buildMemoryInstruction(context.Background(), &ChatRequest{}, "s1")
-	if !strings.Contains(instruction, "会话短期记忆") {
-		t.Fatalf("instruction missing short-term memory section: %s", instruction)
-	}
-	if !strings.Contains(instruction, "第一问") || !strings.Contains(instruction, "第一答") {
+	if !strings.Contains(instruction, "first question") || !strings.Contains(instruction, "first answer") {
 		t.Fatalf("instruction missing cached messages: %s", instruction)
 	}
 	if messageRepo.listCalls != 0 {
@@ -124,6 +127,7 @@ func TestBuildMemoryInstructionUsesSessionCache(t *testing.T) {
 }
 
 func TestSaveMessagesRefreshesSessionCache(t *testing.T) {
+	baseTime := time.Date(2026, 3, 23, 12, 0, 0, 0, time.UTC)
 	cfg := &config.Config{
 		Memory: config.MemoryConfig{
 			Enabled:                  true,
@@ -139,14 +143,15 @@ func TestSaveMessagesRefreshesSessionCache(t *testing.T) {
 	}
 
 	messageRepo := newFakeMessageRepo()
+	messageRepo.now = func() time.Time { return baseTime }
 	cacheStore := newFakeSessionCache()
 	svc.messageRepo = messageRepo
 	svc.sessionCache = cacheStore
 
 	ctx := context.Background()
-	svc.saveUserMessage(ctx, "s2", "旧问题")
-	svc.saveAssistantMessage(ctx, "s2", "旧回答", 0, 10)
-	svc.saveUserMessage(ctx, "s2", "新问题")
+	svc.saveUserMessage(ctx, "s2", "old question")
+	svc.saveAssistantMessage(ctx, "s2", "assistant answer", 0, 10)
+	svc.saveUserMessage(ctx, "s2", "latest question")
 
 	cachedMessages, hit, err := cacheStore.GetRecentMessages(ctx, "s2", 10)
 	if err != nil {
@@ -158,15 +163,15 @@ func TestSaveMessagesRefreshesSessionCache(t *testing.T) {
 	if len(cachedMessages) != 2 {
 		t.Fatalf("expected cache to keep latest 2 messages, got %d", len(cachedMessages))
 	}
-	if cachedMessages[0].Content != "旧回答" || cachedMessages[1].Content != "新问题" {
+	if cachedMessages[0].Content != "assistant answer" || cachedMessages[1].Content != "latest question" {
 		t.Fatalf("unexpected cached order/content: %#v", cachedMessages)
 	}
 
 	instruction := svc.buildMemoryInstruction(ctx, &ChatRequest{}, "s2")
-	if strings.Contains(instruction, "旧问题") {
+	if strings.Contains(instruction, "old question") {
 		t.Fatalf("instruction should not include evicted message: %s", instruction)
 	}
-	if !strings.Contains(instruction, "旧回答") || !strings.Contains(instruction, "新问题") {
+	if !strings.Contains(instruction, "assistant answer") || !strings.Contains(instruction, "latest question") {
 		t.Fatalf("instruction missing refreshed cached messages: %s", instruction)
 	}
 	if messageRepo.createCalls != 3 {

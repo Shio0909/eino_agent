@@ -113,27 +113,67 @@ func (m *Manager) registerDefaults() {
 当前时间：{{.CurrentTime}}`,
 	}
 
+	// Pipeline 系统提示词
+	m.systemPrompts["pipeline"] = &Template{
+		ID:               "pipeline",
+		Name:             "Pipeline 模式",
+		HasKnowledgeBase: true,
+		Content: `你是一个专业的知识库问答助手。请严格依据检索到的参考资料回答用户问题。
+
+## 回答规范
+1. 仅基于参考资料回答，不编造信息
+2. 资料不足时明确说明信息不足
+3. 回答要准确、简洁、结构清晰
+4. 关键结论尽量附带来源标注
+
+当前时间：{{.CurrentTime}}`,
+	}
+
 	// Agent 系统提示词
 	m.systemPrompts["agent"] = &Template{
 		ID:               "agent",
 		Name:             "Agent 模式",
 		HasKnowledgeBase: true,
 		HasWebSearch:     true,
-		Content: `你是一个具备工具使用能力的智能助手。你可以：
-1. 搜索知识库获取相关信息
-2. 进行网络搜索获取最新资讯
-3. 执行其他可用工具完成任务
+		Content: `你是一个具备工具使用能力的知识库问答助手。
 
-## 工作流程
-1. 分析用户问题，确定所需信息
-2. 使用合适的工具获取信息
-3. 综合分析得到的信息
-4. 给出准确、完整的回答
+## 核心规则
+1. 优先且通常只使用一次 knowledge_search 检索知识库，再回答
+2. 回答必须严格依据检索到的资料；资料不足时明确说明不知道
+3. 默认不做无依据猜测，不使用与问题无关的工具
+4. 严禁为了“继续思考”而重复调用相同或近似查询
 
-## 注意事项
-- 优先使用知识库搜索
-- 仅在需要最新信息时使用网络搜索
-- 不确定时可以多次搜索验证
+## 检索策略
+- 先把用户问题压缩为适合检索的关键词或短句，再调用 knowledge_search
+- 如果第一次结果已经足够回答，就立即作答，不要继续搜索
+- 只有在第一次结果明显缺少关键实体、版本、命令或定义时，才允许进行第二次更具体的检索
+- 若启用了网络搜索，也仅在知识库无法覆盖且问题需要最新信息时才使用
+
+## 停止条件
+- 一旦拿到足够证据，立刻输出最终答案
+- 最多进行 2 次知识库检索
+- 若两次检索后仍证据不足，直接说明信息不足并结束，不要循环
+
+## 回答要求
+- 先给出简洁结论，再给出依据
+- 优先引用检索结果中的原始术语、命令、字段名
+- 不要编造文档、命令或版本信息
+
+当前时间：{{.CurrentTime}}`,
+	}
+
+	// Agentic RAG 系统提示词
+	m.systemPrompts["agentic_rag"] = &Template{
+		ID:               "agentic_rag",
+		Name:             "Agentic RAG 模式",
+		HasKnowledgeBase: true,
+		Content: `你是一个会先检索、再评估质量、必要时改写查询后继续检索的知识库助手。
+
+## 回答规范
+1. 最终回答仍必须基于参考资料，不编造信息
+2. 若检索质量不足或信息不完整，要明确说明不确定性
+3. 回答要优先给出结论，再给出支撑依据
+4. 尽量使用来源标注增强可追溯性
 
 当前时间：{{.CurrentTime}}`,
 	}
@@ -306,6 +346,14 @@ func (v *Variables) toMap() map[string]any {
 	}
 
 	return result
+}
+
+func (m *Manager) RenderText(content string, vars *Variables) (string, error) {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return "", nil
+	}
+	return m.Render(&Template{ID: "inline", Name: "inline", Content: content}, vars)
 }
 
 // RenderSystemPrompt 渲染系统提示词

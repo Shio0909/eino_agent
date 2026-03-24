@@ -1,0 +1,98 @@
+[
+  {
+    "id": "backend_go_q1",
+    "category": "go-install-verify",
+    "status": "ok",
+    "latency_ms": 27940.85,
+    "contexts": 5,
+    "error": null
+  },
+  {
+    "id": "backend_go_q4",
+    "category": "go-install-binary",
+    "status": "ok",
+    "latency_ms": 93970.56,
+    "contexts": 5,
+    "error": null
+  },
+  {
+    "id": "backend_gin_q1",
+    "category": "gin-default",
+    "status": "ok",
+    "latency_ms": 43156.33,
+    "contexts": 5,
+    "error": null
+  },
+  {
+    "id": "backend_gin_q5",
+    "category": "gin-validation",
+    "status": "ok",
+    "latency_ms": 43536.62,
+    "contexts": 5,
+    "error": null
+  },
+  {
+    "id": "backend_grpc_q2",
+    "category": "grpc-protoc",
+    "status": "ok",
+    "latency_ms": 42722.25,
+    "contexts": 5,
+    "error": null
+  },
+  {
+    "id": "backend_grpc_q6",
+    "category": "grpc-reflection",
+    "status": "ok",
+    "latency_ms": 56170.42,
+    "contexts": 5,
+    "error": null
+  },
+  {
+    "id": "backend_openapi_q3",
+    "category": "openapi-path-required",
+    "status": "ok",
+    "latency_ms": 99246.15,
+    "contexts": 5,
+    "error": null
+  },
+  {
+    "id": "backend_openapi_q6",
+    "category": "openapi-ref-siblings",
+    "status": "ok",
+    "latency_ms": 72968.69,
+    "contexts": 5,
+    "error": null
+  },
+  {
+    "id": "backend_pg_q2",
+    "category": "pg-serializable",
+    "status": "ok",
+    "latency_ms": 16417.47,
+    "contexts": 5,
+    "error": null
+  },
+  {
+    "id": "backend_pg_q4",
+    "category": "pg-vacuum-full",
+    "status": "error",
+    "latency_ms": 120015.84,
+    "contexts": 0,
+    "error": "timed out"
+  },
+  {
+    "id": "backend_redis_q2",
+    "category": "redis-lists",
+    "status": "ok",
+    "latency_ms": 41815.97,
+    "contexts": 5,
+    "error": null
+  },
+  {
+    "id": "backend_k8s_q5",
+    "category": "k8s-job",
+    "status": "ok",
+    "latency_ms": 58682.74,
+    "contexts": 5,
+    "error": null
+  }
+]

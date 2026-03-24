@@ -272,9 +272,32 @@ func (p *RAGPipeline) RunStream(ctx context.Context, req *RAGRequest) (<-chan St
 			ch <- StreamChunk{Type: ChunkTypeError, Content: err.Error()}
 			return
 		}
+		rankedDocs := docs
+		passages := extractPassages(docs)
+		rerankedIdx := make([]int, len(passages))
+		for i := range rerankedIdx {
+			rerankedIdx[i] = i
+		}
+		if p.config.EnableRerank && !req.SkipRerank && p.reranker != nil && len(passages) > 0 {
+			if idx, rerankErr := p.reranker.Rerank(ctx, query, passages); rerankErr == nil && len(idx) > 0 {
+				rerankedIdx = idx
+			}
+		}
+		if len(rerankedIdx) > 0 {
+			reordered := make([]*schema.Document, 0, len(rerankedIdx))
+			for _, idx := range rerankedIdx {
+				if idx < 0 || idx >= len(docs) {
+					continue
+				}
+				reordered = append(reordered, docs[idx])
+			}
+			if len(reordered) > 0 {
+				rankedDocs = reordered
+			}
+		}
 
 		// 发送来源信息
-		for i, doc := range docs {
+		for i, doc := range rankedDocs {
 			if i >= p.config.RerankTopK {
 				break
 			}
@@ -287,7 +310,7 @@ func (p *RAGPipeline) RunStream(ctx context.Context, req *RAGRequest) (<-chan St
 
 		// 构建上下文
 		var contextBuilder string
-		for i, doc := range docs {
+		for i, doc := range rankedDocs {
 			if i >= p.config.RerankTopK {
 				break
 			}
