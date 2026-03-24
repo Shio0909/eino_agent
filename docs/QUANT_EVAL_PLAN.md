@@ -126,6 +126,13 @@
    - “项目内端到端成绩”
 4. 简历只放 1 行公开基准 + 1 行项目回归基准，避免堆字。
 
+当前仓库可直接运行：
+- `go run ./cmd/beir_eval -config configs/config.yaml -dataset data/beir_scifact_small -strategy vector`
+- `go run ./cmd/beir_eval -config configs/config.yaml -dataset data/beir_scifact_small -strategy hybrid`
+- `go run ./cmd/beir_eval -config configs/config.yaml -dataset data/beir_scifact_small -strategy hybrid_rerank`
+
+首轮已验证：命令可运行、可生成 Markdown/JSON 报告，并输出标准检索指标。
+
 ### E. 风险与解释
 
 - 若公开基准与业务集结果不一致：优先解释语料分布差异与任务定义差异。

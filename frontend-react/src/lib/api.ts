@@ -1,3 +1,5 @@
+import type { StreamEvent } from '../types/api'
+
 const BASE = '/api/v1'
 
 async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
@@ -18,7 +20,7 @@ export async function streamChat(
   sessionId: string,
   mode: string,
   options: { forceCitation?: boolean; enableSkills?: boolean; selectedSkills?: string[]; knowledgeBaseIds?: string[] } | undefined,
-  onEvent: (evt: { type: string; content?: string; session_id?: string; error?: string }) => void,
+  onEvent: (evt: StreamEvent & { error?: string }) => void,
   signal?: AbortSignal,
 ) {
   const res = await fetch(BASE + '/chat/stream', {
@@ -62,7 +64,7 @@ export async function streamChat(
       }
       if (!raw || raw === '[DONE]') continue
       try {
-        const data = JSON.parse(raw)
+        const data = JSON.parse(raw) as StreamEvent & { error?: string }
         onEvent(data)
       } catch { /* skip malformed */ }
     }

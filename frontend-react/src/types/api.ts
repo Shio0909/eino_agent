@@ -174,12 +174,29 @@ export interface EvalReport {
   modified_at: string
 }
 
-export type StreamEventType = 'content' | 'status' | 'error' | 'done' | 'session_id' | 'references' | 'agent_step'
+export type StreamEventType =
+  | 'content'
+  | 'status'
+  | 'error'
+  | 'done'
+  | 'session_id'
+  | 'references'
+  | 'agent_step'
+  | 'mode_resolved'
+  | 'source'
+  | 'rewrite'
+  | 'thought'
+  | 'action'
+  | 'observation'
 
 export interface StreamEvent {
   type: StreamEventType
   content?: string
   session_id?: string
+  resolved_mode?: string
+  doc_id?: string
+  tool_name?: string
+  tool_input?: string
   references?: Reference[]
   agent_step?: AgentStep
 }

@@ -1,0 +1,32 @@
+[
+  {
+    "mode": "pipeline_vector",
+    "samples": 6,
+    "ok": 6,
+    "errors": 0,
+    "avg_latency_ms": 48556.05,
+    "stream_first_token_ms": null,
+    "stream_total_ms_probe": 27555.61,
+    "stream_completed": false
+  },
+  {
+    "mode": "pipeline_hybrid",
+    "samples": 6,
+    "ok": 5,
+    "errors": 1,
+    "avg_latency_ms": 48821.21,
+    "stream_first_token_ms": null,
+    "stream_total_ms_probe": 27824.54,
+    "stream_completed": false
+  },
+  {
+    "mode": "agent_hybrid",
+    "samples": 6,
+    "ok": 5,
+    "errors": 1,
+    "avg_latency_ms": 27073.72,
+    "stream_first_token_ms": null,
+    "stream_total_ms_probe": 19556.57,
+    "stream_completed": false
+  }
+]

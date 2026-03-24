@@ -1,21 +1,7 @@
-// Package pipeline - Agentic RAG (Corrective RAG) 实现
+// Package pipeline implements Agentic RAG (Corrective RAG).
 //
-// 【核心亮点】使用 Eino Graph 有环编排实现 Corrective RAG 机制：
-// - 检索后自动评估结果质量
-// - 质量不达标时自动改写 Query 并重新检索
-// - 支持 Web 搜索降级兜底
-// - 通过 MaxRetries 防止死循环
-//
-// 流程图：
-//
-//	START → [query_rewrite] → [retrieve] → [evaluate]
-//	                 ↑                          │
-//	                 │      score < threshold   │
-//	                 └──────── && retry < max ──┘
-//	                                            │
-//	                                  score >= threshold
-//	                                            ↓
-//	                                       [generate] → END
+// The graph rewrites the query, retrieves context, evaluates retrieval quality,
+// and retries until the quality threshold is met or the retry budget is exhausted.
 package pipeline
 
 import (
@@ -33,32 +19,30 @@ import (
 	"eino_agent/internal/config"
 )
 
-// ── State ───────────────────────────────────────────────────────
-
-// AgenticRAGState 是 Agentic RAG Graph 在各节点间共享的状态
+// AgenticRAGState carries shared state across graph nodes.
 type AgenticRAGState struct {
-	// 输入
-	OriginalQuery string // 用户原始查询
-	CurrentQuery  string // 当前（可能被改写过的）查询
-	SystemPrompt  string // 系统提示词
+	// Inputs
+	OriginalQuery string // The original user query.
+	CurrentQuery  string // The current rewritten query.
+	SystemPrompt  string // The runtime system prompt.
 
-	// 检索
-	Documents      []*schema.Document // 检索到的文档
-	RetrievalScore float64            // 检索质量分数 (0-1)
-	RetryCount     int                // 已重试次数
+	// Retrieval
+	Documents      []*schema.Document // Retrieved documents for the current attempt.
+	RetrievalScore float64            // Retrieval quality score in the range [0, 1].
+	RetryCount     int                // Number of retries already attempted.
 
-	// 控制
-	MaxRetries       int     // 最大重试次数
-	QualityThreshold float64 // 质量阈值
-	UseWebSearch     bool    // 当前轮次是否使用 Web 搜索
+	// Control
+	MaxRetries       int     // Maximum number of rewrite/retrieve retries.
+	QualityThreshold float64 // Minimum retrieval quality required to continue.
+	UseWebSearch     bool    // Whether web search is enabled for fallback.
 
-	// 输出
-	FinalAnswer  string // 最终生成的回答
+	// Outputs
+	FinalAnswer  string // Final generated answer.
 	Sources      []AgenticSource
-	QueryHistory []string // 查询改写历史
+	QueryHistory []string // History of rewritten queries.
 }
 
-// AgenticSource 来源信息
+// AgenticSource describes a source used by the final answer.
 type AgenticSource struct {
 	Content string  `json:"content"`
 	DocID   string  `json:"doc_id"`
@@ -66,47 +50,50 @@ type AgenticSource struct {
 	Type    string  `json:"type"` // "knowledge" or "web"
 }
 
-// ── AgenticRAGPipeline ──────────────────────────────────────────
-
-// AgenticRAGPipeline 基于 Eino Graph 有环编排的 Corrective RAG
+// AgenticRAGPipeline is a graph-based corrective RAG pipeline.
 type AgenticRAGPipeline struct {
-	runnable  compose.Runnable[string, string]
-	chatModel model.ChatModel
-	retriever retriever.Retriever
-	cfg       *config.AgenticRAGConfig
+	runnable     compose.Runnable[string, string]
+	chatModel    model.ChatModel
+	retriever    retriever.Retriever
+	cfg          *config.AgenticRAGConfig
+	systemPrompt string
 }
 
-// AgenticRAGOption 配置选项
+// AgenticRAGOption configures AgenticRAGPipeline dependencies.
 type AgenticRAGOption func(*agenticRAGDeps)
 
 type agenticRAGDeps struct {
 	chatModel    model.ChatModel
 	retriever    retriever.Retriever
-	webRetriever retriever.Retriever // 可选的 Web 搜索 retriever
+	webRetriever retriever.Retriever // Optional web retriever for fallback.
+	systemPrompt string
 }
 
-// WithAgenticChatModel 设置 ChatModel
+// WithAgenticChatModel sets the chat model dependency.
 func WithAgenticChatModel(m model.ChatModel) AgenticRAGOption {
 	return func(d *agenticRAGDeps) { d.chatModel = m }
 }
 
-// WithAgenticRetriever 设置知识库检索器
+// WithAgenticRetriever sets the primary knowledge retriever.
 func WithAgenticRetriever(r retriever.Retriever) AgenticRAGOption {
 	return func(d *agenticRAGDeps) { d.retriever = r }
 }
 
-// WithAgenticWebRetriever 设置 Web 搜索检索器（可选，用于降级）
+// WithAgenticWebRetriever sets the optional web retriever fallback.
 func WithAgenticWebRetriever(r retriever.Retriever) AgenticRAGOption {
 	return func(d *agenticRAGDeps) { d.webRetriever = r }
 }
 
-// NewAgenticRAGPipeline 创建 Agentic RAG 流水线
+// WithAgenticSystemPrompt sets the runtime system prompt.
+func WithAgenticSystemPrompt(systemPrompt string) AgenticRAGOption {
+	return func(d *agenticRAGDeps) { d.systemPrompt = systemPrompt }
+}
+
+// NewAgenticRAGPipeline builds the corrective RAG graph.
 //
-// 【Eino 特点】
-// - 使用 compose.NewGraph 创建有状态的图
-// - 使用 WithGenLocalState 在节点之间共享状态
-// - 使用 NewGraphBranch 实现条件分支（有环 → Pregel 模式）
-// - 使用 WithMaxRunSteps 防止死循环
+// The graph uses local state to carry retries, retrieved documents,
+// and evaluation scores across rewrite, retrieve, evaluate, and generate nodes.
+// It also uses a conditional branch to either retry retrieval or continue to generation.
 func NewAgenticRAGPipeline(ctx context.Context, cfg *config.AgenticRAGConfig, opts ...AgenticRAGOption) (*AgenticRAGPipeline, error) {
 	deps := &agenticRAGDeps{}
 	for _, opt := range opts {
@@ -120,27 +107,29 @@ func NewAgenticRAGPipeline(ctx context.Context, cfg *config.AgenticRAGConfig, op
 	}
 
 	p := &AgenticRAGPipeline{
-		chatModel: deps.chatModel,
-		retriever: deps.retriever,
-		cfg:       cfg,
+		chatModel:    deps.chatModel,
+		retriever:    deps.retriever,
+		cfg:          cfg,
+		systemPrompt: strings.TrimSpace(deps.systemPrompt),
 	}
 
-	// 构建 Graph
+	// Build the graph.
 	graph := compose.NewGraph[string, string](
 		compose.WithGenLocalState(func(ctx context.Context) *AgenticRAGState {
 			return &AgenticRAGState{
 				MaxRetries:       cfg.MaxRetries,
 				QualityThreshold: cfg.QualityThreshold,
+				SystemPrompt:     strings.TrimSpace(deps.systemPrompt),
 			}
 		}),
 	)
 
-	// ── 节点 1: 查询改写 ──
+	// Node 1: query rewrite.
 	rewriteNode := compose.InvokableLambda(p.queryRewrite)
 	if err := graph.AddLambdaNode("query_rewrite", rewriteNode,
 		compose.WithStatePreHandler(func(ctx context.Context, input string, state *AgenticRAGState) (string, error) {
 			if state.OriginalQuery == "" {
-				// 第一次进入：记录原始查询
+				// Record the first incoming query as the baseline request.
 				state.OriginalQuery = input
 				state.CurrentQuery = input
 				state.QueryHistory = []string{input}
@@ -156,25 +145,25 @@ func NewAgenticRAGPipeline(ctx context.Context, cfg *config.AgenticRAGConfig, op
 		return nil, fmt.Errorf("add query_rewrite node: %w", err)
 	}
 
-	// ── 节点 2: 检索 ──
+	// ── 节点 2: 检??──
 	retrieveNode := compose.InvokableLambda(p.retrieve)
 	if err := graph.AddLambdaNode("retrieve", retrieveNode,
 		compose.WithStatePreHandler(func(ctx context.Context, input string, state *AgenticRAGState) (string, error) {
-			// 如果是降级到 Web 搜索的情况，打标记
+			// 如果是降级到 Web 搜索的情况，打标??
 			if state.RetryCount >= 2 && cfg.EnableWebFallback {
 				state.UseWebSearch = true
 			}
 			return state.CurrentQuery, nil
 		}),
 		compose.WithStatePostHandler(func(ctx context.Context, output string, state *AgenticRAGState) (string, error) {
-			// output 是 retrieve 节点的字符串输出，实际文档存在 state.Documents 中
+			// output ??retrieve 节点的字符串输出，实际文档存??state.Documents ??
 			return output, nil
 		}),
 	); err != nil {
 		return nil, fmt.Errorf("add retrieve node: %w", err)
 	}
 
-	// ── 节点 3: 评估检索质量 ──
+	// ── 节点 3: 评估检索质??──
 	evaluateNode := compose.InvokableLambda(p.evaluate)
 	if err := graph.AddLambdaNode("evaluate", evaluateNode,
 		compose.WithStatePostHandler(func(ctx context.Context, output string, state *AgenticRAGState) (string, error) {
@@ -191,7 +180,7 @@ func NewAgenticRAGPipeline(ctx context.Context, cfg *config.AgenticRAGConfig, op
 		return nil, fmt.Errorf("add generate node: %w", err)
 	}
 
-	// ── 边 ──
+	// ── ??──
 	if err := graph.AddEdge(compose.START, "query_rewrite"); err != nil {
 		return nil, fmt.Errorf("add edge START -> query_rewrite: %w", err)
 	}
@@ -205,8 +194,8 @@ func NewAgenticRAGPipeline(ctx context.Context, cfg *config.AgenticRAGConfig, op
 		return nil, fmt.Errorf("add edge generate -> END: %w", err)
 	}
 
-	// ── 条件分支：评估后决定是重试还是生成 ──
-	// 【Eino 特点】这是实现有环图的关键 — evaluate 节点的输出可以回到 query_rewrite
+	// ── 条件分支：评估后决定是重试还是生??──
+	// 【Eino 特点】这是实现有环图的关????evaluate 节点的输出可以回??query_rewrite
 	branch := compose.NewGraphBranch(func(ctx context.Context, evaluateOutput string) (string, error) {
 		var retrievalScore, qualityThreshold float64
 		var retryCount, maxRetries int
@@ -219,23 +208,23 @@ func NewAgenticRAGPipeline(ctx context.Context, cfg *config.AgenticRAGConfig, op
 			return nil
 		})
 		if err != nil {
-			// 无法获取状态，降级到直接生成
+			// 无法获取状态，降级到直接生??
 			log.Printf("[AgenticRAG] 无法获取状态，直接生成: %v", err)
 			return "generate", nil
 		}
 
 		if retrievalScore >= qualityThreshold {
-			log.Printf("[AgenticRAG] 检索质量达标 (%.2f >= %.2f)，进入生成",
+			log.Printf("[AgenticRAG] retrieval score meets threshold (%.2f >= %.2f); continue to generation",
 				retrievalScore, qualityThreshold)
 			return "generate", nil
 		}
 
 		if retryCount >= maxRetries {
-			log.Printf("[AgenticRAG] 已达最大重试次数 (%d)，使用当前结果生成", maxRetries)
+			log.Printf("[AgenticRAG] reached max retries (%d); continue to generation", maxRetries)
 			return "generate", nil
 		}
 
-		log.Printf("[AgenticRAG] 检索质量不足 (%.2f < %.2f)，第 %d 次重试",
+		log.Printf("[AgenticRAG] retrieval score below threshold (%.2f < %.2f); retry rewrite #%d",
 			retrievalScore, qualityThreshold, retryCount)
 		return "query_rewrite", nil
 
@@ -249,7 +238,7 @@ func NewAgenticRAGPipeline(ctx context.Context, cfg *config.AgenticRAGConfig, op
 	}
 
 	// ── 编译 ──
-	// 【Eino 特点】Pregel 模式（默认）支持有环图；WithMaxRunSteps 防止死循环
+	// 【Eino 特点】Pregel 模式（默认）支持有环图；WithMaxRunSteps 防止死循??
 	runnable, err := graph.Compile(ctx,
 		compose.WithMaxRunSteps(cfg.MaxRunSteps),
 		compose.WithGraphName("agentic_rag"),
@@ -262,57 +251,52 @@ func NewAgenticRAGPipeline(ctx context.Context, cfg *config.AgenticRAGConfig, op
 	return p, nil
 }
 
-// ── 节点实现 ────────────────────────────────────────────────────
+// Node implementations
 
-// queryRewrite 查询改写节点
-// 第一次直接透传；重试时让 LLM 基于之前的检索反馈改写查询
+// queryRewrite rewrites the query for the next retrieval attempt.
+// The first attempt keeps the original query. Retries ask the LLM to improve it using retrieval feedback.
 func (p *AgenticRAGPipeline) queryRewrite(ctx context.Context, query string) (string, error) {
 	startTime := time.Now()
 	var retryCount int
 	var currentQuery string
+	var originalQuery string
 
 	_ = compose.ProcessState[*AgenticRAGState](ctx, func(ctx context.Context, state *AgenticRAGState) error {
 		retryCount = state.RetryCount
 		currentQuery = state.CurrentQuery
-		return nil
-	})
-
-	if retryCount == 0 {
-		// 第一次不改写，直接用原始查询
-		log.Printf("[Timing][AgenticRAG] stage=rewrite duration_ms=%d retry=%d skipped=true", time.Since(startTime).Milliseconds(), retryCount)
-		return query, nil
-	}
-
-	// 重试时：让 LLM 改写查询
-	log.Printf("[AgenticRAG][Rewrite] 第 %d 次改写，当前查询: %s", retryCount, currentQuery)
-
-	var originalQuery string
-	_ = compose.ProcessState[*AgenticRAGState](ctx, func(ctx context.Context, state *AgenticRAGState) error {
 		originalQuery = state.OriginalQuery
 		return nil
 	})
 
-	prompt := fmt.Sprintf(`你是一个搜索查询优化专家。用户的原始问题是："%s"
-
-之前的搜索查询 "%s" 没有找到足够好的结果。
-
-请改写搜索查询，使其更容易匹配到相关文档。改写策略：
-1. 尝试使用同义词或近义词
-2. 扩展或缩小搜索范围
-3. 提取核心关键词
-4. 如果是专业术语，尝试用更通用的表达
-
-只输出改写后的查询，不要解释。`, originalQuery, currentQuery)
-
-	messages := []*schema.Message{
-		{Role: schema.User, Content: prompt},
+	if retryCount == 0 {
+		log.Printf("[Timing][AgenticRAG] stage=rewrite duration_ms=%d retry=%d skipped=true", time.Since(startTime).Milliseconds(), retryCount)
+		return query, nil
 	}
 
-	resp, err := p.chatModel.Generate(ctx, messages)
+	log.Printf("[AgenticRAG][Rewrite] retry=%d current_query=%q", retryCount, currentQuery)
+
+	prompt := fmt.Sprintf(`You are improving a retrieval query for a knowledge search system.
+
+Original user question:
+%s
+
+Current query that did not retrieve strong enough evidence:
+%s
+
+Rewrite the query to improve retrieval quality.
+Guidelines:
+- preserve the user's intent
+- use clearer or more common terminology
+- expand or narrow the scope only when helpful
+- return a single rewritten query and nothing else`, originalQuery, currentQuery)
+
+	resp, err := p.chatModel.Generate(ctx, []*schema.Message{
+		{Role: schema.User, Content: prompt},
+	})
 	log.Printf("[Timing][AgenticRAG] stage=rewrite duration_ms=%d retry=%d", time.Since(startTime).Milliseconds(), retryCount)
 	if err != nil {
-		log.Printf("[AgenticRAG][Rewrite] LLM 改写失败，使用原始查询: %v", err)
-		return query, nil // 改写失败不影响主流程
+		log.Printf("[AgenticRAG][Rewrite] failed to rewrite query, fallback to original: %v", err)
+		return query, nil
 	}
 
 	rewritten := strings.TrimSpace(resp.Content)
@@ -320,11 +304,11 @@ func (p *AgenticRAGPipeline) queryRewrite(ctx context.Context, query string) (st
 		return query, nil
 	}
 
-	log.Printf("[AgenticRAG][Rewrite] 改写结果: %s → %s", currentQuery, rewritten)
+	log.Printf("[AgenticRAG][Rewrite] rewritten_query=%q", rewritten)
 	return rewritten, nil
 }
 
-// retrieve 检索节点
+// retrieve runs knowledge retrieval for the current query.
 func (p *AgenticRAGPipeline) retrieve(ctx context.Context, query string) (string, error) {
 	startTime := time.Now()
 	var retryCount int
@@ -336,8 +320,7 @@ func (p *AgenticRAGPipeline) retrieve(ctx context.Context, query string) (string
 		return nil
 	})
 
-	log.Printf("[AgenticRAG][Retrieve] 检索查询: %s (retry=%d, webFallback=%v)",
-		query, retryCount, useWebSearch)
+	log.Printf("[AgenticRAG][Retrieve] query=%q retry=%d web_fallback=%v", query, retryCount, useWebSearch)
 
 	docs, err := p.retriever.Retrieve(ctx, query)
 	log.Printf("[Timing][AgenticRAG] stage=retrieve duration_ms=%d retry=%d docs=%d", time.Since(startTime).Milliseconds(), retryCount, len(docs))
@@ -345,18 +328,16 @@ func (p *AgenticRAGPipeline) retrieve(ctx context.Context, query string) (string
 		return "", fmt.Errorf("retrieve: %w", err)
 	}
 
-	// 将文档写入状态
 	_ = compose.ProcessState[*AgenticRAGState](ctx, func(ctx context.Context, state *AgenticRAGState) error {
 		state.Documents = docs
 		return nil
 	})
 
-	log.Printf("[AgenticRAG][Retrieve] 检索到 %d 个文档", len(docs))
+	log.Printf("[AgenticRAG][Retrieve] documents=%d", len(docs))
 
-	// 返回文档内容的摘要（用作下游节点的输入）
 	var sb strings.Builder
 	for i, doc := range docs {
-		if i >= 5 { // 最多传递 5 个
+		if i >= 5 {
 			break
 		}
 		sb.WriteString(fmt.Sprintf("[%d] %s\n\n", i+1, truncate(doc.Content, 200)))
@@ -364,8 +345,8 @@ func (p *AgenticRAGPipeline) retrieve(ctx context.Context, query string) (string
 	return sb.String(), nil
 }
 
-// evaluate 评估检索质量
-// 两级评估：规则判断优先（零延迟），LLM 评估兜底
+// evaluate scores retrieval quality before generation.
+// It uses a lightweight rule-based check first, then falls back to an LLM-based evaluation.
 func (p *AgenticRAGPipeline) evaluate(ctx context.Context, retrieveOutput string) (string, error) {
 	startTime := time.Now()
 	var docs []*schema.Document
@@ -377,30 +358,22 @@ func (p *AgenticRAGPipeline) evaluate(ctx context.Context, retrieveOutput string
 		return nil
 	})
 
-	// ── 规则评估（快速，零 LLM 调用） ──
-
 	var score float64
-
-	// 规则 1: 没有检索到任何文档 → 直接判定质量差
 	if len(docs) == 0 {
 		score = 0
-		log.Printf("[AgenticRAG][Evaluate] 规则判定：无文档，score=0")
+		log.Printf("[AgenticRAG][Evaluate] no documents retrieved, score=0")
 	} else if len(docs) <= 1 {
-		// 规则 2: 检索到文档非常少 → 质量可疑
 		score = 0.3
-		log.Printf("[AgenticRAG][Evaluate] 规则判定：文档过少(%d)，score=0.3", len(docs))
+		log.Printf("[AgenticRAG][Evaluate] only %d document retrieved, score=0.3", len(docs))
 	} else {
-		// ── LLM 评估（兜底，更准确） ──
 		var err error
 		score, err = p.llmEvaluate(ctx, currentQuery, docs)
 		if err != nil {
-			// LLM 评估失败时，给一个中等分数让流程继续
-			log.Printf("[AgenticRAG][Evaluate] LLM 评估失败: %v，使用默认分数 0.5", err)
+			log.Printf("[AgenticRAG][Evaluate] llm evaluation failed, fallback to 0.5: %v", err)
 			score = 0.5
 		}
 	}
 
-	// 将分数写入状态
 	_ = compose.ProcessState[*AgenticRAGState](ctx, func(ctx context.Context, state *AgenticRAGState) error {
 		state.RetrievalScore = score
 		return nil
@@ -411,64 +384,59 @@ func (p *AgenticRAGPipeline) evaluate(ctx context.Context, retrieveOutput string
 		threshold = state.QualityThreshold
 		return nil
 	})
-	log.Printf("[AgenticRAG][Evaluate] 最终评估分数: %.2f (阈值: %.2f)", score, threshold)
+
+	log.Printf("[AgenticRAG][Evaluate] score=%.2f threshold=%.2f", score, threshold)
 	log.Printf("[Timing][AgenticRAG] stage=evaluate duration_ms=%d docs=%d score=%.2f threshold=%.2f", time.Since(startTime).Milliseconds(), len(docs), score, threshold)
 	return retrieveOutput, nil
 }
 
-// llmEvaluate 使用 LLM 评估检索结果与查询的相关性
+// llmEvaluate asks the LLM to judge how well the retrieved documents answer the query.
 func (p *AgenticRAGPipeline) llmEvaluate(ctx context.Context, query string, docs []*schema.Document) (float64, error) {
 	startTime := time.Now()
-	// 构建评估文本
 	var docsText strings.Builder
 	for i, doc := range docs {
 		if i >= 5 {
 			break
 		}
-		content := truncate(doc.Content, 300)
-		docsText.WriteString(fmt.Sprintf("文档 %d:\n%s\n\n", i+1, content))
+		docsText.WriteString(fmt.Sprintf("Document %d:\n%s\n\n", i+1, truncate(doc.Content, 300)))
 	}
 
-	prompt := fmt.Sprintf(`你是一个搜索结果质量评估专家。请评估以下检索结果与用户问题的相关程度。
+	prompt := fmt.Sprintf(`You are grading retrieval quality for a question answering system.
 
-用户问题：%s
-
-检索结果：
+User question:
 %s
 
-请对这些检索结果的整体相关性给出评价。只输出一个词：
-- "高" — 检索结果能很好地回答用户问题
-- "中" — 检索结果部分相关，但可能不够完整
-- "低" — 检索结果与用户问题关联不大
+Retrieved documents:
+%s
 
-只输出"高"、"中"或"低"，不要解释。`, query, docsText.String())
+Return exactly one label:
+- high: the documents strongly support answering the question
+- medium: the documents are somewhat relevant but incomplete
+- low: the documents are mostly not relevant`, query, docsText.String())
 
-	messages := []*schema.Message{
+	resp, err := p.chatModel.Generate(ctx, []*schema.Message{
 		{Role: schema.User, Content: prompt},
-	}
-
-	resp, err := p.chatModel.Generate(ctx, messages)
+	})
 	log.Printf("[Timing][AgenticRAG] stage=llm_evaluate duration_ms=%d docs=%d", time.Since(startTime).Milliseconds(), len(docs))
 	if err != nil {
 		return 0, err
 	}
 
-	// 将评价映射为分数
-	answer := strings.TrimSpace(resp.Content)
+	answer := strings.ToLower(strings.TrimSpace(resp.Content))
 	switch {
-	case strings.Contains(answer, "高"):
+	case strings.Contains(answer, "high"):
 		return 0.9, nil
-	case strings.Contains(answer, "中"):
+	case strings.Contains(answer, "medium"):
 		return 0.6, nil
-	case strings.Contains(answer, "低"):
+	case strings.Contains(answer, "low"):
 		return 0.2, nil
 	default:
-		log.Printf("[AgenticRAG][Evaluate] LLM 返回了非预期的评价: %s，默认为 0.5", answer)
+		log.Printf("[AgenticRAG][Evaluate] unexpected llm label %q, fallback to 0.5", answer)
 		return 0.5, nil
 	}
 }
 
-// generate 生成最终回答
+// generate produces the final grounded answer.
 func (p *AgenticRAGPipeline) generate(ctx context.Context, evaluateOutput string) (string, error) {
 	startTime := time.Now()
 	var docs []*schema.Document
@@ -488,49 +456,43 @@ func (p *AgenticRAGPipeline) generate(ctx context.Context, evaluateOutput string
 		return nil
 	})
 
-	// 构建上下文
 	var contextBuilder strings.Builder
 	for i, doc := range docs {
 		if i >= 5 {
 			break
 		}
-		contextBuilder.WriteString(fmt.Sprintf("[来源 %d] %s\n\n", i+1, doc.Content))
+		contextBuilder.WriteString(fmt.Sprintf("[Source %d] %s\n\n", i+1, doc.Content))
 	}
 
-	// 构建提示词
 	if systemPrompt == "" {
-		systemPrompt = `你是一个专业的知识库问答助手。请根据提供的参考资料回答用户问题。
-
-回答要求：
-1. 仅基于参考资料回答，不编造信息
-2. 如果资料不足以完整回答，请明确告知
-3. 适当引用来源编号（如 [来源 1]）
-4. 回答准确、简洁、专业`
+		systemPrompt = `You are a grounded knowledge-base assistant.
+Answer using the provided sources when possible.
+If the sources are insufficient, say so clearly.
+When citing evidence, reference the source number such as [Source 1].`
 	}
 
 	qualityNote := ""
 	if retrievalScore < qualityThreshold {
-		qualityNote = "\n\n注意：检索结果的相关性可能不足，请在回答中注明信息可能不够完整。"
+		qualityNote = "\n\nNote: retrieval quality is below the preferred threshold, so the answer may be incomplete."
 	}
 
 	retryNote := ""
 	if retryCount > 1 {
-		retryNote = fmt.Sprintf("\n(经过 %d 次检索优化)", retryCount)
+		retryNote = fmt.Sprintf("\nThe system retried retrieval %d times before answering.", retryCount)
 	}
 
-	userPrompt := fmt.Sprintf(`参考资料：
+	userPrompt := fmt.Sprintf(`Reference material:
 %s
 
-用户问题：%s%s%s
+User question:
+%s%s%s
 
-请根据以上参考资料回答用户的问题。`, contextBuilder.String(), originalQuery, qualityNote, retryNote)
+Answer the question using the reference material above.`, contextBuilder.String(), originalQuery, qualityNote, retryNote)
 
-	messages := []*schema.Message{
+	resp, err := p.chatModel.Generate(ctx, []*schema.Message{
 		{Role: schema.System, Content: systemPrompt},
 		{Role: schema.User, Content: userPrompt},
-	}
-
-	resp, err := p.chatModel.Generate(ctx, messages)
+	})
 	log.Printf("[Timing][AgenticRAG] stage=generate duration_ms=%d docs=%d context_chars=%d retry=%d", time.Since(startTime).Milliseconds(), len(docs), contextBuilder.Len(), retryCount)
 	if err != nil {
 		return "", fmt.Errorf("generate: %w", err)
@@ -539,9 +501,9 @@ func (p *AgenticRAGPipeline) generate(ctx context.Context, evaluateOutput string
 	return resp.Content, nil
 }
 
-// ── 公开 API ────────────────────────────────────────────────────
+// Public API
 
-// Run 执行 Agentic RAG
+// Run executes Agentic RAG synchronously.
 func (p *AgenticRAGPipeline) Run(ctx context.Context, query string) (*AgenticRAGResponse, error) {
 	answer, err := p.runnable.Invoke(ctx, query)
 	if err != nil {
@@ -553,15 +515,15 @@ func (p *AgenticRAGPipeline) Run(ctx context.Context, query string) (*AgenticRAG
 	}, nil
 }
 
-// RunStream 流式执行 Agentic RAG
+// RunStream executes Agentic RAG with streaming events.
 func (p *AgenticRAGPipeline) RunStream(ctx context.Context, query string) (<-chan AgenticStreamEvent, error) {
 	ch := make(chan AgenticStreamEvent, 100)
 
 	go func() {
 		defer close(ch)
 
-		// 目前使用 Invoke 模式，后续可升级为 Stream
-		// TODO: 利用 Eino Graph 的 Stream 能力实现真正的流式输出
+		// 目前使用 Invoke 模式，后续可升级??Stream
+		// TODO: 利用 Eino Graph ??Stream 能力实现真正的流式输??
 		ch <- AgenticStreamEvent{Type: AgenticEventStatus, Content: "正在分析问题..."}
 
 		answer, err := p.runnable.Invoke(ctx, query)
@@ -577,9 +539,9 @@ func (p *AgenticRAGPipeline) RunStream(ctx context.Context, query string) (<-cha
 	return ch, nil
 }
 
-// ── 响应类型 ────────────────────────────────────────────────────
+// Response types
 
-// AgenticRAGResponse Agentic RAG 响应
+// AgenticRAGResponse is the synchronous response payload.
 type AgenticRAGResponse struct {
 	Answer       string          `json:"answer"`
 	Sources      []AgenticSource `json:"sources,omitempty"`
@@ -587,25 +549,25 @@ type AgenticRAGResponse struct {
 	QueryHistory []string        `json:"query_history,omitempty"`
 }
 
-// AgenticStreamEvent 流式事件
+// AgenticStreamEvent is a streaming event emitted by Agentic RAG.
 type AgenticStreamEvent struct {
 	Type    AgenticEventType `json:"type"`
 	Content string           `json:"content,omitempty"`
 }
 
-// AgenticEventType 事件类型
+// AgenticEventType enumerates stream event types.
 type AgenticEventType string
 
 const (
-	AgenticEventStatus  AgenticEventType = "status"  // 状态信息（检索中/评估中/改写中）
-	AgenticEventContent AgenticEventType = "content" // 最终内容
+	AgenticEventStatus  AgenticEventType = "status"  // 状态信息（检索中/评估??改写中）
+	AgenticEventContent AgenticEventType = "content" // 最终内??
 	AgenticEventDone    AgenticEventType = "done"    // 完成
 	AgenticEventError   AgenticEventType = "error"   // 错误
 )
 
-// ── 工具函数 ────────────────────────────────────────────────────
+// Helpers
 
-// truncate 截断字符串
+// truncate shortens a string to the requested rune length.
 func truncate(s string, maxLen int) string {
 	runes := []rune(s)
 	if len(runes) <= maxLen {

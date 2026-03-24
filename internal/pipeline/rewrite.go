@@ -16,6 +16,14 @@ type LLMRewriter struct {
 	template prompt.ChatTemplate
 }
 
+func NewPromptRewriter(model model.ChatModel, userPrompt string) *LLMRewriter {
+	tpl := prompt.FromMessages(
+		schema.FString,
+		schema.UserMessage(userPrompt),
+	)
+	return &LLMRewriter{model: model, template: tpl}
+}
+
 // NewLLMRewriter 创建 LLM 重写器
 func NewLLMRewriter(model model.ChatModel) *LLMRewriter {
 	tpl := prompt.FromMessages(

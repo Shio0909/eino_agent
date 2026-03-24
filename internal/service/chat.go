@@ -25,6 +25,7 @@ import (
 	"eino_agent/internal/database/repository"
 	"eino_agent/internal/filter"
 	"eino_agent/internal/pipeline"
+	promptmgr "eino_agent/internal/prompt"
 	internalTool "eino_agent/internal/tool"
 )
 
@@ -43,8 +44,10 @@ type ChatService struct {
 	agent           *react.Agent
 	knowledgeTool   *internalTool.KnowledgeTool  // Agent 模式的知识库工具引用
 	agenticRAG      *pipeline.AgenticRAGPipeline // Agentic RAG (Corrective RAG)
-	mcpTools        []tool.BaseTool              // MCP 远程工具
-	skillMiddleware *adk.AgentMiddleware         // Eino 原生 skill 中间件
+	skillBackend    skill.Backend
+	mcpTools        []tool.BaseTool      // MCP 远程工具
+	skillMiddleware *adk.AgentMiddleware // Eino 原生 skill 中间件
+	promptManager   *promptmgr.Manager
 
 	// 持久化
 	sessionRepo  repository.SessionRepository
@@ -55,11 +58,12 @@ type ChatService struct {
 // NewChatService 创建聊天服务
 func NewChatService(cfg *config.Config) (*ChatService, error) {
 	svc := &ChatService{
-		config:       cfg,
-		sessionCache: cachepkg.NewNoopSessionCache(),
+		config:        cfg,
+		sessionCache:  cachepkg.NewNoopSessionCache(),
+		promptManager: promptmgr.NewManager(),
 	}
 
-	// 初始化 Eino 原生 skill 中间件（渐进式披露）
+	// 初始化 skill 中间件（渐进式披露）
 	if cfg.Agent.EnableSkills {
 		backend, err := skill.NewLocalBackend(&skill.LocalBackendConfig{
 			BaseDir: cfg.Agent.SkillsDir,
@@ -74,6 +78,7 @@ func NewChatService(cfg *config.Config) (*ChatService, error) {
 		if err != nil {
 			return nil, fmt.Errorf("init skill middleware: %w", err)
 		}
+		svc.skillBackend = backend
 		svc.skillMiddleware = &mw
 	}
 
@@ -224,22 +229,6 @@ func (s *ChatService) buildToolsWithRetriever(runtimeRetriever retriever.Retriev
 	}
 
 	return tools, kt
-}
-
-// ChatRequest 聊天请求
-type ChatRequest struct {
-	Message          string   `json:"message"`
-	SessionID        string   `json:"session_id"`
-	UseAgent         bool     `json:"use_agent"`      // 是否使用 Agent 模式
-	Mode             string   `json:"mode,omitempty"` // 模式: "pipeline", "agent", "agentic_rag"
-	TenantID         int      `json:"tenant_id,omitempty"`
-	UserID           string   `json:"user_id,omitempty"`
-	ForceCitation    bool     `json:"force_citation,omitempty"` // 强制引用模式（可选）
-	KnowledgeBaseIDs []string `json:"knowledge_base_ids,omitempty"`
-	DocumentIDs      []string `json:"document_ids,omitempty"`
-	EnableLongTerm   *bool    `json:"enable_long_term,omitempty"`
-	// EnableSkills / SelectedSkills 已废弃：skills 由 Eino 原生中间件在 Agent 初始化时注入，
-	// LLM 通过渐进式披露自动选择，无需客户端指定。
 }
 
 func (s *ChatService) buildRuntimeInstruction(ctx context.Context, req *ChatRequest, sessionID string) string {
@@ -401,40 +390,6 @@ func (s *ChatService) getRuntimeRetriever(req *ChatRequest) retriever.Retriever 
 		}
 	}
 	return &scopedRetriever{base: s.retriever, scope: scope}
-}
-
-func (s *ChatService) buildRuntimeAgent(ctx context.Context, runtimeRetriever retriever.Retriever) (*react.Agent, *internalTool.KnowledgeTool, error) {
-	toolCallingModel, ok := any(s.chatModel).(model.ToolCallingChatModel)
-	if !ok {
-		return nil, nil, fmt.Errorf("agent mode requires ToolCallingChatModel, current model type: %T", s.chatModel)
-	}
-
-	tools, kt := s.buildToolsWithRetriever(runtimeRetriever)
-	tools = append(tools, s.mcpTools...)
-	if s.skillMiddleware != nil {
-		tools = append(tools, s.skillMiddleware.AdditionalTools...)
-	}
-
-	systemInstruction := s.config.Agent.SystemPrompt
-	if s.skillMiddleware != nil && s.skillMiddleware.AdditionalInstruction != "" {
-		systemInstruction = systemInstruction + "\n\n" + s.skillMiddleware.AdditionalInstruction
-	}
-
-	agent, err := react.NewAgent(ctx, &react.AgentConfig{
-		ToolsConfig:      compose.ToolsNodeConfig{Tools: tools},
-		MaxStep:          s.config.Agent.MaxSteps,
-		ToolCallingModel: toolCallingModel,
-		MessageModifier: func(ctx context.Context, input []*schema.Message) []*schema.Message {
-			if len(input) == 0 {
-				return []*schema.Message{{Role: schema.System, Content: systemInstruction}}
-			}
-			out := make([]*schema.Message, 0, len(input)+1)
-			out = append(out, &schema.Message{Role: schema.System, Content: systemInstruction})
-			out = append(out, input...)
-			return out
-		},
-	})
-	return agent, kt, err
 }
 
 func (s *ChatService) buildRuntimePipeline(runtimeRetriever retriever.Retriever) *pipeline.RAGPipeline {
@@ -613,143 +568,6 @@ func appendInstructionToMessage(message, instruction string) string {
 	return fmt.Sprintf("%s\n\n请遵循以下回答要求：\n%s", message, instruction)
 }
 
-func (s *ChatService) shortTermMessageLimit() int {
-	window := s.config.Memory.WindowSize
-	if window <= 0 {
-		window = 8
-	}
-	return window * 2
-}
-
-func (s *ChatService) shortTermCacheTTL() time.Duration {
-	ttlMinutes := s.config.Memory.ShortTermCacheTTLMinutes
-	if ttlMinutes <= 0 {
-		ttlMinutes = 60
-	}
-	return time.Duration(ttlMinutes) * time.Minute
-}
-
-func (s *ChatService) getShortTermMessages(ctx context.Context, sessionID string, limit int) ([]*repository.Message, error) {
-	if s.messageRepo == nil || sessionID == "" {
-		return nil, nil
-	}
-	if limit <= 0 {
-		limit = s.shortTermMessageLimit()
-	}
-
-	if s.sessionCache != nil {
-		cachedMessages, hit, err := s.sessionCache.GetRecentMessages(ctx, sessionID, limit)
-		if err != nil {
-			log.Printf("[ChatService] 读取会话缓存失败: %v", err)
-		} else if hit {
-			return cacheMessagesToRepository(cachedMessages), nil
-		}
-	}
-
-	messages, err := s.messageRepo.ListBySession(ctx, sessionID, limit)
-	if err != nil {
-		return nil, err
-	}
-
-	if s.sessionCache != nil && len(messages) > 0 {
-		if err := s.sessionCache.SetRecentMessages(ctx, sessionID, repositoryMessagesToCache(messages), s.shortTermCacheTTL()); err != nil {
-			log.Printf("[ChatService] 回填会话缓存失败: %v", err)
-		}
-	}
-
-	return messages, nil
-}
-
-func (s *ChatService) refreshSessionCache(ctx context.Context, sessionID string, fallbackMsg *repository.Message) {
-	if s.sessionCache == nil || s.messageRepo == nil || sessionID == "" {
-		return
-	}
-
-	limit := s.shortTermMessageLimit()
-	if limit <= 0 {
-		return
-	}
-
-	cachedMessages, hit, err := s.sessionCache.GetRecentMessages(ctx, sessionID, limit)
-	if err != nil {
-		log.Printf("[ChatService] 读取会话缓存失败: %v", err)
-		hit = false
-	}
-
-	if hit {
-		updated := append(cachedMessages, repositoryMessageToCache(fallbackMsg))
-		if len(updated) > limit {
-			updated = updated[len(updated)-limit:]
-		}
-		if err := s.sessionCache.SetRecentMessages(ctx, sessionID, updated, s.shortTermCacheTTL()); err != nil {
-			log.Printf("[ChatService] 更新会话缓存失败: %v", err)
-		}
-		return
-	}
-
-	messages, listErr := s.messageRepo.ListBySession(ctx, sessionID, limit)
-	if listErr != nil {
-		log.Printf("[ChatService] 回源刷新会话缓存失败: %v", listErr)
-		return
-	}
-	if len(messages) == 0 && fallbackMsg != nil {
-		messages = []*repository.Message{fallbackMsg}
-	}
-	if len(messages) == 0 {
-		return
-	}
-	if err := s.sessionCache.SetRecentMessages(ctx, sessionID, repositoryMessagesToCache(messages), s.shortTermCacheTTL()); err != nil {
-		log.Printf("[ChatService] 刷新会话缓存失败: %v", err)
-	}
-}
-
-func repositoryMessagesToCache(messages []*repository.Message) []cachepkg.SessionMessage {
-	if len(messages) == 0 {
-		return nil
-	}
-	result := make([]cachepkg.SessionMessage, 0, len(messages))
-	for _, msg := range messages {
-		if msg == nil {
-			continue
-		}
-		result = append(result, repositoryMessageToCache(msg))
-	}
-	return result
-}
-
-func repositoryMessageToCache(msg *repository.Message) cachepkg.SessionMessage {
-	if msg == nil {
-		return cachepkg.SessionMessage{}
-	}
-	return cachepkg.SessionMessage{
-		Role:      msg.Role,
-		Content:   msg.Content,
-		CreatedAt: msg.CreatedAt,
-	}
-}
-
-func cacheMessagesToRepository(messages []cachepkg.SessionMessage) []*repository.Message {
-	if len(messages) == 0 {
-		return nil
-	}
-	result := make([]*repository.Message, 0, len(messages))
-	for _, msg := range messages {
-		result = append(result, &repository.Message{
-			Role:      msg.Role,
-			Content:   msg.Content,
-			CreatedAt: msg.CreatedAt,
-		})
-	}
-	return result
-}
-
-// ChatResponse 聊天响应
-type ChatResponse struct {
-	Answer    string   `json:"answer"`
-	Sources   []Source `json:"sources,omitempty"`
-	SessionID string   `json:"session_id,omitempty"`
-}
-
 // Source 来源信息
 type Source struct {
 	Content string `json:"content"`
@@ -794,143 +612,94 @@ func (s *ChatService) buildSourcesFromRetriever(ctx context.Context, runtimeRetr
 	return sources
 }
 
-// truncateTitle 截取消息前 N 个字符作为会话标题
-func truncateTitle(msg string, maxLen int) string {
-	msg = strings.TrimSpace(msg)
-	// 去掉换行
-	msg = strings.ReplaceAll(msg, "\n", " ")
-	runes := []rune(msg)
-	if len(runes) > maxLen {
-		return string(runes[:maxLen]) + "..."
+// skillsEnabledForRequest 判断本次请求是否启用 Eino skill 功能。
+// 优先采用请求中的 EnableSkills 覆盖值；未设置时回退到全局配置。
+func (s *ChatService) skillsEnabledForRequest(req *ChatRequest) bool {
+	if req.EnableSkills != nil {
+		return *req.EnableSkills
 	}
-	return msg
+	return s.config.Agent.EnableSkills
 }
 
-// ensureSession 确保会话存在，如果 SessionID 为空则自动创建
-func (s *ChatService) ensureSession(ctx context.Context, req *ChatRequest) (string, error) {
-	if req.SessionID != "" {
-		return req.SessionID, nil
+// renderSystemPrompt 通过 promptManager 渲染指定模式的系统提示词，
+// 失败时回退到配置文件中的静态 SystemPrompt。
+func (s *ChatService) renderSystemPrompt(mode string) string {
+	if s.promptManager == nil {
+		return s.config.Agent.SystemPrompt
 	}
-
-	if s.sessionRepo == nil {
-		return "", nil
+	result, err := s.promptManager.RenderSystemPrompt(mode, nil)
+	if err != nil || strings.TrimSpace(result) == "" {
+		return s.config.Agent.SystemPrompt
 	}
-
-	session := &repository.Session{
-		TenantID:            req.TenantID,
-		UserID:              req.UserID,
-		Title:               truncateTitle(req.Message, 50),
-		SimilarityThreshold: 0.7,
-		TopK:                s.config.RAG.TopK,
-	}
-	if session.TenantID <= 0 {
-		session.TenantID = 1
-	}
-	if err := s.sessionRepo.Create(ctx, session); err != nil {
-		log.Printf("[ChatService] 自动创建会话失败: %v", err)
-		return "", nil // 不阻塞聊天
-	}
-	log.Printf("[ChatService] 自动创建会话: %s", session.ID)
-	return session.ID, nil
+	return result
 }
 
-// saveUserMessage 保存用户消息
-func (s *ChatService) saveUserMessage(ctx context.Context, sessionID, content string) {
-	if s.messageRepo == nil || sessionID == "" {
-		return
-	}
-
-	msg := &repository.Message{
-		SessionID: sessionID,
-		Role:      "user",
-		Content:   content,
-	}
-	if err := s.messageRepo.Create(ctx, msg); err != nil {
-		log.Printf("[ChatService] 保存用户消息失败: %v", err)
-		return
-	}
-	s.refreshSessionCache(ctx, sessionID, msg)
+// chatContext 封装 Chat/ChatStream 共用的请求预处理结果
+type chatContext struct {
+	sessionID          string
+	runtimeInstruction string
+	messageWithInst    string
+	runtimeRetriever   retriever.Retriever
 }
 
-// saveAssistantMessage 保存助手消息
-func (s *ChatService) saveAssistantMessage(ctx context.Context, sessionID, content string, tokensUsed int, latencyMs int64) {
-	if s.messageRepo == nil || sessionID == "" {
-		return
+// prepareChatContext 执行聊天请求的公共预处理：会话管理、指令构建、检索器构建、保存用户消息
+func (s *ChatService) prepareChatContext(ctx context.Context, req *ChatRequest) *chatContext {
+	sessionID, _ := s.ensureSession(ctx, req)
+	runtimeInstruction := s.buildRuntimeInstruction(ctx, req, sessionID)
+	messageWithInst := appendInstructionToMessage(req.Message, runtimeInstruction)
+	runtimeRetriever := s.getRuntimeRetriever(req)
+	s.saveUserMessage(ctx, sessionID, req.Message)
+	return &chatContext{
+		sessionID:          sessionID,
+		runtimeInstruction: runtimeInstruction,
+		messageWithInst:    messageWithInst,
+		runtimeRetriever:   runtimeRetriever,
 	}
-
-	msg := &repository.Message{
-		SessionID:  sessionID,
-		Role:       "assistant",
-		Content:    content,
-		TokensUsed: tokensUsed,
-		LatencyMs:  int(latencyMs),
-	}
-	if err := s.messageRepo.Create(ctx, msg); err != nil {
-		log.Printf("[ChatService] 保存助手消息失败: %v", err)
-		return
-	}
-	s.refreshSessionCache(ctx, sessionID, msg)
 }
 
 // Chat 执行聊天
 func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
 	startTime := time.Now()
-
-	// 确保会话存在
-	sessionID, _ := s.ensureSession(ctx, req)
-	runtimeInstruction := s.buildRuntimeInstruction(ctx, req, sessionID)
-	messageWithInstruction := appendInstructionToMessage(req.Message, runtimeInstruction)
-	runtimeRetriever := s.getRuntimeRetriever(req)
-
-	// 保存用户消息
-	s.saveUserMessage(ctx, sessionID, req.Message)
+	cc := s.prepareChatContext(ctx, req)
 
 	var resp *ChatResponse
-	var err error
 
 	// Agentic RAG 模式
 	if req.Mode == "agentic_rag" && s.agenticRAG != nil {
 		modeStart := time.Now()
 		runtimeAgentic := s.agenticRAG
-		if runtimeRetriever != s.retriever {
-			created, createErr := s.buildRuntimeAgenticRAG(ctx, runtimeRetriever)
+		if cc.runtimeRetriever != s.retriever {
+			created, createErr := s.buildRuntimeAgenticRAG(ctx, cc.runtimeRetriever)
 			if createErr != nil {
 				return nil, fmt.Errorf("build runtime agentic rag: %w", createErr)
 			}
 			runtimeAgentic = created
 		}
 
-		ragResp, ragErr := runtimeAgentic.Run(ctx, messageWithInstruction)
+		ragResp, ragErr := runtimeAgentic.Run(ctx, cc.messageWithInst)
 		if ragErr != nil {
 			return nil, fmt.Errorf("agentic rag: %w", ragErr)
 		}
 		answer := filter.StripThinkTags(ragResp.Answer)
 		sourceStart := time.Now()
-		sources := s.buildSourcesFromRetriever(ctx, runtimeRetriever, req.Message, s.config.RAG.TopK)
+		sources := s.buildSourcesFromRetriever(ctx, cc.runtimeRetriever, req.Message, s.config.RAG.TopK)
 		log.Printf("[Timing][ChatService] mode=agentic_rag stage=source_backfill duration_ms=%d sources=%d", time.Since(sourceStart).Milliseconds(), len(sources))
 		resp = &ChatResponse{
 			Answer:    answer,
 			Sources:   sources,
-			SessionID: sessionID,
+			SessionID: cc.sessionID,
 		}
 		log.Printf("[Timing][ChatService] mode=agentic_rag stage=total duration_ms=%d", time.Since(modeStart).Milliseconds())
-		err = nil
 	} else if req.UseAgent && s.agent != nil {
-		// Agent 模式
+		// Agent 模式（使用 per-request agent 支持动态 skill 和事件追踪）
 		modeStart := time.Now()
-		runtimeAgent := s.agent
-		kt := s.knowledgeTool
-		if runtimeRetriever != s.retriever {
-			created, rtKt, createErr := s.buildRuntimeAgent(ctx, runtimeRetriever)
-			if createErr != nil {
-				return nil, fmt.Errorf("build runtime agent: %w", createErr)
-			}
-			runtimeAgent = created
-			kt = rtKt
+		runtimeAgent, kt, createErr := s.buildRuntimeAgentForRequest(ctx, cc.runtimeRetriever, req, nil)
+		if createErr != nil {
+			return nil, fmt.Errorf("build runtime agent: %w", createErr)
 		}
 
 		messages := []*schema.Message{
-			{Role: schema.User, Content: messageWithInstruction},
+			{Role: schema.User, Content: cc.messageWithInst},
 		}
 		respMsg, agentErr := runtimeAgent.Generate(ctx, messages)
 		if agentErr != nil {
@@ -961,21 +730,20 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 		resp = &ChatResponse{
 			Answer:    answer,
 			Sources:   sources,
-			SessionID: sessionID,
+			SessionID: cc.sessionID,
 		}
 		log.Printf("[Timing][ChatService] mode=agent stage=total duration_ms=%d", time.Since(modeStart).Milliseconds())
-		err = nil
 	} else if s.pipeline != nil {
 		// Pipeline 模式
 		runtimePipeline := s.pipeline
-		if runtimeRetriever != s.retriever {
-			runtimePipeline = s.buildRuntimePipeline(runtimeRetriever)
+		if cc.runtimeRetriever != s.retriever {
+			runtimePipeline = s.buildRuntimePipeline(cc.runtimeRetriever)
 		}
 
 		pipeResp, pipeErr := runtimePipeline.Run(ctx, &pipeline.RAGRequest{
 			Query:                 req.Message,
-			SessionID:             sessionID,
-			GenerationInstruction: runtimeInstruction,
+			SessionID:             cc.sessionID,
+			GenerationInstruction: cc.runtimeInstruction,
 		})
 		if pipeErr != nil {
 			return nil, fmt.Errorf("pipeline run: %w", pipeErr)
@@ -994,20 +762,15 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 		resp = &ChatResponse{
 			Answer:    pipeResp.Answer,
 			Sources:   sources,
-			SessionID: sessionID,
+			SessionID: cc.sessionID,
 		}
-		err = nil
 	} else {
 		return nil, fmt.Errorf("no chat handler available")
 	}
 
-	if err != nil {
-		return nil, err
-	}
-
 	// 保存助手消息
 	latencyMs := time.Since(startTime).Milliseconds()
-	s.saveAssistantMessage(ctx, sessionID, resp.Answer, 0, latencyMs)
+	s.saveAssistantMessage(ctx, cc.sessionID, resp.Answer, 0, latencyMs)
 
 	return resp, nil
 }
@@ -1015,19 +778,11 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 // ChatStream 流式聊天
 func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan StreamEvent, error) {
 	ch := make(chan StreamEvent, 100)
-
-	// 确保会话存在
-	sessionID, _ := s.ensureSession(ctx, req)
-	runtimeInstruction := s.buildRuntimeInstruction(ctx, req, sessionID)
-	messageWithInstruction := appendInstructionToMessage(req.Message, runtimeInstruction)
-	runtimeRetriever := s.getRuntimeRetriever(req)
-
-	// 保存用户消息
-	s.saveUserMessage(ctx, sessionID, req.Message)
+	cc := s.prepareChatContext(ctx, req)
 
 	// 发送 session_id 事件（首个事件）
-	if sessionID != "" {
-		ch <- StreamEvent{Type: "session_id", SessionID: sessionID}
+	if cc.sessionID != "" {
+		ch <- StreamEvent{Type: "session_id", SessionID: cc.sessionID}
 	}
 
 	go func() {
@@ -1043,8 +798,8 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 		// Agentic RAG 模式
 		if req.Mode == "agentic_rag" && s.agenticRAG != nil {
 			runtimeAgentic := s.agenticRAG
-			if runtimeRetriever != s.retriever {
-				created, createErr := s.buildRuntimeAgenticRAG(ctx, runtimeRetriever)
+			if cc.runtimeRetriever != s.retriever {
+				created, createErr := s.buildRuntimeAgenticRAG(ctx, cc.runtimeRetriever)
 				if createErr != nil {
 					ch <- StreamEvent{Type: "error", Error: createErr.Error()}
 					return
@@ -1052,7 +807,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 				runtimeAgentic = created
 			}
 
-			stream, err := runtimeAgentic.RunStream(ctx, messageWithInstruction)
+			stream, err := runtimeAgentic.RunStream(ctx, cc.messageWithInst)
 			if err != nil {
 				ch <- StreamEvent{Type: "error", Error: err.Error()}
 				return
@@ -1083,26 +838,22 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 				}
 			}
 
-			// 保存助手消息
 			latencyMs := time.Since(startTime).Milliseconds()
-			s.saveAssistantMessage(ctx, sessionID, fullResponse.String(), 0, latencyMs)
+			s.saveAssistantMessage(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs)
 			return
 		}
 
-		// Agent 模式
+		// Agent 模式（使用 per-request agent 支持动态 skill 和事件追踪）
 		if req.UseAgent && s.agent != nil {
-			runtimeAgent := s.agent
-			if runtimeRetriever != s.retriever {
-				created, _, createErr := s.buildRuntimeAgent(ctx, runtimeRetriever)
-				if createErr != nil {
-					ch <- StreamEvent{Type: "error", Error: createErr.Error()}
-					return
-				}
-				runtimeAgent = created
+			eventSink := func(ev StreamEvent) { ch <- ev }
+			runtimeAgent, _, createErr := s.buildRuntimeAgentForRequest(ctx, cc.runtimeRetriever, req, eventSink)
+			if createErr != nil {
+				ch <- StreamEvent{Type: "error", Error: createErr.Error()}
+				return
 			}
 
 			messages := []*schema.Message{
-				{Role: schema.User, Content: messageWithInstruction},
+				{Role: schema.User, Content: cc.messageWithInst},
 			}
 			stream, err := runtimeAgent.Stream(ctx, messages)
 			if err != nil {
@@ -1142,23 +893,22 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			}
 			ch <- StreamEvent{Type: "done"}
 
-			// 保存助手消息
 			latencyMs := time.Since(startTime).Milliseconds()
-			s.saveAssistantMessage(ctx, sessionID, fullResponse.String(), 0, latencyMs)
+			s.saveAssistantMessage(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs)
 			return
 		}
 
 		// Pipeline 模式
 		if s.pipeline != nil {
 			runtimePipeline := s.pipeline
-			if runtimeRetriever != s.retriever {
-				runtimePipeline = s.buildRuntimePipeline(runtimeRetriever)
+			if cc.runtimeRetriever != s.retriever {
+				runtimePipeline = s.buildRuntimePipeline(cc.runtimeRetriever)
 			}
 
 			stream, err := runtimePipeline.RunStream(ctx, &pipeline.RAGRequest{
 				Query:                 req.Message,
-				SessionID:             sessionID,
-				GenerationInstruction: runtimeInstruction,
+				SessionID:             cc.sessionID,
+				GenerationInstruction: cc.runtimeInstruction,
 			})
 			if err != nil {
 				ch <- StreamEvent{Type: "error", Error: err.Error()}
@@ -1167,7 +917,6 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 
 			for chunk := range stream {
 				if chunk.Type == pipeline.ChunkTypeContent {
-					// 流式过滤 认
 					filtered := thinkFilter.Filter(chunk.Content)
 					if filtered != "" {
 						if !firstTokenLogged {
@@ -1195,9 +944,8 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 				ch <- StreamEvent{Type: "content", Content: remaining}
 			}
 
-			// 保存助手消息
 			latencyMs := time.Since(startTime).Milliseconds()
-			s.saveAssistantMessage(ctx, sessionID, fullResponse.String(), 0, latencyMs)
+			s.saveAssistantMessage(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs)
 			return
 		}
 
@@ -1205,13 +953,4 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 	}()
 
 	return ch, nil
-}
-
-// StreamEvent 流式事件
-type StreamEvent struct {
-	Type      string `json:"type"`
-	Content   string `json:"content,omitempty"`
-	DocID     string `json:"doc_id,omitempty"`
-	Error     string `json:"error,omitempty"`
-	SessionID string `json:"session_id,omitempty"`
 }

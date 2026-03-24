@@ -144,6 +144,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
           set({ currentSessionId: sessionId })
         } else if (evt.type === 'mode_resolved' && (evt as any).resolved_mode) {
           set({ resolvedMode: (evt as any).resolved_mode })
+        } else if (evt.type === 'source') {
+          const nextRef: Reference = {
+            document_id: (evt as any).doc_id || '',
+            document_name: (evt as any).doc_id || 'Document',
+            knowledge_base_id: '',
+            knowledge_base_name: '',
+            chunk_index: refs.length,
+            content: evt.content || '',
+            score: Math.max(0, 1 - refs.length * 0.1),
+          }
+          refs = [...refs, nextRef]
+          set({ references: refs })
         } else if (evt.type === 'content' && evt.content) {
           fullContent += evt.content
           set({ streamContent: fullContent })

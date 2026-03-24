@@ -39,6 +39,13 @@ nul
 # Claude Code
 .claude/
 
+# Python
+.venv/
+.venv_*/
+__pycache__/
+*.pyc
+.venv_rag_eval/
+
 # Docker
 docker-compose.override.yml
 
@@ -49,3 +56,5 @@ Thumbs.db
 # Temp
 *.tmp
 *.log
+.gocache/
+.gomodcache/
