@@ -22,13 +22,14 @@ import (
 )
 
 // CompositeRetriever 组合检索器
-// 【Eino 特点】支持向量检索 + 关键词检索的混合模式
+// 【Eino 特点】支持向量检索 + 关键词检索 + 图谱检索的混合模式
 type CompositeRetriever struct {
 	cfg            *config.RAGConfig
 	embeddingCfg   *config.EmbeddingConfig
 	embedding      einoembedding.Embedder
 	vectorDB       VectorDBProvider
 	retrievalCache cachepkg.RetrievalCache
+	graphRetriever einoretriever.Retriever
 }
 
 type scopedKeywordSearcher interface {
@@ -61,6 +62,11 @@ func NewRetrieverProvider(
 		retrievalCache: retrievalCache,
 	}
 	return retriever, nil, nil
+}
+
+// SetGraphRetriever 注入图谱检索器（GraphRAG 启用后调用）
+func (r *CompositeRetriever) SetGraphRetriever(gr einoretriever.Retriever) {
+	r.graphRetriever = gr
 }
 
 // Retrieve 执行检索
@@ -132,7 +138,26 @@ func (r *CompositeRetriever) retrieveWithHybrid(ctx context.Context, query strin
 		}
 	}
 
-	fused := r.rrfFuse(vectorDocs, keywordDocs, topK)
+	// 图谱检索（如果启用）
+	var graphDocs []*Document
+	if r.graphRetriever != nil {
+		gDocs, gErr := r.graphRetriever.Retrieve(ctx, query)
+		if gErr != nil {
+			log.Printf("[Retriever] 图谱检索失败（降级继续）: %v", gErr)
+		} else {
+			for _, d := range gDocs {
+				if d != nil {
+					graphDocs = append(graphDocs, &Document{
+						ID:       d.ID,
+						Content:  d.Content,
+						Metadata: d.MetaData,
+					})
+				}
+			}
+		}
+	}
+
+	fused := r.rrfFuse(vectorDocs, keywordDocs, graphDocs, topK)
 	r.setCachedRetrievalDocuments(ctx, query, true, fused)
 
 	return toSchemaDocuments(fused), nil
@@ -328,7 +353,7 @@ func retrievalCacheDocsToDocuments(docs []cachepkg.RetrievalDocument) []*Documen
 	return result
 }
 
-func (r *CompositeRetriever) rrfFuse(vectorDocs, keywordDocs []*Document, topK int) []*Document {
+func (r *CompositeRetriever) rrfFuse(vectorDocs, keywordDocs, graphDocs []*Document, topK int) []*Document {
 	const rrfK = 60.0
 
 	type rankedDoc struct {
@@ -365,6 +390,7 @@ func (r *CompositeRetriever) rrfFuse(vectorDocs, keywordDocs []*Document, topK i
 
 	add(vectorDocs, "vector")
 	add(keywordDocs, "keyword")
+	add(graphDocs, "graph")
 
 	list := make([]*rankedDoc, 0, len(ranked))
 	for _, item := range ranked {
