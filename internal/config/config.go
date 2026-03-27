@@ -93,12 +93,13 @@ type AuthConfig struct {
 
 // GraphRAGConfig GraphRAG 图谱增强检索配置
 type GraphRAGConfig struct {
-	Enabled            bool    `yaml:"enabled"`             // 是否启用 GraphRAG
-	Neo4jURI           string  `yaml:"neo4j_uri"`           // Neo4j Bolt URI
-	Neo4jUsername      string  `yaml:"neo4j_username"`      // Neo4j 用户名
-	Neo4jPassword      string  `yaml:"neo4j_password"`      // Neo4j 密码
-	ExtractTemperature float64 `yaml:"extract_temperature"` // 实体抽取温度（建议 0.1）
-	TopK               int     `yaml:"top_k"`               // 图谱检索返回 chunk 数
+	Enabled            bool       `yaml:"enabled"`             // 是否启用 GraphRAG
+	Neo4jURI           string     `yaml:"neo4j_uri"`           // Neo4j Bolt URI
+	Neo4jUsername      string     `yaml:"neo4j_username"`      // Neo4j 用户名
+	Neo4jPassword      string     `yaml:"neo4j_password"`      // Neo4j 密码
+	ExtractTemperature float64    `yaml:"extract_temperature"` // 实体抽取温度（建议 0.1）
+	TopK               int        `yaml:"top_k"`               // 图谱检索返回 chunk 数
+	LightLLM           *LLMConfig `yaml:"light_llm"`           // 查询时实体抽取用的轻量模型（可选）
 }
 
 // ServerConfig 服务器配置
@@ -164,8 +165,9 @@ type RAGConfig struct {
 	RetrievalCacheTTLMinutes int  `yaml:"retrieval_cache_ttl_minutes"`
 
 	// 分块配置
-	ChunkSize    int `yaml:"chunk_size"`
-	ChunkOverlap int `yaml:"chunk_overlap"`
+	ChunkSize     int    `yaml:"chunk_size"`
+	ChunkOverlap  int    `yaml:"chunk_overlap"`
+	ChunkStrategy string `yaml:"chunk_strategy"` // recursive, markdown, auto
 
 	// 文档路径
 	DocumentsPath string `yaml:"documents_path"`
@@ -193,13 +195,16 @@ type AgentConfig struct {
 	AgenticRAG AgenticRAGConfig `yaml:"agentic_rag"`
 }
 
-// AgenticRAGConfig Agentic RAG（Corrective RAG）配置
+// AgenticRAGConfig Agentic RAG 配置（含 Query Router / Decomposition / Knowledge Refinement / Self-Reflection）
 type AgenticRAGConfig struct {
 	Enabled           bool    `yaml:"enabled"`             // 是否启用 Agentic RAG
 	MaxRetries        int     `yaml:"max_retries"`         // 最大重试次数（防死循环）
 	QualityThreshold  float64 `yaml:"quality_threshold"`   // 检索质量阈值 (0-1)
 	EnableWebFallback bool    `yaml:"enable_web_fallback"` // 重试失败后是否降级到 Web 搜索
 	MaxRunSteps       int     `yaml:"max_run_steps"`       // Graph 最大运行步数
+
+	// 轻量模型配置：用于 classify / refine 等不需要强推理的节点，降低延迟
+	LightLLM *LLMConfig `yaml:"light_llm,omitempty"`
 }
 
 // DocReaderConfig DocReader 文档解析服务配置
@@ -397,6 +402,9 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.RAG.ChunkOverlap == 0 {
 		cfg.RAG.ChunkOverlap = 50
+	}
+	if cfg.RAG.ChunkStrategy == "" {
+		cfg.RAG.ChunkStrategy = "auto"
 	}
 
 	if cfg.Agent.MaxSteps == 0 {

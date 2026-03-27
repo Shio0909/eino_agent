@@ -1251,9 +1251,11 @@ func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeI
 		},
 	}
 
-	chunker := document.NewRecursiveCharacterChunker(
+	chunker := document.NewChunker(
+		h.cfg.RAG.ChunkStrategy,
 		h.cfg.RAG.ChunkSize,
 		h.cfg.RAG.ChunkOverlap,
+		filename,
 	)
 	chunks, err := chunker.Chunk(ctx, rawDoc)
 	if err != nil {

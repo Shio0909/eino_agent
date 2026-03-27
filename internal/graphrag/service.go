@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cloudwego/eino/components/model"
+	"github.com/cloudwego/eino/components/retriever"
 )
 
 // Service GraphRAG 服务
@@ -178,6 +179,23 @@ func (s *Service) CreateGraphRetriever(namespace *NameSpace, topK int) *GraphRet
 	})
 }
 
+// CreateScopedGraphRetriever 按知识库 ID 创建作用域图谱检索器
+// 实现 container.GraphRetrieverFactory 接口
+func (s *Service) CreateScopedGraphRetriever(knowledgeBaseID string, topK int) retriever.Retriever {
+	ns := &NameSpace{KnowledgeBase: knowledgeBaseID}
+	return s.CreateGraphRetriever(ns, topK)
+}
+
+// SetLightModel 为实体抽取器设置轻量模型
+func (s *Service) SetLightModel(m model.ChatModel) {
+	s.extractor.SetLightModel(m)
+}
+
+// SetExtractorUseLightForBuild 设置抽取器是否使用轻量模型建图
+func (s *Service) SetExtractorUseLightForBuild(use bool) {
+	s.extractor.SetUseLightForBuild(use)
+}
+
 // InitService 初始化 GraphRAG 服务（工厂方法）
 // 从环境变量/配置创建完整的 GraphRAG 服务
 func InitService(ctx context.Context, cfg *Config, chatModel model.ChatModel) (*Service, error) {
@@ -186,13 +204,20 @@ func InitService(ctx context.Context, cfg *Config, chatModel model.ChatModel) (*
 	}
 
 	// 初始化 Neo4j
-	driver, err := InitNeo4jDriver(ctx)
+	driver, err := InitNeo4jDriver(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("初始化 Neo4j 失败: %w", err)
 	}
 
 	repo := NewNeo4jRepository(driver)
 	svc := NewService(cfg, chatModel, repo)
+
+	// 确保 Neo4j 索引存在（加速实体名称查询）
+	if neoRepo, ok := repo.(*Neo4jRepository); ok {
+		if err := neoRepo.EnsureIndexes(ctx); err != nil {
+			log.Printf("[GraphRAG] 索引创建警告: %v", err)
+		}
+	}
 
 	log.Println("[GraphRAG] 服务初始化完成")
 	return svc, nil

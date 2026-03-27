@@ -57,10 +57,13 @@ A: ` + "```json" + `
 ` + "```"
 
 // 查询时实体抽取 Prompt（参考 WeKnora extract_entity.description）
-const extractEntityPrompt = `请基于用户给的问题，按以下步骤处理关键信息提取任务：
-1. 梳理逻辑关联：分析问题内容，明确核心逻辑关系；
-2. 提取关键实体：围绕核心逻辑，精准提取问题中的关键实体；
-3. 排序实体优先级：按与核心问题的关联程度排序。
+const extractEntityPrompt = `请基于用户给的问题，提取其中的关键实体用于知识图谱检索：
+
+## 规则
+1. **提取原子实体**：每个实体应该是单一概念，不要组合多个词。例如 "Kubernetes Service" 应拆分为 "Kubernetes" 和 "Service" 两个实体。
+2. **双语提取**：如果问题包含中文术语，同时提取其英文等价形式（反之亦然）。例如 "服务发现" → 同时输出 "服务发现" 和 "Service Discovery"。
+3. **按关联度排序**：核心实体在前，辅助实体在后。
+4. **去除动词和修饰词**：只保留名词性实体。
 
 ## 输出格式
 以 JSON 数组格式输出实体列表：
@@ -74,6 +77,16 @@ const extractEntityPrompt = `请基于用户给的问题，按以下步骤处理
 
 ## 示例
 
+Q: Kubernetes Service 如何实现服务发现？
+A: ` + "```json" + `
+[
+  {"entity": "Kubernetes"},
+  {"entity": "Service"},
+  {"entity": "服务发现"},
+  {"entity": "Service Discovery"}
+]
+` + "```" + `
+
 Q: 《红楼梦》的作者是谁？
 A: ` + "```json" + `
 [
@@ -86,8 +99,10 @@ A: ` + "```json" + `
 
 // Extractor 从文本中抽取实体和关系
 type Extractor struct {
-	chatModel model.ChatModel
-	temp      float64
+	chatModel        model.ChatModel // 重模型 — 用于 BuildGraph 时的完整实体/关系抽取
+	lightModel       model.ChatModel // 轻量模型 — 用于查询时的快速实体抽取（可选，为 nil 则退化到 chatModel）
+	useLightForBuild bool            // 是否用轻量模型替代重模型进行建图（牺牲质量换速度）
+	temp             float64
 }
 
 // NewExtractor 创建抽取器
@@ -96,6 +111,32 @@ func NewExtractor(chatModel model.ChatModel, temperature float64) *Extractor {
 		temperature = 0.1 // 低温度保证抽取一致性
 	}
 	return &Extractor{chatModel: chatModel, temp: temperature}
+}
+
+// SetLightModel 注入轻量模型，用于查询时实体抽取（延迟敏感场景）
+func (e *Extractor) SetLightModel(m model.ChatModel) {
+	e.lightModel = m
+}
+
+// SetUseLightForBuild 启用轻量模型建图（速度快但抽取质量可能略降）
+func (e *Extractor) SetUseLightForBuild(use bool) {
+	e.useLightForBuild = use
+}
+
+// queryModel 返回查询时使用的模型（优先轻量模型）
+func (e *Extractor) queryModel() model.ChatModel {
+	if e.lightModel != nil {
+		return e.lightModel
+	}
+	return e.chatModel
+}
+
+// buildModel 返回建图时使用的模型
+func (e *Extractor) buildModel() model.ChatModel {
+	if e.useLightForBuild && e.lightModel != nil {
+		return e.lightModel
+	}
+	return e.chatModel
 }
 
 // ExtractFromChunk 从文档 Chunk 中抽取实体和关系
@@ -109,7 +150,7 @@ func (e *Extractor) ExtractFromChunk(ctx context.Context, content string) (*Grap
 		{Role: schema.User, Content: content},
 	}
 
-	resp, err := e.chatModel.Generate(ctx, messages,
+	resp, err := e.buildModel().Generate(ctx, messages,
 		model.WithTemperature(float32(e.temp)),
 	)
 	if err != nil {
@@ -126,20 +167,30 @@ func (e *Extractor) ExtractFromChunk(ctx context.Context, content string) (*Grap
 }
 
 // ExtractEntitiesFromQuery 从用户查询中抽取实体名称列表
+// 使用轻量模型（如果已配置），因为查询时实体抽取对延迟敏感
 func (e *Extractor) ExtractEntitiesFromQuery(ctx context.Context, query string) ([]string, error) {
 	messages := []*schema.Message{
 		{Role: schema.System, Content: extractEntityPrompt},
 		{Role: schema.User, Content: fmt.Sprintf("# Question\nQ: %s\nA: ", query)},
 	}
 
-	resp, err := e.chatModel.Generate(ctx, messages,
+	resp, err := e.queryModel().Generate(ctx, messages,
 		model.WithTemperature(float32(e.temp)),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("LLM 实体抽取失败: %w", err)
 	}
 
-	return parseEntityNames(resp.Content), nil
+	raw := parseEntityNames(resp.Content)
+	// 过滤太短的实体（单字符容易过度匹配，如 "n"、"r"）
+	filtered := make([]string, 0, len(raw))
+	for _, name := range raw {
+		name = strings.TrimSpace(name)
+		if len([]rune(name)) >= 2 {
+			filtered = append(filtered, name)
+		}
+	}
+	return filtered, nil
 }
 
 // ── JSON 解析器 ──

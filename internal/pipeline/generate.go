@@ -40,16 +40,16 @@ func NewLLMGenerator(m model.ChatModel, systemPrompt string) *LLMGenerator {
 	}
 }
 
-const defaultSystemPrompt = `你是一个专业的知识库问答助手。请根据提供的上下文信息回答用户的问题。
+const defaultSystemPrompt = `你是一个专业的知识库问答助手。
 
-## 忠实性原则（最高优先级）
-- 你的回答**必须且只能**基于提供的上下文信息，**严禁**使用自身训练知识补充或推断
-- 如果上下文信息不足以回答问题，请直接说明信息不足
-- 禁止编造文档名称、命令、版本号等任何具体信息
+## 回答原则
+- **积极回答**：基于上下文信息尽可能给出有帮助的回答，允许总结和归纳。
+- **禁止编造**具体信息。
+- 只有在上下文与问题完全无关时才说明信息不足。
 
-## 回答规范
-1. 回答要简洁、准确、有条理
-2. 引用来源时使用 [来源X] 标记`
+## 回答格式
+1. 每个要点附带 [来源X] 标注
+2. 优先使用上下文中的原始措辞`
 
 // Generate 生成回答
 func (g *LLMGenerator) Generate(ctx context.Context, query string, ragContext string) (string, error) {
@@ -114,69 +114,4 @@ func (g *LLMGenerator) GenerateStream(ctx context.Context, query string, ragCont
 	}()
 
 	return ch, nil
-}
-
-// ChatGenerator 对话式生成器（带历史上下文）
-type ChatGenerator struct {
-	model        model.ChatModel
-	systemPrompt string
-	maxHistory   int
-	template     prompt.ChatTemplate
-}
-
-// NewChatGenerator 创建对话生成器
-func NewChatGenerator(m model.ChatModel, systemPrompt string, maxHistory int) *ChatGenerator {
-	if maxHistory <= 0 {
-		maxHistory = 10
-	}
-	tpl := prompt.FromMessages(
-		schema.FString,
-		schema.SystemMessage("{system_prompt}"),
-		schema.MessagesPlaceholder("history", true),
-		schema.UserMessage(`上下文信息：
-{rag_context}
-
-用户问题：{query}`),
-	)
-	return &ChatGenerator{
-		model:        m,
-		systemPrompt: systemPrompt,
-		maxHistory:   maxHistory,
-		template:     tpl,
-	}
-}
-
-// GenerateWithHistory 带历史上下文的生成
-func (g *ChatGenerator) GenerateWithHistory(
-	ctx context.Context,
-	query string,
-	ragContext string,
-	history []*schema.Message,
-) (string, error) {
-	if g.model == nil {
-		return "", fmt.Errorf("model not configured")
-	}
-
-	// 保留最近的 N 条历史消息
-	startIdx := 0
-	if len(history) > g.maxHistory {
-		startIdx = len(history) - g.maxHistory
-	}
-
-	messages, err := g.template.Format(ctx, map[string]any{
-		"system_prompt": g.systemPrompt,
-		"history":       history[startIdx:],
-		"rag_context":   ragContext,
-		"query":         query,
-	})
-	if err != nil {
-		return "", fmt.Errorf("format prompt: %w", err)
-	}
-
-	resp, err := g.model.Generate(ctx, messages)
-	if err != nil {
-		return "", fmt.Errorf("generate: %w", err)
-	}
-
-	return resp.Content, nil
 }

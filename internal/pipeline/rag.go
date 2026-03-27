@@ -51,7 +51,7 @@ func DefaultConfig() *Config {
 		TopK:          10,
 		RerankTopK:    5,
 		ModelID:       "gpt-4o-mini",
-		SystemPrompt:  "你是一个专业的知识库问答助手，请严格基于提供的上下文回答用户问题。回答必须且只能基于参考资料，严禁使用训练知识补充。资料不足时请明确说明。",
+		SystemPrompt:  "你是一个专业的知识库问答助手。请基于参考资料尽可能完整地回答，允许总结和归纳。禁止编造具体信息。每个要点附带[来源X]标注。",
 	}
 }
 

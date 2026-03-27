@@ -50,6 +50,7 @@ rag:
     retrieval_cache_ttl_minutes: 10
     chunk_size: 512
     chunk_overlap: 50
+    chunk_strategy: auto  # recursive, markdown, auto(根据文件类型自动选择)
     documents_path: ./data/documents
 agent:
     enabled: true
@@ -70,6 +71,16 @@ agent:
         quality_threshold: 0.6
         enable_web_fallback: false
         max_run_steps: 20
+        # 轻量模型：用于 query classify / knowledge refine 等低推理节点
+        # 推荐使用 SiliconFlow 免费模型以降低延迟（~2s vs 主模型 ~16s）
+        # 留空或删除此段则所有节点使用主模型
+        light_llm:
+            provider: openai
+            base_url: https://api.siliconflow.cn/v1
+            api_key: your-llm-api-key
+            model_id: THUDM/GLM-4-Flash
+            temperature: 0.1
+            max_tokens: 1024
 security:
     prompt_guard:
         enabled: true
@@ -155,3 +166,11 @@ graphrag:
     neo4j_password: your-neo4j-password
     extract_temperature: 0.1
     top_k: 10
+    # 查询时实体抽取轻量模型（可选，不配则用主模型）
+    # light_llm:
+    #     provider: openai
+    #     base_url: https://api.siliconflow.cn/v1
+    #     api_key: your-api-key
+    #     model_id: Qwen/Qwen2.5-7B-Instruct
+    #     temperature: 0.1
+    #     max_tokens: 1024

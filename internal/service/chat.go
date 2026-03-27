@@ -24,6 +24,7 @@ import (
 	"eino_agent/internal/container"
 	"eino_agent/internal/database/repository"
 	"eino_agent/internal/filter"
+	"eino_agent/internal/graphrag"
 	"eino_agent/internal/pipeline"
 	promptmgr "eino_agent/internal/prompt"
 	internalTool "eino_agent/internal/tool"
@@ -44,6 +45,7 @@ type ChatService struct {
 	agent           *react.Agent
 	knowledgeTool   *internalTool.KnowledgeTool  // Agent 模式的知识库工具引用
 	agenticRAG      *pipeline.AgenticRAGPipeline // Agentic RAG (Corrective RAG)
+	graphRAGService *graphrag.Service             // GraphRAG 服务（可选，用于按需创建图谱检索器）
 	skillBackend    skill.Backend
 	mcpTools        []tool.BaseTool      // MCP 远程工具
 	skillMiddleware *adk.AgentMiddleware // Eino 原生 skill 中间件
@@ -118,6 +120,11 @@ func (s *ChatService) SetRepositories(sessionRepo repository.SessionRepository, 
 	s.messageRepo = messageRepo
 }
 
+// SetGraphRAGService 设置 GraphRAG 服务（按需创建图谱检索器）
+func (s *ChatService) SetGraphRAGService(svc *graphrag.Service) {
+	s.graphRAGService = svc
+}
+
 // InitWithComponents 使用组件初始化服务
 func (s *ChatService) InitWithComponents(
 	chatModel model.ChatModel,
@@ -135,6 +142,8 @@ func (s *ChatService) InitWithComponents(
 	if s.reranker != nil {
 		pipeOpts = append(pipeOpts, pipeline.WithReranker(s.reranker))
 	}
+	// 注入查询重写器
+	pipeOpts = append(pipeOpts, pipeline.WithRewriter(pipeline.NewLLMRewriter(chatModel)))
 	s.pipeline = pipeline.NewRAGPipeline(
 		&pipeline.Config{
 			EnableRewrite: s.config.RAG.EnableRewrite,
@@ -148,11 +157,24 @@ func (s *ChatService) InitWithComponents(
 
 	// 初始化 Agentic RAG（如果启用）
 	if s.config.Agent.AgenticRAG.Enabled {
+		agenticOpts := []pipeline.AgenticRAGOption{
+			pipeline.WithAgenticChatModel(chatModel),
+			pipeline.WithAgenticRetriever(retriever),
+		}
+		// 如果配置了轻量模型，创建并注入
+		if lm := s.config.Agent.AgenticRAG.LightLLM; lm != nil && lm.ModelID != "" {
+			lightModel, _, err := container.NewLLMProvider(ctx, lm)
+			if err != nil {
+				log.Printf("[AgenticRAG] 轻量模型初始化失败，降级使用主模型: %v", err)
+			} else {
+				log.Printf("[AgenticRAG] 轻量模型已启用: %s/%s", lm.Provider, lm.ModelID)
+				agenticOpts = append(agenticOpts, pipeline.WithAgenticLightModel(lightModel))
+			}
+		}
 		agenticRAG, err := pipeline.NewAgenticRAGPipeline(
 			ctx,
 			&s.config.Agent.AgenticRAG,
-			pipeline.WithAgenticChatModel(chatModel),
-			pipeline.WithAgenticRetriever(retriever),
+			agenticOpts...,
 		)
 		if err != nil {
 			return fmt.Errorf("create agentic rag: %w", err)
@@ -404,6 +426,8 @@ func (s *ChatService) buildRuntimePipeline(runtimeRetriever retriever.Retriever)
 	if s.reranker != nil {
 		pipeOpts = append(pipeOpts, pipeline.WithReranker(s.reranker))
 	}
+	// 注入查询重写器
+	pipeOpts = append(pipeOpts, pipeline.WithRewriter(pipeline.NewLLMRewriter(s.chatModel)))
 	return pipeline.NewRAGPipeline(
 		&pipeline.Config{
 			EnableRewrite: s.config.RAG.EnableRewrite,
@@ -420,11 +444,22 @@ func (s *ChatService) buildRuntimeAgenticRAG(ctx context.Context, runtimeRetriev
 	if runtimeRetriever == nil {
 		return nil, fmt.Errorf("retriever is nil")
 	}
+	agenticOpts := []pipeline.AgenticRAGOption{
+		pipeline.WithAgenticChatModel(s.chatModel),
+		pipeline.WithAgenticRetriever(runtimeRetriever),
+	}
+	if lm := s.config.Agent.AgenticRAG.LightLLM; lm != nil && lm.ModelID != "" {
+		lightModel, _, err := container.NewLLMProvider(ctx, lm)
+		if err != nil {
+			log.Printf("[AgenticRAG] runtime 轻量模型初始化失败，降级使用主模型: %v", err)
+		} else {
+			agenticOpts = append(agenticOpts, pipeline.WithAgenticLightModel(lightModel))
+		}
+	}
 	return pipeline.NewAgenticRAGPipeline(
 		ctx,
 		&s.config.Agent.AgenticRAG,
-		pipeline.WithAgenticChatModel(s.chatModel),
-		pipeline.WithAgenticRetriever(runtimeRetriever),
+		agenticOpts...,
 	)
 }
 

@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/md5"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -160,7 +161,25 @@ func NewRecursiveCharacterChunker(chunkSize, chunkOverlap int) *RecursiveCharact
 	return &RecursiveCharacterChunker{
 		ChunkSize:    chunkSize,
 		ChunkOverlap: chunkOverlap,
-		Separators:   []string{"\n\n", "\n", "。", ".", " ", ""},
+		Separators:   []string{"\n\n", "\n", "。", "！", "？", "；", ".", "!", "?", " ", ""},
+	}
+}
+
+// NewChunker 根据策略创建分块器
+// strategy: "recursive"=递归字符, "markdown"=Markdown 结构, "auto"=根据文件扩展名自动选择
+func NewChunker(strategy string, chunkSize, chunkOverlap int, filename string) Chunker {
+	ext := strings.ToLower(filepath.Ext(filename))
+	switch strategy {
+	case "markdown":
+		return NewMarkdownChunker(chunkSize, chunkOverlap)
+	case "auto":
+		if ext == ".md" || ext == ".markdown" {
+			log.Printf("[Chunker] 文件 %s 使用 MarkdownChunker", filename)
+			return NewMarkdownChunker(chunkSize, chunkOverlap)
+		}
+		return NewRecursiveCharacterChunker(chunkSize, chunkOverlap)
+	default: // "recursive"
+		return NewRecursiveCharacterChunker(chunkSize, chunkOverlap)
 	}
 }
 
@@ -267,14 +286,23 @@ func (c *RecursiveCharacterChunker) splitByCharCount(text string) []string {
 	return chunks
 }
 
-// addOverlap 添加块重叠
+// addOverlap 为相邻块添加尾部→头部重叠文本，确保段落级分割也有 overlap
 func (c *RecursiveCharacterChunker) addOverlap(chunks []string) []string {
 	if c.ChunkOverlap <= 0 || len(chunks) <= 1 {
 		return chunks
 	}
 
-	// 已经在分割时处理了重叠
-	return chunks
+	result := make([]string, len(chunks))
+	result[0] = chunks[0]
+	for i := 1; i < len(chunks); i++ {
+		prevRunes := []rune(chunks[i-1])
+		overlapStart := len(prevRunes) - c.ChunkOverlap
+		if overlapStart < 0 {
+			overlapStart = 0
+		}
+		result[i] = string(prevRunes[overlapStart:]) + chunks[i]
+	}
+	return result
 }
 
 // MarkdownChunker Markdown 专用分块器
@@ -292,34 +320,53 @@ func NewMarkdownChunker(chunkSize, chunkOverlap int) *MarkdownChunker {
 	}
 }
 
-// Chunk 按 Markdown 结构分块
+// Chunk 按 Markdown 结构分块，每个 chunk 自带标题层级前缀作为上下文
 func (c *MarkdownChunker) Chunk(ctx context.Context, doc *RawDocument) ([]*container.Document, error) {
 	scanner := bufio.NewScanner(strings.NewReader(doc.Content))
 	var chunks []*container.Document
 	var currentChunk strings.Builder
-	var currentHeaders []string
+	var currentHeaders []string // 当前标题栈
 	chunkIndex := 0
+
+	// headerPrefix 将标题栈拼成前缀，如 "## 第三章 > ### 3.2 螺栓扭矩\n"
+	headerPrefix := func(headers []string) string {
+		if len(headers) == 0 {
+			return ""
+		}
+		return "[" + strings.Join(headers, " > ") + "]\n"
+	}
+
+	saveChunk := func() {
+		text := strings.TrimSpace(currentChunk.String())
+		if text == "" {
+			return
+		}
+		// 如果 chunk 不是以标题开头，则注入标题前缀
+		if !strings.HasPrefix(text, "#") && len(currentHeaders) > 0 {
+			text = headerPrefix(currentHeaders) + text
+		}
+		headersCopy := make([]string, len(currentHeaders))
+		copy(headersCopy, currentHeaders)
+		chunks = append(chunks, &container.Document{
+			ID:      fmt.Sprintf("%s_chunk_%d", doc.ID, chunkIndex),
+			Content: text,
+			Metadata: map[string]interface{}{
+				"source":      doc.Source,
+				"chunk_index": chunkIndex,
+				"headers":     headersCopy,
+				"doc_id":      doc.ID,
+			},
+		})
+		chunkIndex++
+		currentChunk.Reset()
+	}
 
 	for scanner.Scan() {
 		line := scanner.Text()
 
 		// 检测标题
 		if strings.HasPrefix(line, "#") {
-			// 保存当前块
-			if currentChunk.Len() > 0 {
-				chunks = append(chunks, &container.Document{
-					ID:      fmt.Sprintf("%s_chunk_%d", doc.ID, chunkIndex),
-					Content: strings.TrimSpace(currentChunk.String()),
-					Metadata: map[string]interface{}{
-						"source":      doc.Source,
-						"chunk_index": chunkIndex,
-						"headers":     currentHeaders,
-						"doc_id":      doc.ID,
-					},
-				})
-				chunkIndex++
-				currentChunk.Reset()
-			}
+			saveChunk()
 
 			// 更新标题层级
 			level := 0
@@ -345,35 +392,11 @@ func (c *MarkdownChunker) Chunk(ctx context.Context, doc *RawDocument) ([]*conta
 
 		// 检查块大小
 		if utf8.RuneCountInString(currentChunk.String()) > c.ChunkSize {
-			chunks = append(chunks, &container.Document{
-				ID:      fmt.Sprintf("%s_chunk_%d", doc.ID, chunkIndex),
-				Content: strings.TrimSpace(currentChunk.String()),
-				Metadata: map[string]interface{}{
-					"source":      doc.Source,
-					"chunk_index": chunkIndex,
-					"headers":     currentHeaders,
-					"doc_id":      doc.ID,
-				},
-			})
-			chunkIndex++
-			currentChunk.Reset()
+			saveChunk()
 		}
 	}
 
-	// 保存最后一个块
-	if currentChunk.Len() > 0 {
-		chunks = append(chunks, &container.Document{
-			ID:      fmt.Sprintf("%s_chunk_%d", doc.ID, chunkIndex),
-			Content: strings.TrimSpace(currentChunk.String()),
-			Metadata: map[string]interface{}{
-				"source":       doc.Source,
-				"chunk_index":  chunkIndex,
-				"headers":      currentHeaders,
-				"doc_id":       doc.ID,
-				"total_chunks": chunkIndex + 1,
-			},
-		})
-	}
+	saveChunk()
 
 	// 更新所有块的 total_chunks
 	for _, chunk := range chunks {

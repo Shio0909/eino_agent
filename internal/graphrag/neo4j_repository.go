@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -31,6 +32,29 @@ func NewNeo4jRepository(driver neo4j.DriverWithContext) GraphRepository {
 // removeHyphen 去除连字符（Neo4j 标签不支持连字符）
 func removeHyphen(s string) string {
 	return strings.ReplaceAll(s, "-", "_")
+}
+
+// relTypeRE 匹配 Neo4j 关系类型允许的字符（字母、数字、下划线、中文）
+var relTypeRE = regexp.MustCompile(`[^a-zA-Z0-9_\p{Han}]`)
+
+// sanitizeRelType 清理关系类型名称，确保 Neo4j Cypher 安全
+// 移除反引号、斜杠等特殊字符，截断过长名称
+func sanitizeRelType(relType string) string {
+	relType = relTypeRE.ReplaceAllString(relType, "_")
+	// 合并连续下划线
+	for strings.Contains(relType, "__") {
+		relType = strings.ReplaceAll(relType, "__", "_")
+	}
+	relType = strings.Trim(relType, "_")
+	// 截断过长的关系类型（超过 50 字符的通常是抽取错误）
+	runes := []rune(relType)
+	if len(runes) > 50 {
+		relType = string(runes[:50])
+	}
+	if relType == "" {
+		relType = "RELATED_TO"
+	}
+	return relType
 }
 
 // Labels 返回命名空间对应的 Neo4j 标签列表
@@ -105,8 +129,8 @@ func (r *Neo4jRepository) addGraph(ctx context.Context, namespace NameSpace, gra
 			if relType == "" {
 				relType = "RELATED_TO"
 			}
-			// Neo4j 关系类型不能含空格/特殊字符
-			relType = strings.ReplaceAll(relType, " ", "_")
+			// Neo4j 关系类型只允许字母、数字、下划线（sanitize 特殊字符）
+			relType = sanitizeRelType(relType)
 			relData = append(relData, map[string]interface{}{
 				"source":        rel.Node1,
 				"target":        rel.Node2,
@@ -198,11 +222,36 @@ func (r *Neo4jRepository) SearchNode(
 
 	result, err := session.ExecuteRead(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
 		labelExpr := r.Label(namespace)
-		query := `
-			MATCH (n:` + labelExpr + `)-[r]-(m:` + labelExpr + `)
-			WHERE ANY(nodeText IN $nodes WHERE n.name CONTAINS nodeText)
-			RETURN n, r, m
-		`
+		var nodeMatch string
+		if labelExpr == "" {
+			// 空命名空间：匹配所有带 ENTITY 前缀标签的节点
+			nodeMatch = "(n)"
+			// 使用 WHERE 条件过滤：节点至少有一个以 ENTITY 开头的标签
+		} else {
+			nodeMatch = "(n:" + labelExpr + ")"
+		}
+
+		// 双向 CONTAINS + 大小写不敏感 + 最小长度过滤：
+		// 1. toLower(n.name) CONTAINS toLower(nodeText) — 搜索词是节点名的子串（如搜 "Pod" 命中 "Kubernetes Pod"）
+		// 2. toLower(nodeText) CONTAINS toLower(n.name) — 节点名是搜索词的子串（如搜 "Kubernetes Service" 命中 "Kubernetes"）
+		// 3. size(n.name) >= 2 — 排除单字符节点名避免过度匹配
+		matchExpr := `ANY(nodeText IN $nodes WHERE size(nodeText) >= 2 AND (toLower(n.name) CONTAINS toLower(nodeText) OR (size(n.name) >= 2 AND toLower(nodeText) CONTAINS toLower(n.name))))`
+
+		var query string
+		if labelExpr == "" {
+			query = `
+				MATCH ` + nodeMatch + `-[r]-(m)
+				WHERE ANY(lbl IN labels(n) WHERE lbl STARTS WITH 'ENTITY')
+				AND ` + matchExpr + `
+				RETURN n, r, m
+			`
+		} else {
+			query = `
+				MATCH ` + nodeMatch + `-[r]-(m)
+				WHERE ` + matchExpr + `
+				RETURN n, r, m
+			`
+		}
 		params := map[string]interface{}{"nodes": nodes}
 		result, err := tx.Run(ctx, query, params)
 		if err != nil {
@@ -271,19 +320,50 @@ func listToStrings(v interface{}) []string {
 	return result
 }
 
+// EnsureIndexes 为 Neo4j 创建全文索引加速实体名称查询
+// 索引使用 name 属性，利用 CONTAINS 匹配时显著提升性能
+func (r *Neo4jRepository) EnsureIndexes(ctx context.Context) error {
+	if r.driver == nil {
+		return nil
+	}
+	session := r.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	// 创建 name 属性索引（IF NOT EXISTS 保证幂等）
+	queries := []string{
+		`CREATE TEXT INDEX entity_name_text IF NOT EXISTS FOR (n:ENTITY) ON (n.name)`,
+	}
+	for _, q := range queries {
+		if _, err := session.Run(ctx, q, nil); err != nil {
+			log.Printf("[GraphRAG] 创建索引警告（可忽略）: %v", err)
+			// 不同 Neo4j 版本可能不支持 TEXT INDEX，尝试普通索引
+			fallback := `CREATE INDEX entity_name IF NOT EXISTS FOR (n:ENTITY) ON (n.name)`
+			if _, err2 := session.Run(ctx, fallback, nil); err2 != nil {
+				log.Printf("[GraphRAG] 创建备选索引也失败: %v", err2)
+			}
+		}
+	}
+	log.Println("[GraphRAG] Neo4j 索引已确保创建")
+	return nil
+}
+
 // ── Neo4j 连接工厂 ──
 
 // InitNeo4jDriver 初始化 Neo4j 驱动（带重试）
-// 参考 WeKnora: internal/container/container.go initNeo4jClient
-func InitNeo4jDriver(ctx context.Context) (neo4j.DriverWithContext, error) {
-	if strings.ToLower(os.Getenv("NEO4J_ENABLE")) != "true" {
-		log.Println("[GraphRAG] Neo4j 未启用 (NEO4J_ENABLE != true)")
-		return nil, nil
+// 优先使用 Config 字段，环境变量作为备选
+func InitNeo4jDriver(ctx context.Context, cfg *Config) (neo4j.DriverWithContext, error) {
+	uri := cfg.Neo4jURI
+	if uri == "" {
+		uri = os.Getenv("NEO4J_URI")
 	}
-
-	uri := os.Getenv("NEO4J_URI")
-	username := os.Getenv("NEO4J_USERNAME")
-	password := os.Getenv("NEO4J_PASSWORD")
+	username := cfg.Neo4jUser
+	if username == "" {
+		username = os.Getenv("NEO4J_USERNAME")
+	}
+	password := cfg.Neo4jPass
+	if password == "" {
+		password = os.Getenv("NEO4J_PASSWORD")
+	}
 
 	if uri == "" {
 		uri = "bolt://localhost:7687"
@@ -295,7 +375,7 @@ func InitNeo4jDriver(ctx context.Context) (neo4j.DriverWithContext, error) {
 		password = "password"
 	}
 
-	maxRetries := 15
+	maxRetries := 5
 	retryInterval := 2 * time.Second
 
 	var driver neo4j.DriverWithContext

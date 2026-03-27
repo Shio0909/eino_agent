@@ -337,6 +337,37 @@ func main() {
 	apiHandler.SetSessionCache(sessionCache)
 	apiHandler.SetRetrievalCache(retrievalCache)
 	apiHandler.SetImportStateStore(importStateStore)
+	// 接入 GraphRAG 服务（如果初始化成功）
+	if graphRAGService != nil {
+		apiHandler.SetGraphRAGService(graphRAGService)
+		chatService.SetGraphRAGService(graphRAGService)
+
+		// 注入轻量模型用于查询时快速实体抽取
+		if cfg.GraphRAG.LightLLM != nil {
+			lightModel, lightCleanup, lightErr := container.NewLLMProvider(ctx, cfg.GraphRAG.LightLLM)
+			if lightErr != nil {
+				log.Printf("[GraphRAG] 轻量模型创建失败，退化到重模型: %v", lightErr)
+			} else {
+				if lightCleanup != nil {
+					defer lightCleanup(ctx)
+				}
+				graphRAGService.SetLightModel(lightModel)
+				log.Printf("[GraphRAG] 查询时实体抽取已切换到轻量模型: %s", cfg.GraphRAG.LightLLM.ModelID)
+			}
+		}
+
+		// 将图谱检索器工厂注入 CompositeRetriever（按 KB 动态创建作用域检索器）
+		if composite, ok := einoRetriever.(*container.CompositeRetriever); ok {
+			composite.SetGraphRetrieverFactory(graphRAGService)
+			// 同时保留全局兜底（无 KB 作用域时使用）
+			topK := cfg.GraphRAG.TopK
+			if topK <= 0 {
+				topK = 10
+			}
+			composite.SetGraphRetriever(graphRAGService.CreateGraphRetriever(&graphrag.NameSpace{}, topK))
+			log.Printf("[GraphRAG] 图谱检索器已注入 Retriever (topK=%d, 支持按 KB 动态作用域)", topK)
+		}
+	}
 	if importQueue != nil {
 		if err := importQueue.StartConsumer(ctx, apiHandler.ProcessImportTask); err != nil {
 			log.Fatalf("[ImportQueue] 启动消费者失败: %v", err)

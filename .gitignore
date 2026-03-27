@@ -6,6 +6,9 @@ configs/config.yaml
 # AI 文档（面试材料、架构分析等）
 ai_docs/
 
+# Eval 报告（本地生成，不适合上传）
+docs/eval_reports/
+
 # 依赖
 node_modules/
 

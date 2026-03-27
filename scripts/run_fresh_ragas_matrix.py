@@ -216,6 +216,7 @@ def run_mode(mode_name, settings, request_builder, samples, cfg):
         base_url=cfg["llm"]["base_url"],
         temperature=0,
         max_tokens=2048,
+        request_timeout=180,
     )
     embeddings = OpenAIEmbeddings(
         model=cfg["embedding"]["model_id"],

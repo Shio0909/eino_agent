@@ -24,12 +24,18 @@ import (
 // CompositeRetriever 组合检索器
 // 【Eino 特点】支持向量检索 + 关键词检索 + 图谱检索的混合模式
 type CompositeRetriever struct {
-	cfg            *config.RAGConfig
-	embeddingCfg   *config.EmbeddingConfig
-	embedding      einoembedding.Embedder
-	vectorDB       VectorDBProvider
-	retrievalCache cachepkg.RetrievalCache
-	graphRetriever einoretriever.Retriever
+	cfg                  *config.RAGConfig
+	embeddingCfg         *config.EmbeddingConfig
+	embedding            einoembedding.Embedder
+	vectorDB             VectorDBProvider
+	retrievalCache       cachepkg.RetrievalCache
+	graphRetriever       einoretriever.Retriever
+	graphRetrieverFactory GraphRetrieverFactory // 用于按 KB 动态创建图谱检索器
+}
+
+// GraphRetrieverFactory 按命名空间创建图谱检索器（由 graphRAG Service 实现）
+type GraphRetrieverFactory interface {
+	CreateScopedGraphRetriever(knowledgeBaseID string, topK int) einoretriever.Retriever
 }
 
 type scopedKeywordSearcher interface {
@@ -64,9 +70,14 @@ func NewRetrieverProvider(
 	return retriever, nil, nil
 }
 
-// SetGraphRetriever 注入图谱检索器（GraphRAG 启用后调用）
+// SetGraphRetriever 注入图谱检索器（全局兜底，当无法按 KB 动态创建时使用）
 func (r *CompositeRetriever) SetGraphRetriever(gr einoretriever.Retriever) {
 	r.graphRetriever = gr
+}
+
+// SetGraphRetrieverFactory 注入图谱检索器工厂（按 KB 动态创建作用域图谱检索器）
+func (r *CompositeRetriever) SetGraphRetrieverFactory(f GraphRetrieverFactory) {
+	r.graphRetrieverFactory = f
 }
 
 // Retrieve 执行检索
@@ -140,24 +151,46 @@ func (r *CompositeRetriever) retrieveWithHybrid(ctx context.Context, query strin
 
 	// 图谱检索（如果启用）
 	var graphDocs []*Document
+	var graphContextDoc *Document // 图谱上下文（实体/关系描述），不参与 RRF 竞争
 	if r.graphRetriever != nil {
 		gDocs, gErr := r.graphRetriever.Retrieve(ctx, query)
 		if gErr != nil {
 			log.Printf("[Retriever] 图谱检索失败（降级继续）: %v", gErr)
 		} else {
 			for _, d := range gDocs {
-				if d != nil {
-					graphDocs = append(graphDocs, &Document{
+				if d == nil {
+					continue
+				}
+				// graph-context 是实体/关系的摘要文档，从 RRF 中分离出来直接注入
+				if d.ID == "graph-context" && strings.TrimSpace(d.Content) != "" {
+					graphContextDoc = &Document{
 						ID:       d.ID,
 						Content:  d.Content,
 						Metadata: d.MetaData,
-					})
+					}
+					continue
 				}
+				graphDocs = append(graphDocs, &Document{
+					ID:       d.ID,
+					Content:  d.Content,
+					Metadata: d.MetaData,
+				})
 			}
 		}
 	}
 
 	fused := r.rrfFuse(vectorDocs, keywordDocs, graphDocs, topK)
+
+	// 将图谱上下文作为补充信息追加到检索结果中（不占 topK 名额）
+	if graphContextDoc != nil {
+		if graphContextDoc.Metadata == nil {
+			graphContextDoc.Metadata = map[string]interface{}{}
+		}
+		graphContextDoc.Metadata["match_type"] = "graph_context"
+		fused = append(fused, graphContextDoc)
+		log.Printf("[Retriever] 已注入图谱上下文文档（%d 字符）", len(graphContextDoc.Content))
+	}
+
 	r.setCachedRetrievalDocuments(ctx, query, true, fused)
 
 	return toSchemaDocuments(fused), nil
@@ -184,6 +217,17 @@ func (r *CompositeRetriever) WithKnowledgeBaseScope(ids []string) einoretriever.
 		base:  r.vectorDB,
 		kbSet: kbSet,
 	}
+
+	// 如果有 GraphRetriever 工厂，按第一个 KB ID 创建作用域图谱检索器
+	if r.graphRetrieverFactory != nil && len(ids) > 0 {
+		topK := r.cfg.TopK
+		if topK <= 0 {
+			topK = 10
+		}
+		clone.graphRetriever = r.graphRetrieverFactory.CreateScopedGraphRetriever(ids[0], topK)
+		log.Printf("[Retriever] 为 KB=%s 创建了作用域图谱检索器", ids[0])
+	}
+
 	return &clone
 }
 
@@ -373,6 +417,9 @@ func (r *CompositeRetriever) rrfFuse(vectorDocs, keywordDocs, graphDocs []*Docum
 			if !exists {
 				entry = &rankedDoc{doc: doc}
 				ranked[doc.ID] = entry
+			} else if entry.doc.Content == "" && doc.Content != "" {
+				// 当前 entry 无内容但新 doc 有内容时，替换为有内容的文档（保留已有得分）
+				entry.doc = doc
 			}
 			entry.score += 1.0 / (rrfK + float64(rank+1))
 			entry.hits++
@@ -400,6 +447,10 @@ func (r *CompositeRetriever) rrfFuse(vectorDocs, keywordDocs, graphDocs []*Docum
 				item.doc.Metadata = map[string]interface{}{}
 			}
 			item.doc.Metadata["match_type"] = "hybrid"
+		}
+		// 跳过没有实际内容的文档（图谱返回的空 content chunk 若未被向量/关键词命中则无用）
+		if strings.TrimSpace(item.doc.Content) == "" {
+			continue
 		}
 		list = append(list, item)
 	}
