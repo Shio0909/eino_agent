@@ -7,6 +7,7 @@ from urllib import request as urllib_request
 from datasets import Dataset
 from ragas import evaluate
 from ragas.metrics import AnswerRelevancy, Faithfulness
+from ragas.run_config import RunConfig
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 BASE_URL = os.environ.get("EINO_BASE_URL", "http://127.0.0.1:19093")
@@ -171,6 +172,12 @@ def main():
         api_key=cfg["embedding"]["api_key"],
         base_url=cfg["embedding"]["base_url"],
     )
+    run_config = RunConfig(
+        timeout=600,       # 10 min per job (GLM-5 via SiliconFlow is slow)
+        max_retries=5,
+        max_wait=120,
+        max_workers=4,     # limit concurrency to avoid API rate limits
+    )
     result = evaluate(
         ds,
         metrics=[AnswerRelevancy(), Faithfulness()],
@@ -178,6 +185,7 @@ def main():
         embeddings=embeddings,
         raise_exceptions=False,
         show_progress=True,
+        run_config=run_config,
     )
     metric_rows = []
     for item in getattr(result, "scores", []) or []:
