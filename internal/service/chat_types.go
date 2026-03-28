@@ -35,4 +35,7 @@ type StreamEvent struct {
 	ToolName     string   `json:"tool_name,omitempty"`
 	ToolInput    string   `json:"tool_input,omitempty"`
 	Sources      []Source `json:"sources,omitempty"`
+	LatencyMs    int64    `json:"latency_ms,omitempty"`
+	SourceCount  int      `json:"source_count,omitempty"`
+	RetryCount   int      `json:"retry_count,omitempty"`
 }

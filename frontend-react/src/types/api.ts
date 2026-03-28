@@ -49,6 +49,10 @@ export interface Message {
   mode?: ChatMode
   references?: Reference[]
   agent_steps?: AgentStep[]
+  latency_ms?: number
+  source_count?: number
+  resolved_mode?: string
+  retry_count?: number
   created_at: string
 }
 
@@ -188,6 +192,7 @@ export type StreamEventType =
   | 'thought'
   | 'action'
   | 'observation'
+  | 'meta'
 
 export interface StreamEvent {
   type: StreamEventType
@@ -199,6 +204,9 @@ export interface StreamEvent {
   tool_input?: string
   references?: Reference[]
   agent_step?: AgentStep
+  latency_ms?: number
+  source_count?: number
+  retry_count?: number
 }
 
 export interface APIResponse<T> {

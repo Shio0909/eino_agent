@@ -874,6 +874,8 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			}
 
 			latencyMs := time.Since(startTime).Milliseconds()
+			sourceCount := len(s.buildSourcesFromRetriever(ctx, cc.runtimeRetriever, req.Message, s.config.RAG.TopK))
+			ch <- StreamEvent{Type: "meta", ResolvedMode: "agentic_rag", LatencyMs: latencyMs, SourceCount: sourceCount}
 			s.saveAssistantMessage(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs)
 			return
 		}
@@ -929,6 +931,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			ch <- StreamEvent{Type: "done"}
 
 			latencyMs := time.Since(startTime).Milliseconds()
+			ch <- StreamEvent{Type: "meta", ResolvedMode: "agent", LatencyMs: latencyMs}
 			s.saveAssistantMessage(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs)
 			return
 		}
@@ -980,6 +983,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			}
 
 			latencyMs := time.Since(startTime).Milliseconds()
+			ch <- StreamEvent{Type: "meta", ResolvedMode: "pipeline", LatencyMs: latencyMs}
 			s.saveAssistantMessage(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs)
 			return
 		}

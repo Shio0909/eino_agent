@@ -3,7 +3,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism'
-import { Copy, Check, User, Bot } from 'lucide-react'
+import { Copy, Check, User, Bot, RefreshCw } from 'lucide-react'
 import type { Message } from '../../types/api'
 import AgentStepCard from './AgentStepCard'
 import ReferencePanel from './ReferencePanel'
@@ -11,6 +11,9 @@ import ReferencePanel from './ReferencePanel'
 interface Props {
   message: Message
   isStreaming?: boolean
+  isLast?: boolean
+  onRegenerate?: () => void
+  regenerating?: boolean
 }
 
 // Stable references to avoid ReactMarkdown re-parsing on every render
@@ -31,7 +34,7 @@ const markdownComponents = {
   },
 }
 
-const ChatMessage = memo(function ChatMessage({ message, isStreaming }: Props) {
+const ChatMessage = memo(function ChatMessage({ message, isStreaming, isLast, onRegenerate, regenerating }: Props) {
   const isUser = message.role === 'user'
 
   return (
@@ -79,6 +82,35 @@ const ChatMessage = memo(function ChatMessage({ message, isStreaming }: Props) {
           {message.references && message.references.length > 0 && (
             <div className="mt-4">
               <ReferencePanel references={message.references} />
+            </div>
+          )}
+
+          {/* Meta info + Regenerate (assistant only, not streaming) */}
+          {!isUser && !isStreaming && message.content && (
+            <div className="flex items-center gap-3 mt-3 text-[11px] text-[var(--color-text-muted)]">
+              {message.latency_ms != null && message.latency_ms > 0 && (
+                <span>{(message.latency_ms / 1000).toFixed(1)}s</span>
+              )}
+              {(message.source_count ?? (message.references?.length || 0)) > 0 && (
+                <span>{message.source_count ?? message.references?.length} 来源</span>
+              )}
+              {message.resolved_mode && (
+                <span>{message.resolved_mode}</span>
+              )}
+              {message.retry_count != null && message.retry_count > 0 && (
+                <span>重试 {message.retry_count} 次</span>
+              )}
+              {isLast && onRegenerate && (
+                <button
+                  onClick={onRegenerate}
+                  disabled={regenerating}
+                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md hover:bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)] transition-colors disabled:opacity-40"
+                  title="重新生成"
+                >
+                  <RefreshCw size={12} className={regenerating ? 'animate-spin' : ''} />
+                  <span>重新生成</span>
+                </button>
+              )}
             </div>
           )}
         </div>

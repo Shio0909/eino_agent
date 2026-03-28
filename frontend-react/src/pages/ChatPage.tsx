@@ -45,6 +45,7 @@ export default function ChatPage() {
     })),
   )
   const sendMessage = useChatStore((s) => s.sendMessage)
+  const regenerateLastMessage = useChatStore((s) => s.regenerateLastMessage)
   const setForceCitation = useChatStore((s) => s.setForceCitation)
   const setEnableSkills = useChatStore((s) => s.setEnableSkills)
   const toggleSkill = useChatStore((s) => s.toggleSkill)
@@ -86,6 +87,13 @@ export default function ChatPage() {
     const ts = new Date().toISOString().slice(0, 10)
     downloadMarkdown(`eino-chat-${ts}.md`, md)
   }, [])
+
+  const handleRegenerate = useCallback(() => {
+    const controller = new AbortController()
+    abortRef.current = controller
+    streamStartRef.current = new Date().toISOString()
+    regenerateLastMessage(controller.signal)
+  }, [regenerateLastMessage])
 
   // Stable streaming message object — only recreated when streamContent changes
   const streamingMessage = useMemo(() => ({
@@ -165,8 +173,14 @@ export default function ChatPage() {
           </div>
         ) : (
           <div className="py-4 px-8 lg:px-16 xl:px-24">
-            {messages.map((msg) => (
-              <ChatMessage key={msg.id} message={msg} />
+            {messages.map((msg, idx) => (
+              <ChatMessage
+                key={msg.id}
+                message={msg}
+                isLast={idx === messages.length - 1 && msg.role === 'assistant'}
+                onRegenerate={handleRegenerate}
+                regenerating={streaming}
+              />
             ))}
             {streaming && streamContent && (
               <ChatMessage message={streamingMessage} isStreaming />

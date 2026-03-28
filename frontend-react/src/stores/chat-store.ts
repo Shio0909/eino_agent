@@ -17,6 +17,7 @@ interface ChatState {
   enableSkills: boolean
   selectedSkills: string[]
   selectedKBIds: string[]
+  lastMeta: { latency_ms?: number; source_count?: number; resolved_mode?: string; retry_count?: number }
 
   // Actions
   setMode: (m: ChatMode) => void
@@ -30,6 +31,7 @@ interface ChatState {
   createSession: (title: string) => Promise<string>
   deleteSession: (id: string) => Promise<void>
   sendMessage: (query: string, signal?: AbortSignal) => Promise<void>
+  regenerateLastMessage: (signal?: AbortSignal) => Promise<void>
   clearCurrent: () => void
 }
 
@@ -48,6 +50,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   enableSkills: false,
   selectedSkills: ['citation-generator'],
   selectedKBIds: [],
+  lastMeta: {},
 
   setMode: (m) => set({ mode: m, resolvedMode: '' }),
   setForceCitation: (enabled) => set({ forceCitation: enabled }),
@@ -125,12 +128,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
       agentSteps: [],
       references: [],
       pipelineStatus: '',
+      lastMeta: {},
     })
 
     let sessionId = currentSessionId
     let fullContent = ''
     const steps: AgentStep[] = []
     let refs: Reference[] = []
+    let meta: ChatState['lastMeta'] = {}
 
     try {
       await api.streamChat(query, sessionId, mode, {
@@ -144,6 +149,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
           set({ currentSessionId: sessionId })
         } else if (evt.type === 'mode_resolved' && (evt as any).resolved_mode) {
           set({ resolvedMode: (evt as any).resolved_mode })
+        } else if (evt.type === 'meta') {
+          meta = {
+            latency_ms: (evt as any).latency_ms,
+            source_count: (evt as any).source_count,
+            resolved_mode: (evt as any).resolved_mode,
+            retry_count: (evt as any).retry_count,
+          }
+          set({ lastMeta: meta })
+          if ((evt as any).resolved_mode) {
+            set({ resolvedMode: (evt as any).resolved_mode })
+          }
         } else if (evt.type === 'source') {
           const nextRef: Reference = {
             document_id: (evt as any).doc_id || '',
@@ -193,6 +209,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       mode,
       references: refs.length > 0 ? refs : undefined,
       agent_steps: steps.length > 0 ? steps : undefined,
+      latency_ms: meta.latency_ms,
+      source_count: meta.source_count ?? refs.length,
+      resolved_mode: meta.resolved_mode || mode,
+      retry_count: meta.retry_count,
       created_at: new Date().toISOString(),
     }
 
@@ -205,6 +225,33 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     // Reload sessions to pick up new session
     get().loadSessions()
+  },
+
+  regenerateLastMessage: async (signal) => {
+    const { messages } = get()
+    // Find last user message
+    let lastUserIdx = -1
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'user') {
+        lastUserIdx = i
+        break
+      }
+    }
+    if (lastUserIdx < 0) return
+
+    const query = messages[lastUserIdx].content
+    // Remove everything after (and including) the last user message's assistant reply
+    const trimmed = messages.slice(0, lastUserIdx + 1)
+    // If there's an assistant message right after, remove it
+    if (trimmed.length < messages.length && messages[lastUserIdx + 1]?.role === 'assistant') {
+      // Keep only up to and including the user message
+    } else {
+      // There's no assistant reply to remove, just re-send
+    }
+    set({ messages: trimmed })
+
+    // Re-send the same query
+    await get().sendMessage(query, signal)
   },
 
   clearCurrent: () =>

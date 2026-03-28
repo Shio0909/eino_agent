@@ -529,6 +529,18 @@ func (h *Handler) ChatStream(c *gin.Context) {
 			if event.DocID != "" {
 				data["doc_id"] = event.DocID
 			}
+			if event.ResolvedMode != "" {
+				data["resolved_mode"] = event.ResolvedMode
+			}
+			if event.LatencyMs > 0 {
+				data["latency_ms"] = event.LatencyMs
+			}
+			if event.SourceCount > 0 {
+				data["source_count"] = event.SourceCount
+			}
+			if event.RetryCount > 0 {
+				data["retry_count"] = event.RetryCount
+			}
 			c.SSEvent("message", data)
 			return true
 		}
