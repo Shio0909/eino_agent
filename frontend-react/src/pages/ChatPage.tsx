@@ -1,6 +1,6 @@
 import { useRef, useEffect, useState, useMemo, useCallback } from 'react'
 import { useShallow } from 'zustand/react/shallow'
-import { Sparkles, Database, ChevronDown } from 'lucide-react'
+import { Sparkles, Database, ChevronDown, Download } from 'lucide-react'
 import { useChatStore } from '../stores/chat-store'
 import { useKnowledgeStore } from '../stores/knowledge-store'
 import ChatMessage from '../components/chat/ChatMessage'
@@ -9,6 +9,8 @@ import ModeSelector from '../components/chat/ModeSelector'
 import AgentStepCard from '../components/chat/AgentStepCard'
 import PipelineViewer from '../components/chat/PipelineViewer'
 import ReferencePanel from '../components/chat/ReferencePanel'
+import ThinkingIndicator from '../components/chat/ThinkingIndicator'
+import { messagesToMarkdown, downloadMarkdown } from '../lib/export'
 
 const quickPrompts = [
   '总结当前知识库的核心主题',
@@ -30,6 +32,7 @@ export default function ChatPage() {
   const streaming = useChatStore((s) => s.streaming)
   const streamContent = useChatStore((s) => s.streamContent)
   const mode = useChatStore((s) => s.mode)
+  const resolvedMode = useChatStore((s) => s.resolvedMode)
   const agentSteps = useChatStore((s) => s.agentSteps)
   const references = useChatStore((s) => s.references)
   const pipelineStatus = useChatStore((s) => s.pipelineStatus)
@@ -75,6 +78,15 @@ export default function ChatPage() {
 
   const handleStop = useCallback(() => { abortRef.current?.abort() }, [])
 
+  const handleExport = useCallback(() => {
+    const msgs = useChatStore.getState().messages
+    if (msgs.length === 0) return
+    const title = msgs[0]?.content.slice(0, 30) || '对话'
+    const md = messagesToMarkdown(msgs, title)
+    const ts = new Date().toISOString().slice(0, 10)
+    downloadMarkdown(`eino-chat-${ts}.md`, md)
+  }, [])
+
   // Stable streaming message object — only recreated when streamContent changes
   const streamingMessage = useMemo(() => ({
     id: 'streaming',
@@ -90,8 +102,44 @@ export default function ChatPage() {
     <div className="flex-1 flex flex-col h-full min-w-0">
       {/* Header */}
       <header className="h-14 shrink-0 border-b border-[var(--color-border-subtle)] bg-[var(--color-bg-primary)] px-8 flex items-center justify-between">
-        <p className="text-base font-semibold text-[var(--color-text-primary)]">Eino Agent</p>
-        <ModeSelector />
+        <div className="flex items-center gap-3">
+          <p className="text-base font-semibold text-[var(--color-text-primary)]">Eino Agent</p>
+          {/* Context indicators */}
+          <div className="flex items-center gap-1.5">
+            <span className="px-2 py-0.5 rounded-md text-[11px] font-medium bg-[var(--color-accent-light)] text-[var(--color-accent)]">
+              {resolvedMode || mode}
+            </span>
+            {selectedKBIds.length > 0 ? (
+              <>
+                {knowledgeBases.filter(kb => selectedKBIds.includes(kb.id)).slice(0, 2).map(kb => (
+                  <span key={kb.id} className="px-2 py-0.5 rounded-md text-[11px] font-medium bg-[var(--color-bg-tertiary)] text-[var(--color-text-secondary)] truncate max-w-[120px]">
+                    {kb.name}
+                  </span>
+                ))}
+                {selectedKBIds.length > 2 && (
+                  <span className="px-1.5 py-0.5 rounded-md text-[11px] font-medium bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)]">
+                    +{selectedKBIds.length - 2}
+                  </span>
+                )}
+              </>
+            ) : (
+              <span className="px-2 py-0.5 rounded-md text-[11px] bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)]">
+                全部知识库
+              </span>
+            )}
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={handleExport}
+            disabled={messages.length === 0}
+            title="导出 Markdown"
+            className="p-2 rounded-lg text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-tertiary)] transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+          >
+            <Download size={16} />
+          </button>
+          <ModeSelector />
+        </div>
       </header>
 
       {/* Messages */}
@@ -122,6 +170,9 @@ export default function ChatPage() {
             ))}
             {streaming && streamContent && (
               <ChatMessage message={streamingMessage} isStreaming />
+            )}
+            {streaming && !streamContent && (
+              <ThinkingIndicator />
             )}
             {streaming && agentSteps.length > 0 && (
               <div className="ml-12"><AgentStepCard steps={agentSteps} live /></div>
