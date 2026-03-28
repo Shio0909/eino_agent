@@ -448,6 +448,10 @@ func (s *ChatService) buildRuntimeAgenticRAG(ctx context.Context, runtimeRetriev
 		pipeline.WithAgenticChatModel(s.chatModel),
 		pipeline.WithAgenticRetriever(runtimeRetriever),
 	}
+	// 注入重排序器
+	if s.reranker != nil && s.config.RAG.EnableRerank {
+		agenticOpts = append(agenticOpts, pipeline.WithAgenticReranker(s.reranker, s.config.Reranker.TopK))
+	}
 	if lm := s.config.Agent.AgenticRAG.LightLLM; lm != nil && lm.ModelID != "" {
 		lightModel, _, err := container.NewLLMProvider(ctx, lm)
 		if err != nil {
@@ -470,7 +474,7 @@ func (s *ChatService) buildMemoryInstruction(ctx context.Context, req *ChatReque
 
 	maxChars := s.config.Memory.MaxContextChars
 	if maxChars <= 0 {
-		maxChars = 3000
+		maxChars = 6000
 	}
 
 	parts := make([]string, 0, 2)

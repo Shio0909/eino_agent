@@ -97,6 +97,8 @@ type AgenticRAGPipeline struct {
 	chatModel    model.ChatModel
 	lightModel   model.ChatModel // 轻量模型，用于 classify / refine 等低推理节点
 	retriever    retriever.Retriever
+	reranker     Reranker // 可选重排序器，用于检索后对文档排序
+	rerankerTopK int      // 重排序后保留的文档数
 	cfg          *config.AgenticRAGConfig
 	systemPrompt string
 
@@ -126,6 +128,8 @@ type agenticRAGDeps struct {
 	chatModel    model.ChatModel
 	lightModel   model.ChatModel        // Optional light model for classify/refine.
 	retriever    retriever.Retriever
+	reranker     Reranker               // Optional reranker for post-retrieval ranking.
+	rerankerTopK int                    // Number of docs to keep after reranking.
 	webRetriever retriever.Retriever // Optional web retriever for fallback.
 	systemPrompt string
 }
@@ -155,6 +159,14 @@ func WithAgenticLightModel(m model.ChatModel) AgenticRAGOption {
 	return func(d *agenticRAGDeps) { d.lightModel = m }
 }
 
+// WithAgenticReranker sets an optional reranker for post-retrieval document ranking.
+func WithAgenticReranker(r Reranker, topK int) AgenticRAGOption {
+	return func(d *agenticRAGDeps) {
+		d.reranker = r
+		d.rerankerTopK = topK
+	}
+}
+
 // NewAgenticRAGPipeline builds the Agentic RAG graph.
 //
 // Graph: START → query_analyze → retrieve → knowledge_refine → generate → self_reflect → [END | query_analyze]
@@ -182,6 +194,8 @@ func NewAgenticRAGPipeline(ctx context.Context, cfg *config.AgenticRAGConfig, op
 		chatModel:    deps.chatModel,
 		lightModel:   deps.lightModel,
 		retriever:    deps.retriever,
+		reranker:     deps.reranker,
+		rerankerTopK: deps.rerankerTopK,
 		cfg:          cfg,
 		systemPrompt: strings.TrimSpace(deps.systemPrompt),
 	}
@@ -575,6 +589,37 @@ func (p *AgenticRAGPipeline) retrieve(ctx context.Context, query string) (string
 		allDocs = docs
 	}
 
+	// Apply reranking if available
+	if p.reranker != nil && len(allDocs) > 0 {
+		rerankStart := time.Now()
+		passages := make([]string, len(allDocs))
+		for i, doc := range allDocs {
+			passages[i] = doc.Content
+		}
+		ranked, err := p.reranker.Rerank(ctx, query, passages)
+		if err != nil {
+			log.Printf("[AgenticRAG][Retrieve] rerank failed, keeping original order: %v", err)
+		} else {
+			topK := p.rerankerTopK
+			if topK <= 0 {
+				topK = 5
+			}
+			if topK > len(ranked) {
+				topK = len(ranked)
+			}
+			rerankedDocs := make([]*schema.Document, 0, topK)
+			for i := 0; i < topK; i++ {
+				idx := ranked[i]
+				if idx < len(allDocs) {
+					rerankedDocs = append(rerankedDocs, allDocs[idx])
+				}
+			}
+			log.Printf("[Timing][AgenticRAG] stage=rerank duration_ms=%d docs_in=%d docs_out=%d",
+				time.Since(rerankStart).Milliseconds(), len(allDocs), len(rerankedDocs))
+			allDocs = rerankedDocs
+		}
+	}
+
 	_ = compose.ProcessState[*AgenticRAGState](ctx, func(ctx context.Context, state *AgenticRAGState) error {
 		state.Documents = allDocs
 		return nil
@@ -811,7 +856,8 @@ func (p *AgenticRAGPipeline) generate(ctx context.Context, refineOutput string) 
 
 	if systemPrompt == "" {
 		systemPrompt = `你是一个专业的知识库问答助手。
-请基于来源资料尽可能完整地回答，允许总结和归纳。禁止编造具体信息。
+回答必须且只能基于下方的来源资料，逐条引用原文支撑论点。
+不得添加资料中未出现的事实或数据。信息不足时明确说明，不要猜测。
 引用证据时使用 [来源X] 标注。优先使用资料原文措辞。`
 	}
 
