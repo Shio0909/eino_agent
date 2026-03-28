@@ -71,6 +71,7 @@ agent:
         quality_threshold: 0.6
         enable_web_fallback: false
         max_run_steps: 20
+        node_timeout_sec: 60  # 每个 LLM 节点的超时秒数（0=不限）
         # 轻量模型：用于 query classify / knowledge refine 等低推理节点
         # 推荐使用 SiliconFlow 免费模型以降低延迟（~2s vs 主模型 ~16s）
         # 留空或删除此段则所有节点使用主模型

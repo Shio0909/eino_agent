@@ -110,6 +110,15 @@ type runMeta struct {
 	queryHistory []string
 }
 
+// nodeCtx returns a context with the configured per-node timeout.
+// If no timeout is configured, returns the original context.
+func (p *AgenticRAGPipeline) nodeCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	if p.cfg != nil && p.cfg.NodeTimeoutSec > 0 {
+		return context.WithTimeout(ctx, time.Duration(p.cfg.NodeTimeoutSec)*time.Second)
+	}
+	return ctx, func() {}
+}
+
 // AgenticRAGOption configures AgenticRAGPipeline dependencies.
 type AgenticRAGOption func(*agenticRAGDeps)
 
@@ -411,7 +420,9 @@ func (p *AgenticRAGPipeline) classifyAndDecompose(ctx context.Context, query str
 
 只返回 JSON。`, query)
 
-	resp, err := p.lightModel.Generate(ctx, []*schema.Message{
+	llmCtx, llmCancel := p.nodeCtx(ctx)
+	defer llmCancel()
+	resp, err := p.lightModel.Generate(llmCtx, []*schema.Message{
 		{Role: schema.User, Content: prompt},
 	})
 	if err != nil {
@@ -464,7 +475,9 @@ func (p *AgenticRAGPipeline) rewriteWithFeedback(ctx context.Context, originalQu
 - 使用更精确或更常用的术语
 - 只返回一条重写后的查询，不要附加解释`, originalQuery, currentQuery, reflectReason)
 
-	resp, err := p.lightModel.Generate(ctx, []*schema.Message{
+	llmCtx, llmCancel := p.nodeCtx(ctx)
+	defer llmCancel()
+	resp, err := p.lightModel.Generate(llmCtx, []*schema.Message{
 		{Role: schema.User, Content: prompt},
 	})
 	if err != nil {
@@ -511,30 +524,34 @@ func (p *AgenticRAGPipeline) retrieve(ctx context.Context, query string) (string
 		return "", nil
 	}
 
-	// For complex queries with sub-queries: retrieve per sub-query and merge
+	// For complex queries with sub-queries: retrieve per sub-query in parallel and merge
 	if queryType == QueryTypeComplex && len(subQueries) > 0 && retryCount == 0 {
-		seen := make(map[string]bool)
-		for _, sq := range subQueries {
-			docs, err := p.retriever.Retrieve(ctx, sq)
-			if err != nil {
-				log.Printf("[AgenticRAG][Retrieve] sub-query %q failed: %v", sq, err)
-				continue
-			}
-			for _, doc := range docs {
-				key := doc.ID
-				if key == "" {
-					key = truncate(doc.Content, 100)
-				}
-				if !seen[key] {
-					seen[key] = true
-					allDocs = append(allDocs, doc)
-				}
-			}
+		// 并行检索所有子查询 + 原始查询
+		type retrieveResult struct {
+			docs []*schema.Document
+			sq   string
 		}
-		// Also retrieve with the original query to ensure coverage
-		mainDocs, err := p.retriever.Retrieve(ctx, query)
-		if err == nil {
-			for _, doc := range mainDocs {
+		queries := append([]string{query}, subQueries...)
+		results := make([]retrieveResult, len(queries))
+		var wg sync.WaitGroup
+		for i, sq := range queries {
+			wg.Add(1)
+			go func(idx int, q string) {
+				defer wg.Done()
+				docs, err := p.retriever.Retrieve(ctx, q)
+				if err != nil {
+					log.Printf("[AgenticRAG][Retrieve] sub-query %q failed: %v", q, err)
+					return
+				}
+				results[idx] = retrieveResult{docs: docs, sq: q}
+			}(i, sq)
+		}
+		wg.Wait()
+
+		// 合并去重
+		seen := make(map[string]bool)
+		for _, r := range results {
+			for _, doc := range r.docs {
 				key := doc.ID
 				if key == "" {
 					key = truncate(doc.Content, 100)
@@ -641,7 +658,9 @@ func (p *AgenticRAGPipeline) knowledgeRefine(ctx context.Context, retrieveOutput
 
 只返回 JSON。`, evalQuery, docsText.String())
 
-	resp, err := p.lightModel.Generate(ctx, []*schema.Message{
+	llmCtx, llmCancel := p.nodeCtx(ctx)
+	defer llmCancel()
+	resp, err := p.lightModel.Generate(llmCtx, []*schema.Message{
 		{Role: schema.User, Content: prompt},
 	})
 	log.Printf("[Timing][AgenticRAG] stage=knowledge_refine duration_ms=%d docs_in=%d",
@@ -707,13 +726,34 @@ func (p *AgenticRAGPipeline) knowledgeRefine(ctx context.Context, retrieveOutput
 		score = 0.9
 	}
 
+	// 检索质量低于阈值时标记，让 selfReflect 更倾向触发重试
+	qualityThreshold := 0.3 // 默认阈值
+	lowQuality := false
+	_ = compose.ProcessState[*AgenticRAGState](ctx, func(ctx context.Context, state *AgenticRAGState) error {
+		if state.QualityThreshold > 0 {
+			qualityThreshold = state.QualityThreshold
+		}
+		return nil
+	})
+	if score < qualityThreshold {
+		lowQuality = true
+		log.Printf("[AgenticRAG][Refine] ⚠ retrieval quality %.2f below threshold %.2f", score, qualityThreshold)
+	}
+
 	_ = compose.ProcessState[*AgenticRAGState](ctx, func(ctx context.Context, state *AgenticRAGState) error {
 		state.RefinedDocs = refined
 		state.RetrievalScore = score
+		if lowQuality && state.RetryCount < state.MaxRetries {
+			// 质量不达标时，直接触发重试（跳过 generate+reflect 节省时间）
+			state.ReflectPass = false
+			state.ReflectReason = fmt.Sprintf("retrieval quality %.2f below threshold %.2f", score, qualityThreshold)
+			state.RetryCount++
+			log.Printf("[AgenticRAG][Refine] low quality → forcing retry (count=%d)", state.RetryCount)
+		}
 		return nil
 	})
 
-	log.Printf("[AgenticRAG][Refine] docs_in=%d docs_out=%d score=%.2f", len(docs), len(refined), score)
+	log.Printf("[AgenticRAG][Refine] docs_in=%d docs_out=%d score=%.2f lowQuality=%v", len(docs), len(refined), score, lowQuality)
 	return retrieveOutput, nil
 }
 
@@ -745,7 +785,9 @@ func (p *AgenticRAGPipeline) generate(ctx context.Context, refineOutput string) 
 
 	// Direct queries: answer without document context
 	if queryType == QueryTypeDirect {
-		resp, err := p.chatModel.Generate(ctx, []*schema.Message{
+		llmCtx, llmCancel := p.nodeCtx(ctx)
+		defer llmCancel()
+		resp, err := p.chatModel.Generate(llmCtx, []*schema.Message{
 			{Role: schema.User, Content: originalQuery},
 		})
 		if err != nil {
@@ -786,7 +828,9 @@ func (p *AgenticRAGPipeline) generate(ctx context.Context, refineOutput string) 
 
 请基于上述参考资料尽可能完整地回答。每个要点附带[来源X]。允许总结归纳。`, contextBuilder.String(), originalQuery, retryNote)
 
-	resp, err := p.chatModel.Generate(ctx, []*schema.Message{
+	llmCtx, llmCancel := p.nodeCtx(ctx)
+	defer llmCancel()
+	resp, err := p.chatModel.Generate(llmCtx, []*schema.Message{
 		{Role: schema.System, Content: systemPrompt},
 		{Role: schema.User, Content: userPrompt},
 	})
@@ -864,17 +908,27 @@ func (p *AgenticRAGPipeline) selfReflect(ctx context.Context, answer string) (st
 
 只返回 JSON。`, originalQuery, docsSummary.String(), truncate(answer, 500))
 
-	resp, err := p.chatModel.Generate(ctx, []*schema.Message{
+	// 反思是二分类任务（pass/fail），使用轻量模型即可
+	llmCtx, llmCancel := p.nodeCtx(ctx)
+	defer llmCancel()
+	resp, err := p.lightModel.Generate(llmCtx, []*schema.Message{
 		{Role: schema.User, Content: prompt},
 	})
 	log.Printf("[Timing][AgenticRAG] stage=self_reflect duration_ms=%d",
 		time.Since(startTime).Milliseconds())
 
 	if err != nil {
-		// LLM failed: pass by default (conservative)
-		log.Printf("[AgenticRAG][Reflect] LLM failed, passing by default: %v", err)
+		// LLM failed: track consecutive failures; pass on first, fail on second
+		log.Printf("[AgenticRAG][Reflect] LLM failed: %v", err)
 		_ = compose.ProcessState[*AgenticRAGState](ctx, func(ctx context.Context, state *AgenticRAGState) error {
-			state.ReflectPass = true
+			if state.RetryCount > 0 {
+				// 已重试过，再次失败说明 LLM 不稳定，不再盲目通过
+				state.ReflectPass = false
+				state.ReflectReason = "reflection LLM failed after retry"
+				log.Printf("[AgenticRAG][Reflect] LLM failed after retry, rejecting")
+			} else {
+				state.ReflectPass = true
+			}
 			return nil
 		})
 		return answer, nil
@@ -891,9 +945,14 @@ func (p *AgenticRAGPipeline) selfReflect(ctx context.Context, answer string) (st
 		Reason string `json:"reason"`
 	}
 	if err := json.Unmarshal([]byte(content), &result); err != nil {
-		log.Printf("[AgenticRAG][Reflect] JSON parse failed (%q), passing by default: %v", content, err)
+		log.Printf("[AgenticRAG][Reflect] JSON parse failed (%q): %v", content, err)
 		_ = compose.ProcessState[*AgenticRAGState](ctx, func(ctx context.Context, state *AgenticRAGState) error {
-			state.ReflectPass = true
+			if state.RetryCount > 0 {
+				state.ReflectPass = false
+				state.ReflectReason = "reflection JSON parse failed after retry"
+			} else {
+				state.ReflectPass = true
+			}
 			return nil
 		})
 		return answer, nil

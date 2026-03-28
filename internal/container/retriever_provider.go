@@ -145,7 +145,8 @@ func (r *CompositeRetriever) retrieveWithHybrid(ctx context.Context, query strin
 	if ks, ok := r.vectorDB.(keywordSearcher); ok {
 		keywordDocs, err = ks.SearchKeyword(ctx, query, topK*2)
 		if err != nil {
-			return nil, fmt.Errorf("关键词检索失败: %w", err)
+			log.Printf("[Retriever] 关键词检索失败（降级继续）: %v", err)
+			keywordDocs = nil // 降级：仅使用向量检索结果
 		}
 	}
 
@@ -400,6 +401,13 @@ func retrievalCacheDocsToDocuments(docs []cachepkg.RetrievalDocument) []*Documen
 func (r *CompositeRetriever) rrfFuse(vectorDocs, keywordDocs, graphDocs []*Document, topK int) []*Document {
 	const rrfK = 60.0
 
+	// 各检索源权重（向量通常最稳定，关键词补充精确匹配，图谱提供关系信号）
+	sourceWeights := map[string]float64{
+		"vector":  1.0,
+		"keyword": 0.8,
+		"graph":   0.6,
+	}
+
 	type rankedDoc struct {
 		doc   *Document
 		score float64
@@ -409,6 +417,10 @@ func (r *CompositeRetriever) rrfFuse(vectorDocs, keywordDocs, graphDocs []*Docum
 	ranked := make(map[string]*rankedDoc)
 
 	add := func(docs []*Document, source string) {
+		weight := sourceWeights[source]
+		if weight == 0 {
+			weight = 1.0
+		}
 		for rank, doc := range docs {
 			if doc == nil || doc.ID == "" {
 				continue
@@ -418,10 +430,9 @@ func (r *CompositeRetriever) rrfFuse(vectorDocs, keywordDocs, graphDocs []*Docum
 				entry = &rankedDoc{doc: doc}
 				ranked[doc.ID] = entry
 			} else if entry.doc.Content == "" && doc.Content != "" {
-				// 当前 entry 无内容但新 doc 有内容时，替换为有内容的文档（保留已有得分）
 				entry.doc = doc
 			}
-			entry.score += 1.0 / (rrfK + float64(rank+1))
+			entry.score += weight * 1.0 / (rrfK + float64(rank+1))
 			entry.hits++
 
 			if entry.doc.Metadata == nil {
@@ -448,9 +459,13 @@ func (r *CompositeRetriever) rrfFuse(vectorDocs, keywordDocs, graphDocs []*Docum
 			}
 			item.doc.Metadata["match_type"] = "hybrid"
 		}
-		// 跳过没有实际内容的文档（图谱返回的空 content chunk 若未被向量/关键词命中则无用）
+		// 空内容文档：仅跳过单源命中的（图谱独占但无内容的 chunk）
+		// 多源命中意味着 ID 被多种检索方式确认，即使内容暂空也保留其得分排位
 		if strings.TrimSpace(item.doc.Content) == "" {
-			continue
+			if item.hits <= 1 {
+				continue
+			}
+			log.Printf("[RRF] 保留多源命中的空内容文档 id=%s hits=%d score=%.4f", item.doc.ID, item.hits, item.score)
 		}
 		list = append(list, item)
 	}

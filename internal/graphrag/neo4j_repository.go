@@ -224,17 +224,11 @@ func (r *Neo4jRepository) SearchNode(
 		labelExpr := r.Label(namespace)
 		var nodeMatch string
 		if labelExpr == "" {
-			// 空命名空间：匹配所有带 ENTITY 前缀标签的节点
 			nodeMatch = "(n)"
-			// 使用 WHERE 条件过滤：节点至少有一个以 ENTITY 开头的标签
 		} else {
 			nodeMatch = "(n:" + labelExpr + ")"
 		}
 
-		// 双向 CONTAINS + 大小写不敏感 + 最小长度过滤：
-		// 1. toLower(n.name) CONTAINS toLower(nodeText) — 搜索词是节点名的子串（如搜 "Pod" 命中 "Kubernetes Pod"）
-		// 2. toLower(nodeText) CONTAINS toLower(n.name) — 节点名是搜索词的子串（如搜 "Kubernetes Service" 命中 "Kubernetes"）
-		// 3. size(n.name) >= 2 — 排除单字符节点名避免过度匹配
 		matchExpr := `ANY(nodeText IN $nodes WHERE size(nodeText) >= 2 AND (toLower(n.name) CONTAINS toLower(nodeText) OR (size(n.name) >= 2 AND toLower(nodeText) CONTAINS toLower(n.name))))`
 
 		var query string
@@ -244,15 +238,17 @@ func (r *Neo4jRepository) SearchNode(
 				WHERE ANY(lbl IN labels(n) WHERE lbl STARTS WITH 'ENTITY')
 				AND ` + matchExpr + `
 				RETURN n, r, m
+				LIMIT $maxResults
 			`
 		} else {
 			query = `
 				MATCH ` + nodeMatch + `-[r]-(m)
 				WHERE ` + matchExpr + `
 				RETURN n, r, m
+				LIMIT $maxResults
 			`
 		}
-		params := map[string]interface{}{"nodes": nodes}
+		params := map[string]interface{}{"nodes": nodes, "maxResults": 200}
 		result, err := tx.Run(ctx, query, params)
 		if err != nil {
 			return nil, fmt.Errorf("Cypher 查询失败: %w", err)
