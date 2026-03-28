@@ -51,6 +51,29 @@ func (n NameSpace) Labels() []string {
 	return res
 }
 
+// ── 图可视化 DTO ──
+
+// VisNode 可视化节点
+type VisNode struct {
+	ID         string `json:"id"`
+	Label      string `json:"label"`
+	Degree     int    `json:"degree"`
+	ChunkCount int    `json:"chunk_count"`
+}
+
+// VisEdge 可视化边
+type VisEdge struct {
+	Source string `json:"source"`
+	Target string `json:"target"`
+	Label  string `json:"label"`
+}
+
+// VisGraph 可视化图数据
+type VisGraph struct {
+	Nodes []VisNode `json:"nodes"`
+	Edges []VisEdge `json:"edges"`
+}
+
 // ── GraphRAG 配置 ──
 
 // Config GraphRAG 配置
@@ -73,4 +96,6 @@ type GraphRepository interface {
 	DelGraph(ctx context.Context, namespaces []NameSpace) error
 	// SearchNode 根据实体名称列表在图中检索
 	SearchNode(ctx context.Context, namespace NameSpace, nodes []string) (*GraphData, error)
+	// GetGraphForVis 获取可视化用的子图（节点+边，带 limit）
+	GetGraphForVis(ctx context.Context, namespace NameSpace, limit int) (*VisGraph, error)
 }

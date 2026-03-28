@@ -139,3 +139,23 @@ export const importMCPServer = (data: {
 
 // ---- Eval ----
 export const getEvalReports = () => fetchJSON<{ reports: Array<{ name: string; size: number; modified_at: string }> }>('/eval/reports')
+
+// ---- GraphRAG ----
+export interface VisNode {
+  id: string
+  label: string
+  degree: number
+  chunk_count: number
+}
+export interface VisEdge {
+  source: string
+  target: string
+  label: string
+}
+export interface VisGraph {
+  nodes: VisNode[]
+  edges: VisEdge[]
+}
+export const getGraphRAGStatus = () => fetchJSON<{ enabled: boolean; neo4j_uri: string; connected: boolean }>('/graphrag/status')
+export const getGraphVisualization = (kbId: string, limit = 200) =>
+  fetchJSON<VisGraph>(`/graphrag/graph/${kbId}?limit=${limit}`)

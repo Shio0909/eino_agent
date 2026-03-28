@@ -5,6 +5,7 @@ import KBCard from '../components/knowledge/KBCard'
 import DocumentTable from '../components/knowledge/DocumentTable'
 import DocumentUploader from '../components/knowledge/DocumentUploader'
 import ChunkPreview from '../components/knowledge/ChunkPreview'
+import GraphVisualization from '../components/knowledge/GraphVisualization'
 import { Button, Input, EmptyState, Card, toast } from '../components/ui'
 import { BookOpen } from 'lucide-react'
 import * as api from '../lib/api'
@@ -131,6 +132,9 @@ export default function KnowledgePage() {
                 onViewChunks={handleViewChunks}
               />
             </Card>
+
+            {/* 图谱可视化 */}
+            <GraphVisualization kbId={currentKBId} />
           </div>
         </div>
 

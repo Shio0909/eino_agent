@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -224,6 +225,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			graphragAPI.GET("/status", h.GetGraphRAGStatus)
 			graphragAPI.POST("/build/:kbId", h.BuildGraphForKB)
 			graphragAPI.DELETE("/:kbId", h.DeleteGraphForKB)
+			graphragAPI.GET("/graph/:kbId", h.GetGraphVisualization)
 		}
 	}
 
@@ -330,6 +332,31 @@ func (h *Handler) DeleteGraphForKB(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "图谱已删除"})
+}
+
+// GetGraphVisualization 获取知识库图谱可视化数据
+func (h *Handler) GetGraphVisualization(c *gin.Context) {
+	if h.graphRAGService == nil {
+		c.JSON(http.StatusOK, gin.H{"nodes": []any{}, "edges": []any{}})
+		return
+	}
+	kbID := c.Param("kbId")
+	if kbID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少知识库 ID"})
+		return
+	}
+	limit := 200
+	if l := c.Query("limit"); l != "" {
+		if v, err := strconv.Atoi(l); err == nil && v > 0 {
+			limit = v
+		}
+	}
+	graph, err := h.graphRAGService.GetGraphForVis(c.Request.Context(), kbID, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("获取图谱数据失败: %v", err)})
+		return
+	}
+	c.JSON(http.StatusOK, graph)
 }
 
 // ChatRequest 聊天请求

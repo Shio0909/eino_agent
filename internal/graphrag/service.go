@@ -186,6 +186,12 @@ func (s *Service) CreateScopedGraphRetriever(knowledgeBaseID string, topK int) r
 	return s.CreateGraphRetriever(ns, topK)
 }
 
+// GetGraphForVis 获取可视化用的图数据
+func (s *Service) GetGraphForVis(ctx context.Context, kbID string, limit int) (*VisGraph, error) {
+	ns := NameSpace{KnowledgeBase: kbID}
+	return s.repository.GetGraphForVis(ctx, ns, limit)
+}
+
 // SetLightModel 为实体抽取器设置轻量模型
 func (s *Service) SetLightModel(m model.ChatModel) {
 	s.extractor.SetLightModel(m)

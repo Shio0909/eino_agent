@@ -320,6 +320,120 @@ func listToStrings(v interface{}) []string {
 	return result
 }
 
+// GetGraphForVis 获取可视化用的子图数据
+// 先查该 namespace 下的节点（按关系数排序取 top N），再查这些节点之间的关系
+func (r *Neo4jRepository) GetGraphForVis(ctx context.Context, namespace NameSpace, limit int) (*VisGraph, error) {
+	if r.driver == nil {
+		return &VisGraph{}, nil
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 200
+	}
+
+	session := r.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
+	defer session.Close(ctx)
+
+	result, err := session.ExecuteRead(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		labelExpr := r.Label(namespace)
+		if labelExpr == "" {
+			return &VisGraph{}, nil
+		}
+
+		// Step 1: 获取节点及其 degree，按 degree 降序
+		nodeQuery := `
+			MATCH (n:` + labelExpr + `)
+			OPTIONAL MATCH (n)-[r]-()
+			WITH n, count(r) AS degree
+			ORDER BY degree DESC
+			LIMIT $limit
+			RETURN n.name AS name, degree, n.chunks AS chunks
+		`
+		nodeResult, err := tx.Run(ctx, nodeQuery, map[string]interface{}{"limit": limit})
+		if err != nil {
+			return nil, fmt.Errorf("查询节点失败: %w", err)
+		}
+
+		vis := &VisGraph{}
+		nodeSet := make(map[string]bool)
+
+		for nodeResult.Next(ctx) {
+			rec := nodeResult.Record()
+			name, _ := rec.Get("name")
+			degree, _ := rec.Get("degree")
+			chunks, _ := rec.Get("chunks")
+
+			nameStr, _ := name.(string)
+			if nameStr == "" {
+				continue
+			}
+			degreeInt, _ := degree.(int64)
+			chunkCount := 0
+			if cl, ok := chunks.([]interface{}); ok {
+				chunkCount = len(cl)
+			}
+
+			nodeSet[nameStr] = true
+			vis.Nodes = append(vis.Nodes, VisNode{
+				ID:         nameStr,
+				Label:      nameStr,
+				Degree:     int(degreeInt),
+				ChunkCount: chunkCount,
+			})
+		}
+
+		if len(vis.Nodes) == 0 {
+			return vis, nil
+		}
+
+		// Step 2: 获取这些节点之间的关系
+		edgeQuery := `
+			MATCH (n:` + labelExpr + `)-[r]-(m:` + labelExpr + `)
+			WHERE n.name IN $names AND m.name IN $names AND n.name < m.name
+			RETURN DISTINCT n.name AS source, m.name AS target, type(r) AS relType
+			LIMIT $edgeLimit
+		`
+		names := make([]string, 0, len(nodeSet))
+		for n := range nodeSet {
+			names = append(names, n)
+		}
+		edgeLimit := limit * 2
+		if edgeLimit > 1000 {
+			edgeLimit = 1000
+		}
+
+		edgeResult, err := tx.Run(ctx, edgeQuery, map[string]interface{}{
+			"names":     names,
+			"edgeLimit": edgeLimit,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("查询关系失败: %w", err)
+		}
+
+		for edgeResult.Next(ctx) {
+			rec := edgeResult.Record()
+			source, _ := rec.Get("source")
+			target, _ := rec.Get("target")
+			relType, _ := rec.Get("relType")
+
+			sourceStr, _ := source.(string)
+			targetStr, _ := target.(string)
+			relStr, _ := relType.(string)
+
+			vis.Edges = append(vis.Edges, VisEdge{
+				Source: sourceStr,
+				Target: targetStr,
+				Label:  relStr,
+			})
+		}
+
+		return vis, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result.(*VisGraph), nil
+}
+
 // EnsureIndexes 为 Neo4j 创建全文索引加速实体名称查询
 // 索引使用 name 属性，利用 CONTAINS 匹配时显著提升性能
 func (r *Neo4jRepository) EnsureIndexes(ctx context.Context) error {
