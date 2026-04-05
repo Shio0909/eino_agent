@@ -8,11 +8,12 @@ package codegraph
 type EntityType string
 
 const (
-	EntityFunction EntityType = "Function"
-	EntityClass    EntityType = "Class"
-	EntityMethod   EntityType = "Method"
-	EntityModule   EntityType = "Module"
-	EntityFile     EntityType = "File"
+	EntityFunction  EntityType = "Function"
+	EntityClass     EntityType = "Class"
+	EntityMethod    EntityType = "Method"
+	EntityModule    EntityType = "Module"
+	EntityFile      EntityType = "File"
+	EntityInterface EntityType = "Interface"
 )
 
 // RelationType 代码关系类型

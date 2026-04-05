@@ -238,6 +238,89 @@ func (p *Parser) walkTypeScript(node *sitter.Node, source []byte, filePath, clas
 					Target: moduleName,
 				})
 			}
+
+		case "lexical_declaration", "variable_declaration":
+			p.extractVarDeclFunctions(child, source, filePath, className, result)
+
+		case "export_statement":
+			// Walk into the exported declaration (e.g. export function foo, export class Bar)
+			p.walkTypeScript(child, source, filePath, className, result)
+
+		case "interface_declaration":
+			name := nodeText(child.ChildByFieldName("name"), source)
+			if name == "" {
+				continue
+			}
+			result.Entities = append(result.Entities, CodeEntity{
+				Type:          EntityInterface,
+				Name:          name,
+				QualifiedName: name,
+				FilePath:      filePath,
+				LineStart:     int(child.StartPoint().Row) + 1,
+				LineEnd:       int(child.EndPoint().Row) + 1,
+			})
+
+		case "type_alias_declaration":
+			name := nodeText(child.ChildByFieldName("name"), source)
+			if name == "" {
+				continue
+			}
+			result.Entities = append(result.Entities, CodeEntity{
+				Type:          EntityClass,
+				Name:          name,
+				QualifiedName: name,
+				FilePath:      filePath,
+				LineStart:     int(child.StartPoint().Row) + 1,
+				LineEnd:       int(child.EndPoint().Row) + 1,
+			})
+		}
+	}
+}
+
+// extractVarDeclFunctions handles patterns like:
+//
+//	const fetchData = () => { ... }
+//	const fn = function() { ... }
+func (p *Parser) extractVarDeclFunctions(node *sitter.Node, source []byte, filePath, className string, result *ParseResult) {
+	for i := 0; i < int(node.ChildCount()); i++ {
+		decl := node.Child(i)
+		if decl.Type() != "variable_declarator" {
+			continue
+		}
+		nameNode := decl.ChildByFieldName("name")
+		valueNode := decl.ChildByFieldName("value")
+		if nameNode == nil || valueNode == nil {
+			continue
+		}
+		valType := valueNode.Type()
+		if valType != "arrow_function" && valType != "function" && valType != "function_expression" {
+			continue
+		}
+		name := nodeText(nameNode, source)
+		if name == "" {
+			continue
+		}
+		params := nodeText(valueNode.ChildByFieldName("parameters"), source)
+		entity := CodeEntity{
+			Name:      name,
+			FilePath:  filePath,
+			LineStart: int(node.StartPoint().Row) + 1,
+			LineEnd:   int(node.EndPoint().Row) + 1,
+			Params:    params,
+		}
+		if className != "" {
+			entity.Type = EntityMethod
+			entity.ClassName = className
+			entity.QualifiedName = fmt.Sprintf("%s.%s", className, name)
+		} else {
+			entity.Type = EntityFunction
+			entity.QualifiedName = name
+		}
+		result.Entities = append(result.Entities, entity)
+
+		body := valueNode.ChildByFieldName("body")
+		if body != nil {
+			p.extractCalls(body, source, entity.QualifiedName, result)
 		}
 	}
 }

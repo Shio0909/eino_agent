@@ -236,6 +236,37 @@ function createRunner(config: any): AgentRunner {
     return new AgentRunner(config.model);
 }
 
+const fetchData = async (url: string) => {
+    return fetch(url);
+};
+
+const processItem = function(item: any): void {
+    console.log(item);
+};
+
+export function exportedHelper(x: number): number {
+    return x + 1;
+}
+
+export class ExportedService {
+    start(): void {}
+}
+
+export default function defaultEntry() {
+    return createRunner({});
+}
+
+interface AppConfig {
+    model: string;
+    temperature: number;
+}
+
+type RequestHandler = (req: any) => Promise<any>;
+
+export interface PublicAPI {
+    run(prompt: string): Promise<string>;
+}
+
 export { AgentRunner, ToolManager, createRunner };
 `)
 
@@ -277,5 +308,33 @@ export { AgentRunner, ToolManager, createRunner };
 	}
 	if !hasImport {
 		t.Error("Missing: agent.ts -[IMPORTS]-> ./base")
+	}
+
+	// Verify variable-assigned arrow function
+	found := map[string]bool{}
+	for _, e := range result.Entities {
+		found[e.QualifiedName] = true
+	}
+	for _, name := range []string{
+		"fetchData", "processItem",
+		"exportedHelper", "ExportedService", "defaultEntry",
+		"AppConfig", "RequestHandler", "PublicAPI",
+	} {
+		if !found[name] {
+			t.Errorf("Missing entity: %s", name)
+		}
+	}
+
+	// Verify interface type
+	for _, e := range result.Entities {
+		if e.Name == "AppConfig" && e.Type != EntityInterface {
+			t.Errorf("AppConfig should be EntityInterface, got %s", e.Type)
+		}
+		if e.Name == "PublicAPI" && e.Type != EntityInterface {
+			t.Errorf("PublicAPI should be EntityInterface, got %s", e.Type)
+		}
+		if e.Name == "RequestHandler" && e.Type != EntityClass {
+			t.Errorf("RequestHandler should be EntityClass, got %s", e.Type)
+		}
 	}
 }
