@@ -182,6 +182,8 @@ type AgentConfig struct {
 	// 工具配置
 	EnableKnowledgeTool bool `yaml:"enable_knowledge_tool"`
 	EnableWebSearch     bool `yaml:"enable_web_search"`
+	EnableCodeSearch    bool   `yaml:"enable_code_search"`
+	CodeSearchReposDir  string `yaml:"code_search_repos_dir"`
 
 	// Skills 配置（Eino 原生渐进式披露）
 	EnableSkills bool   `yaml:"enable_skills"`

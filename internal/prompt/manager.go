@@ -164,6 +164,10 @@ func (m *Manager) registerDefaults() {
 执行检索，获取证据：
 - **简单问题**：直接调用 knowledge_search(query, mode="auto")
 - **复杂问题**：先 query_decompose 分解，再对每个子查询分别检索
+- **代码问题**：如果问题涉及代码仓库、函数实现、代码结构，使用 code_search 工具
+  - grep: 搜索代码内容（函数定义、变量、import 等）
+  - find: 按文件名查找（如 *.py, *config*）
+  - read: 读取具体文件内容
 - **mode 选择指南**：
   - auto（默认）：混合检索，适合大多数场景
   - semantic：概念性、模糊性问题（如"微服务的优缺点"）
@@ -181,7 +185,7 @@ func (m *Manager) registerDefaults() {
 - 证据充分 → 直接进入回答
 - 有缺口但可用不同 mode/关键词补充 → 再次检索（换 mode 或换关键词，不要重复相同查询）
 - 知识库已穷尽仍有缺口 → 使用 web_search 补充
-- **硬性限制**：knowledge_search 最多调用 3 次，之后必须基于已有证据作答，不得继续检索
+- **硬性限制**：knowledge_search 最多调用 3 次，code_search 最多调用 5 次，之后必须基于已有证据作答，不得继续检索
 
 ## 第五步：回答前反思
 作答之前，检查：

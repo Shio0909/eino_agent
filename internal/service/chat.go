@@ -242,6 +242,11 @@ func (s *ChatService) buildToolsWithRetriever(runtimeRetriever retriever.Retriev
 		}))
 	}
 
+	// code_search 工具（代码仓库检索）
+	if s.config.Agent.EnableCodeSearch && s.config.Agent.CodeSearchReposDir != "" {
+		tools = append(tools, internalTool.NewCodeSearchTool(s.config.Agent.CodeSearchReposDir))
+	}
+
 	return tools, kt
 }
 
