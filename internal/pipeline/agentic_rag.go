@@ -1,6 +1,10 @@
 // Package pipeline implements Agentic RAG with adaptive query analysis,
 // knowledge refinement, and self-reflective generation verification.
 //
+// Deprecated: This fixed DAG pipeline has been superseded by the unified Agentic
+// mode which uses ReAct Agent + tool-based retrieval (knowledge_search, query_decompose,
+// web_search). Kept for reference; will be removed in a future version.
+//
 // Graph topology:
 //
 //	START → query_analyze → retrieve → knowledge_refine → generate → self_reflect → [END | query_analyze]
@@ -57,9 +61,9 @@ type AgenticRAGState struct {
 	SystemPrompt  string // The runtime system prompt.
 
 	// Query Analysis
-	QueryType    QueryType // Router classification result.
-	SubQueries   []string  // Decomposed sub-queries for complex questions.
-	MergedDocs   bool      // Whether docs were merged from sub-query retrieval.
+	QueryType  QueryType // Router classification result.
+	SubQueries []string  // Decomposed sub-queries for complex questions.
+	MergedDocs bool      // Whether docs were merged from sub-query retrieval.
 
 	// Retrieval
 	Documents      []*schema.Document // Retrieved documents for the current attempt.
@@ -68,9 +72,9 @@ type AgenticRAGState struct {
 	RetryCount     int                // Number of retries already attempted.
 
 	// Generation & Reflection
-	GeneratedAnswer string  // The most recent generated answer (before reflection).
-	ReflectPass     bool    // Whether self-reflection passed.
-	ReflectReason   string  // Reason if reflection failed.
+	GeneratedAnswer string // The most recent generated answer (before reflection).
+	ReflectPass     bool   // Whether self-reflection passed.
+	ReflectReason   string // Reason if reflection failed.
 
 	// Control
 	MaxRetries       int     // Maximum number of rewrite/retrieve retries.
@@ -126,10 +130,10 @@ type AgenticRAGOption func(*agenticRAGDeps)
 
 type agenticRAGDeps struct {
 	chatModel    model.ChatModel
-	lightModel   model.ChatModel        // Optional light model for classify/refine.
+	lightModel   model.ChatModel // Optional light model for classify/refine.
 	retriever    retriever.Retriever
-	reranker     Reranker               // Optional reranker for post-retrieval ranking.
-	rerankerTopK int                    // Number of docs to keep after reranking.
+	reranker     Reranker            // Optional reranker for post-retrieval ranking.
+	rerankerTopK int                 // Number of docs to keep after reranking.
 	webRetriever retriever.Retriever // Optional web retriever for fallback.
 	systemPrompt string
 }
@@ -171,13 +175,13 @@ func WithAgenticReranker(r Reranker, topK int) AgenticRAGOption {
 //
 // Graph: START → query_analyze → retrieve → knowledge_refine → generate → self_reflect → [END | query_analyze]
 //
-// - query_analyze: first pass does routing (simple/complex/direct) + optional decomposition;
-//   retry passes do query rewriting based on reflection feedback.
-// - retrieve: executes retrieval; for complex queries, retrieves per sub-query and merges.
-// - knowledge_refine: per-document relevance filtering to remove noise.
-// - generate: produces grounded answer from refined documents.
-// - self_reflect: checks faithfulness (answer supported by docs) and usefulness;
-//   branches to END if pass, or back to query_analyze for retry.
+//   - query_analyze: first pass does routing (simple/complex/direct) + optional decomposition;
+//     retry passes do query rewriting based on reflection feedback.
+//   - retrieve: executes retrieval; for complex queries, retrieves per sub-query and merges.
+//   - knowledge_refine: per-document relevance filtering to remove noise.
+//   - generate: produces grounded answer from refined documents.
+//   - self_reflect: checks faithfulness (answer supported by docs) and usefulness;
+//     branches to END if pass, or back to query_analyze for retry.
 func NewAgenticRAGPipeline(ctx context.Context, cfg *config.AgenticRAGConfig, opts ...AgenticRAGOption) (*AgenticRAGPipeline, error) {
 	deps := &agenticRAGDeps{}
 	for _, opt := range opts {
@@ -330,8 +334,8 @@ func NewAgenticRAGPipeline(ctx context.Context, cfg *config.AgenticRAGConfig, op
 		return "query_analyze", nil
 
 	}, map[string]bool{
-		compose.END:      true,
-		"query_analyze":  true,
+		compose.END:     true,
+		"query_analyze": true,
 	})
 
 	if err := graph.AddBranch("self_reflect", reflectBranch); err != nil {

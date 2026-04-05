@@ -1,18 +1,16 @@
-import { Sparkles, Workflow, Bot, GitBranch } from 'lucide-react'
+import { Sparkles, Workflow, Bot } from 'lucide-react'
 import type { ChatMode } from '../../types/api'
 import { useChatStore } from '../../stores/chat-store'
 
 const modes: { value: ChatMode; label: string; icon: typeof Workflow }[] = [
   { value: 'auto', label: 'Auto', icon: Sparkles },
   { value: 'pipeline', label: 'Pipeline', icon: Workflow },
-  { value: 'agent', label: 'Agent', icon: Bot },
-  { value: 'agentic_rag', label: 'Agentic RAG', icon: GitBranch },
+  { value: 'agentic', label: 'Agentic', icon: Bot },
 ]
 
 const modeLabels: Record<string, string> = {
   pipeline: 'Pipeline',
-  agent: 'Agent',
-  agentic_rag: 'Agentic RAG',
+  agentic: 'Agentic',
 }
 
 export default function ModeSelector() {

@@ -94,7 +94,7 @@ func (s *ChatService) buildSkillMiddlewareForRequest(ctx context.Context, req *C
 }
 
 func (s *ChatService) buildAgentInstructionForRequest(req *ChatRequest, runtimeSkill *adk.AgentMiddleware) string {
-	systemInstruction := s.renderSystemPrompt("agent")
+	systemInstruction := s.renderSystemPrompt("agentic")
 	if runtimeSkill != nil && runtimeSkill.AdditionalInstruction != "" {
 		systemInstruction += "\n\n" + runtimeSkill.AdditionalInstruction
 	}

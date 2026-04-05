@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -25,10 +24,10 @@ import (
 	"eino_agent/internal/database/repository"
 	"eino_agent/internal/docreader"
 	"eino_agent/internal/document"
+	"eino_agent/internal/graphrag"
 	"eino_agent/internal/importqueue"
 	mcpmanager "eino_agent/internal/mcp"
 	"eino_agent/internal/rediscache"
-	"eino_agent/internal/graphrag"
 	"eino_agent/internal/security"
 	"eino_agent/internal/service"
 )
@@ -225,7 +224,6 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			graphragAPI.GET("/status", h.GetGraphRAGStatus)
 			graphragAPI.POST("/build/:kbId", h.BuildGraphForKB)
 			graphragAPI.DELETE("/:kbId", h.DeleteGraphForKB)
-			graphragAPI.GET("/graph/:kbId", h.GetGraphVisualization)
 		}
 	}
 
@@ -334,31 +332,6 @@ func (h *Handler) DeleteGraphForKB(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "图谱已删除"})
 }
 
-// GetGraphVisualization 获取知识库图谱可视化数据
-func (h *Handler) GetGraphVisualization(c *gin.Context) {
-	if h.graphRAGService == nil {
-		c.JSON(http.StatusOK, gin.H{"nodes": []any{}, "edges": []any{}})
-		return
-	}
-	kbID := c.Param("kbId")
-	if kbID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少知识库 ID"})
-		return
-	}
-	limit := 200
-	if l := c.Query("limit"); l != "" {
-		if v, err := strconv.Atoi(l); err == nil && v > 0 {
-			limit = v
-		}
-	}
-	graph, err := h.graphRAGService.GetGraphForVis(c.Request.Context(), kbID, limit)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("获取图谱数据失败: %v", err)})
-		return
-	}
-	c.JSON(http.StatusOK, graph)
-}
-
 // ChatRequest 聊天请求
 type ChatRequest struct {
 	Query            string   `json:"query"`
@@ -439,11 +412,12 @@ func (h *Handler) Chat(c *gin.Context) {
 	}
 
 	// 调用聊天服务
-	useAgent := req.UseAgent || strings.EqualFold(req.Mode, "agent")
+	// "agent", "agentic", "agentic_rag" 统一走 Agentic 模式
+	useAgent := req.UseAgent || strings.EqualFold(req.Mode, "agent") || strings.EqualFold(req.Mode, "agentic") || strings.EqualFold(req.Mode, "agentic_rag")
 	if decision.DisableToolCalls {
 		log.Printf("[Security][Chat] downgrade to pipeline: level=%s rules=%v", decision.Level, decision.MatchedRules)
 		useAgent = false
-		if strings.EqualFold(req.Mode, "agent") || strings.EqualFold(req.Mode, "agentic_rag") {
+		if strings.EqualFold(req.Mode, "agent") || strings.EqualFold(req.Mode, "agentic") || strings.EqualFold(req.Mode, "agentic_rag") {
 			req.Mode = "pipeline"
 		}
 	}
@@ -515,11 +489,12 @@ func (h *Handler) ChatStream(c *gin.Context) {
 	}
 
 	// 使用流式响应
-	useAgent := req.UseAgent || strings.EqualFold(req.Mode, "agent")
+	// "agent", "agentic", "agentic_rag" 统一走 Agentic 模式
+	useAgent := req.UseAgent || strings.EqualFold(req.Mode, "agent") || strings.EqualFold(req.Mode, "agentic") || strings.EqualFold(req.Mode, "agentic_rag")
 	if decision.DisableToolCalls {
 		log.Printf("[Security][ChatStream] downgrade to pipeline: level=%s rules=%v", decision.Level, decision.MatchedRules)
 		useAgent = false
-		if strings.EqualFold(req.Mode, "agent") || strings.EqualFold(req.Mode, "agentic_rag") {
+		if strings.EqualFold(req.Mode, "agent") || strings.EqualFold(req.Mode, "agentic") || strings.EqualFold(req.Mode, "agentic_rag") {
 			req.Mode = "pipeline"
 		}
 	}
@@ -555,18 +530,6 @@ func (h *Handler) ChatStream(c *gin.Context) {
 			}
 			if event.DocID != "" {
 				data["doc_id"] = event.DocID
-			}
-			if event.ResolvedMode != "" {
-				data["resolved_mode"] = event.ResolvedMode
-			}
-			if event.LatencyMs > 0 {
-				data["latency_ms"] = event.LatencyMs
-			}
-			if event.SourceCount > 0 {
-				data["source_count"] = event.SourceCount
-			}
-			if event.RetryCount > 0 {
-				data["retry_count"] = event.RetryCount
 			}
 			c.SSEvent("message", data)
 			return true

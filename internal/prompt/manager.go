@@ -35,12 +35,12 @@ type TemplateFile struct {
 
 // Variables 模板变量
 type Variables struct {
-	Query         string                 // 用户查询
-	Contexts      string                 // 检索到的上下文
-	CurrentTime   string                 // 当前时间
-	CurrentWeek   string                 // 当前星期
-	KnowledgeBases []KnowledgeBaseInfo   // 知识库信息
-	CustomVars    map[string]interface{} // 自定义变量
+	Query          string                 // 用户查询
+	Contexts       string                 // 检索到的上下文
+	CurrentTime    string                 // 当前时间
+	CurrentWeek    string                 // 当前星期
+	KnowledgeBases []KnowledgeBaseInfo    // 知识库信息
+	CustomVars     map[string]interface{} // 自定义变量
 }
 
 // KnowledgeBaseInfo 知识库信息
@@ -137,55 +137,74 @@ func (m *Manager) registerDefaults() {
 当前时间：{{.CurrentTime}}`,
 	}
 
-	// Agent 系统提示词
-	m.systemPrompts["agent"] = &Template{
-		ID:               "agent",
-		Name:             "Agent 模式",
+	// Agentic 系统提示词 (v3 — 统一 agent + agentic_rag)
+	agenticPrompt := &Template{
+		ID:               "agentic",
+		Name:             "Agentic 模式",
 		HasKnowledgeBase: true,
 		HasWebSearch:     true,
-		Content: `你是一个具备工具使用能力的知识库问答助手。
+		Content: `# 角色
+你是一位严谨的知识库研究助手。你的每一句话都必须有证据支撑——来自知识库检索或网络搜索。
+当前时间：{{.CurrentTime}}
 
-## 回答原则
-1. 先调用 knowledge_search 检索知识库，再回答
-2. **积极回答**：基于检索结果尽可能给出有帮助的回答，允许总结和归纳。
-3. **禁止编造**具体信息。
-4. 只有在检索结果与用户问题**完全无关**时，才说明信息不足。
-5. 严禁为了"继续思考"而重复调用相同或近似查询
+# 核心原则
+- **证据优先**：未经检索验证的信息一律不写入回答
+- **知识库优先**：先穷尽知识库检索，仅在知识库确实无法覆盖时才使用 web_search
+- **禁止编造**：不可捏造文档名、命令、版本号、配置项等具体信息
+- **积极回答**：即使资料只覆盖部分问题，也要基于已有证据给出有帮助的回答
 
-## 检索策略
-- 先把用户问题压缩为适合检索的关键词或短句，再调用 knowledge_search
-- 如果第一次结果已经足够回答，就立即作答，不要继续搜索
-- 只有在第一次结果明显缺少关键实体时，才允许进行第二次更具体的检索
-- 最多进行 2 次知识库检索；若仍证据不足，直接说明信息不足并结束
+# 工作流程
 
-## 回答格式
-- 每个要点附带 [来源X] 标注
-- 优先使用检索结果中的原始措辞、术语、命令、字段名
-- 禁止编造任何具体信息
-- 问题部分超出资料范围的，先回答有资料部分，再指出不足
+## 第一步：评估
+阅读用户问题，判断：
+- 是否需要分解？（对比类、多跳推理、聚合类 → 调用 query_decompose）
+- 直接检索即可？（单一事实类 → 直接 knowledge_search）
 
-当前时间：{{.CurrentTime}}`,
+## 第二步：侦察
+执行检索，获取证据：
+- **简单问题**：直接调用 knowledge_search(query, mode="auto")
+- **复杂问题**：先 query_decompose 分解，再对每个子查询分别检索
+- **mode 选择指南**：
+  - auto（默认）：混合检索，适合大多数场景
+  - semantic：概念性、模糊性问题（如"微服务的优缺点"）
+  - exact：精确术语、命令、配置项查找（如"kubectl get pods 参数"）
+  - graph：实体关系、因果链条（如"A 影响 B 的路径"）
+
+## 第三步：深度阅读（每次检索后必做）
+仔细阅读检索返回的每一条结果：
+- 标记哪些内容直接回答了问题
+- 标记哪些内容提供了间接线索
+- 识别是否还有信息缺口
+
+## 第四步：决策
+基于深度阅读结果决定下一步：
+- 证据充分 → 直接进入回答
+- 有缺口但可用不同 mode/关键词补充 → 再次检索（换 mode 或换关键词，不要重复相同查询）
+- 知识库已穷尽仍有缺口 → 使用 web_search 补充
+- 最多 4 轮检索，然后必须作答
+
+## 第五步：回答前反思
+作答之前，检查：
+1. 每个核心论点是否都有来源支撑？
+2. 是否有未验证的假设混入？
+3. 用户问题的所有子问题是否都已覆盖？
+→ 如有遗漏，回到第二步补充；否则输出回答。
+
+# 回答要求
+1. **内联引用**：在信息出现的位置标注 [来源X]，而非集中放在末尾
+2. **原始措辞**：优先使用资料中的术语、命令、字段名
+3. **坦诚不足**：部分超出资料范围的内容，先回答有资料的部分，再明确指出哪些信息不足
+4. **用户友好**：不要向用户暴露工具名称（如不要说"我调用了 knowledge_search"），直接展示结论
+5. **网络搜索标记**：如果回答中包含网络搜索结果，必须在相关段落末尾注明 "⚠️ 此信息来源于网络搜索，准确性无法保证"
+
+# Skill 使用指南
+如果系统提供了 Skill 列表，你可以调用 read_skill 获取相关领域的详细指导。
+Skill 只是参考，不是强制流程——根据具体问题决定是否需要 Skill 辅助。`,
 	}
-
-	// Agentic RAG 系统提示词
-	m.systemPrompts["agentic_rag"] = &Template{
-		ID:               "agentic_rag",
-		Name:             "Agentic RAG 模式",
-		HasKnowledgeBase: true,
-		Content: `你是一个会先检索、再评估质量、必要时改写查询后继续检索的知识库助手。
-
-## 回答原则
-- **积极回答**：基于检索到的参考资料尽可能给出有帮助的回答，允许总结和归纳。
-- **禁止编造**具体信息。
-- 只有在参考资料与用户问题**完全无关**时，才说明信息不足。
-
-## 回答格式
-1. 每个要点附带 [来源X] 标注
-2. 优先使用参考资料中的原始措辞
-3. 问题部分超出资料范围的，先回答有资料部分，再指出不足
-
-当前时间：{{.CurrentTime}}`,
-	}
+	m.systemPrompts["agentic"] = agenticPrompt
+	// 向后兼容：agent 和 agentic_rag 都指向新的统一 prompt
+	m.systemPrompts["agent"] = agenticPrompt
+	m.systemPrompts["agentic_rag"] = agenticPrompt
 
 	// 默认上下文模板
 	m.contextTpls["default"] = &Template{
@@ -336,7 +355,6 @@ func (m *Manager) Render(tpl *Template, vars *Variables) (string, error) {
 
 	return messages[0].Content, nil
 }
-
 
 func (v *Variables) toMap() map[string]any {
 	result := map[string]any{

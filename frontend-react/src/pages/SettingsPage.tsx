@@ -4,7 +4,7 @@ import { getSettings, updateSettings } from '../lib/api'
 import type { Settings } from '../types/api'
 import { Button, Input, Textarea, Switch, Slider, Tabs, Card, toast, PageSpinner } from '../components/ui'
 
-const tabs = ['LLM', 'Embedding', 'RAG', 'Agent', 'Agentic RAG', 'Reranker', 'GraphRAG'] as const
+const tabs = ['LLM', 'Embedding', 'RAG', 'Agent', 'Reranker', 'GraphRAG'] as const
 type Tab = (typeof tabs)[number]
 
 export default function SettingsPage() {
@@ -99,15 +99,6 @@ export default function SettingsPage() {
                 <Switch label="启用 Agent" checked={settings.agent.enabled} onChange={(v) => update('agent.enabled', v)} />
                 <Slider label="Max Steps" value={settings.agent.max_steps} min={1} max={20} step={1} onChange={(v) => update('agent.max_steps', v)} />
                 <Textarea label="System Prompt" value={settings.agent.system_prompt} onChange={(e) => update('agent.system_prompt', e.target.value)} rows={6} />
-              </>
-            )}
-            {activeTab === 'Agentic RAG' && (
-              <>
-                <p className="text-sm text-[var(--color-text-secondary)]">
-                  Agentic RAG 模式会自动评估检索质量并决定是否需要重新检索。
-                </p>
-                <Slider label="Max Retries" value={(settings as any).agentic_rag?.max_retries ?? 3} min={1} max={10} step={1} onChange={(v) => update('agentic_rag.max_retries', v)} />
-                <Slider label="Quality Threshold" value={(settings as any).agentic_rag?.quality_threshold ?? 0.7} min={0} max={1} step={0.05} onChange={(v) => update('agentic_rag.quality_threshold', v)} />
               </>
             )}
             {activeTab === 'Reranker' && (

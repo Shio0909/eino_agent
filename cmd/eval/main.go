@@ -58,21 +58,21 @@ type chatResponse struct {
 }
 
 type sampleResult struct {
-	ID                string
-	Category          string
-	LatencyMs         int64
-	Recall            float64
-	Precision         float64
-	Hit               float64
-	MRR               float64
+	ID               string
+	Category         string
+	LatencyMs        int64
+	Recall           float64
+	Precision        float64
+	Hit              float64
+	MRR              float64
 	NDCG             float64
 	RetrievalLabeled bool
-	Error             string
+	Error            string
 }
 
 func main() {
 	input := flag.String("input", "data/eval_set.jsonl", "评测集文件（jsonl）")
-	mode := flag.String("mode", "pipeline", "评测模式: pipeline|agent|agentic_rag")
+	mode := flag.String("mode", "pipeline", "评测模式: pipeline|agentic")
 	baseURL := flag.String("base-url", "http://localhost:8080", "服务地址")
 	kbIDsFlag := flag.String("knowledge-base-ids", "", "知识库 ID，多个用逗号分隔（可选）")
 	token := flag.String("token", "", "Bearer token（可选）")
@@ -120,13 +120,9 @@ func main() {
 		fmt.Printf("[eval] 检索策略已切换为: %s\n", strategyName)
 	}
 
-	// 如果是 agentic_rag 模式，自动启用
-	if *mode == "agentic_rag" {
-		if err := setAgenticRAG(client, strings.TrimRight(*baseURL, "/"), bearer, true); err != nil {
-			fmt.Printf("[eval] 启用 agentic_rag 失败: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println("[eval] agentic_rag 已启用")
+	// agentic_rag 模式已废弃，向后兼容映射到 agentic
+	if *mode == "agentic_rag" || *mode == "agent" {
+		*mode = "agentic"
 	}
 
 	results := make([]sampleResult, 0, len(samples))
@@ -312,10 +308,9 @@ func runSample(client *http.Client, baseURL, bearer, mode string, sample EvalSam
 	result := sampleResult{ID: sample.ID, Category: sample.Category}
 	request := chatRequest{Message: sample.Question, KnowledgeBaseIDs: knowledgeBaseIDs}
 	switch mode {
-	case "agent":
+	case "agentic":
 		request.UseAgent = true
-	case "agentic_rag":
-		request.Mode = "agentic_rag"
+		request.Mode = "agentic"
 	default:
 		request.Mode = "pipeline"
 	}
@@ -484,8 +479,6 @@ func matchGoldToReference(goldSet map[string]struct{}, ref reference) []string {
 	}
 	return matches
 }
-
-
 
 func parseCSVList(raw string) []string {
 	parts := strings.Split(raw, ",")

@@ -32,20 +32,20 @@ import (
 
 // ChatService 聊天服务
 // 【Eino 特点】整合 Eino 的各组件，提供统一的聊天接口
-// 支持三种模式：
+// 支持两种模式：
 // 1. Pipeline 模式：线性 RAG 流水线
-// 2. Agent 模式：ReAct Agent + 工具调用
-// 3. Agentic RAG 模式：Graph 有环编排，检索质量评估+自动重试
+// 2. Agentic 模式：ReAct Agent + 工具调用（knowledge_search + query_decompose + web_search）
 type ChatService struct {
 	config          *config.Config
 	chatModel       model.ChatModel
+	lightModel      model.ChatModel // 轻量模型，用于 query_decompose 等辅助任务
 	retriever       retriever.Retriever
 	reranker        pipeline.Reranker // 重排序器（注入到 Pipeline）
 	pipeline        *pipeline.RAGPipeline
 	agent           *react.Agent
 	knowledgeTool   *internalTool.KnowledgeTool  // Agent 模式的知识库工具引用
-	agenticRAG      *pipeline.AgenticRAGPipeline // Agentic RAG (Corrective RAG)
-	graphRAGService *graphrag.Service             // GraphRAG 服务（可选，用于按需创建图谱检索器）
+	agenticRAG      *pipeline.AgenticRAGPipeline // Deprecated: 保留字段供渐进迁移，不再在调度中使用
+	graphRAGService *graphrag.Service            // GraphRAG 服务（可选，用于按需创建图谱检索器）
 	skillBackend    skill.Backend
 	mcpTools        []tool.BaseTool      // MCP 远程工具
 	skillMiddleware *adk.AgentMiddleware // Eino 原生 skill 中间件
@@ -134,6 +134,20 @@ func (s *ChatService) InitWithComponents(
 	s.chatModel = chatModel
 	s.retriever = retriever
 
+	// 初始化轻量模型（用于 query_decompose 等辅助工具）
+	if lm := s.config.Agent.AgenticRAG.LightLLM; lm != nil && lm.ModelID != "" {
+		lightModel, _, err := container.NewLLMProvider(ctx, lm)
+		if err != nil {
+			log.Printf("[ChatService] 轻量模型初始化失败，降级使用主模型: %v", err)
+			s.lightModel = chatModel
+		} else {
+			log.Printf("[ChatService] 轻量模型已启用: %s/%s", lm.Provider, lm.ModelID)
+			s.lightModel = lightModel
+		}
+	} else {
+		s.lightModel = chatModel
+	}
+
 	// 初始化 Pipeline
 	pipeOpts := []pipeline.Option{
 		pipeline.WithRetriever(retriever),
@@ -155,33 +169,6 @@ func (s *ChatService) InitWithComponents(
 		pipeOpts...,
 	)
 
-	// 初始化 Agentic RAG（如果启用）
-	if s.config.Agent.AgenticRAG.Enabled {
-		agenticOpts := []pipeline.AgenticRAGOption{
-			pipeline.WithAgenticChatModel(chatModel),
-			pipeline.WithAgenticRetriever(retriever),
-		}
-		// 如果配置了轻量模型，创建并注入
-		if lm := s.config.Agent.AgenticRAG.LightLLM; lm != nil && lm.ModelID != "" {
-			lightModel, _, err := container.NewLLMProvider(ctx, lm)
-			if err != nil {
-				log.Printf("[AgenticRAG] 轻量模型初始化失败，降级使用主模型: %v", err)
-			} else {
-				log.Printf("[AgenticRAG] 轻量模型已启用: %s/%s", lm.Provider, lm.ModelID)
-				agenticOpts = append(agenticOpts, pipeline.WithAgenticLightModel(lightModel))
-			}
-		}
-		agenticRAG, err := pipeline.NewAgenticRAGPipeline(
-			ctx,
-			&s.config.Agent.AgenticRAG,
-			agenticOpts...,
-		)
-		if err != nil {
-			return fmt.Errorf("create agentic rag: %w", err)
-		}
-		s.agenticRAG = agenticRAG
-	}
-
 	// 初始化 Agent（如果启用）
 	if s.config.Agent.Enabled {
 		tools, kt := s.buildToolsWithRetriever(retriever)
@@ -200,7 +187,7 @@ func (s *ChatService) InitWithComponents(
 		}
 
 		// 构建系统指令（含 skill 附加指令）
-		systemInstruction := s.config.Agent.SystemPrompt
+		systemInstruction := s.renderSystemPrompt("agentic")
 		if s.skillMiddleware != nil && s.skillMiddleware.AdditionalInstruction != "" {
 			systemInstruction = systemInstruction + "\n\n" + s.skillMiddleware.AdditionalInstruction
 		}
@@ -240,6 +227,11 @@ func (s *ChatService) buildToolsWithRetriever(runtimeRetriever retriever.Retriev
 	if s.config.Agent.EnableKnowledgeTool && runtimeRetriever != nil {
 		kt = internalTool.NewKnowledgeTool(runtimeRetriever, s.config.RAG.TopK)
 		tools = append(tools, kt)
+	}
+
+	// query_decompose 工具（使用轻量模型）
+	if s.lightModel != nil {
+		tools = append(tools, internalTool.NewQueryDecomposeTool(s.lightModel))
 	}
 
 	if s.config.Agent.EnableWebSearch {
@@ -448,10 +440,6 @@ func (s *ChatService) buildRuntimeAgenticRAG(ctx context.Context, runtimeRetriev
 		pipeline.WithAgenticChatModel(s.chatModel),
 		pipeline.WithAgenticRetriever(runtimeRetriever),
 	}
-	// 注入重排序器
-	if s.reranker != nil && s.config.RAG.EnableRerank {
-		agenticOpts = append(agenticOpts, pipeline.WithAgenticReranker(s.reranker, s.config.Reranker.TopK))
-	}
 	if lm := s.config.Agent.AgenticRAG.LightLLM; lm != nil && lm.ModelID != "" {
 		lightModel, _, err := container.NewLLMProvider(ctx, lm)
 		if err != nil {
@@ -474,7 +462,7 @@ func (s *ChatService) buildMemoryInstruction(ctx context.Context, req *ChatReque
 
 	maxChars := s.config.Memory.MaxContextChars
 	if maxChars <= 0 {
-		maxChars = 6000
+		maxChars = 3000
 	}
 
 	parts := make([]string, 0, 2)
@@ -703,34 +691,8 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 
 	var resp *ChatResponse
 
-	// Agentic RAG 模式
-	if req.Mode == "agentic_rag" && s.agenticRAG != nil {
-		modeStart := time.Now()
-		runtimeAgentic := s.agenticRAG
-		if cc.runtimeRetriever != s.retriever {
-			created, createErr := s.buildRuntimeAgenticRAG(ctx, cc.runtimeRetriever)
-			if createErr != nil {
-				return nil, fmt.Errorf("build runtime agentic rag: %w", createErr)
-			}
-			runtimeAgentic = created
-		}
-
-		ragResp, ragErr := runtimeAgentic.Run(ctx, cc.messageWithInst)
-		if ragErr != nil {
-			return nil, fmt.Errorf("agentic rag: %w", ragErr)
-		}
-		answer := filter.StripThinkTags(ragResp.Answer)
-		sourceStart := time.Now()
-		sources := s.buildSourcesFromRetriever(ctx, cc.runtimeRetriever, req.Message, s.config.RAG.TopK)
-		log.Printf("[Timing][ChatService] mode=agentic_rag stage=source_backfill duration_ms=%d sources=%d", time.Since(sourceStart).Milliseconds(), len(sources))
-		resp = &ChatResponse{
-			Answer:    answer,
-			Sources:   sources,
-			SessionID: cc.sessionID,
-		}
-		log.Printf("[Timing][ChatService] mode=agentic_rag stage=total duration_ms=%d", time.Since(modeStart).Milliseconds())
-	} else if req.UseAgent && s.agent != nil {
-		// Agent 模式（使用 per-request agent 支持动态 skill 和事件追踪）
+	// Agentic 模式（统一 agent / agentic / agentic_rag）
+	if req.UseAgent && s.config.Agent.Enabled {
 		modeStart := time.Now()
 		runtimeAgent, kt, createErr := s.buildRuntimeAgentForRequest(ctx, cc.runtimeRetriever, req, nil)
 		if createErr != nil {
@@ -764,14 +726,14 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 				}
 			}
 		}
-		log.Printf("[Timing][ChatService] mode=agent stage=source_from_cache sources=%d", len(sources))
+		log.Printf("[Timing][ChatService] mode=agentic stage=source_from_cache sources=%d", len(sources))
 
 		resp = &ChatResponse{
 			Answer:    answer,
 			Sources:   sources,
 			SessionID: cc.sessionID,
 		}
-		log.Printf("[Timing][ChatService] mode=agent stage=total duration_ms=%d", time.Since(modeStart).Milliseconds())
+		log.Printf("[Timing][ChatService] mode=agentic stage=total duration_ms=%d", time.Since(modeStart).Milliseconds())
 	} else if s.pipeline != nil {
 		// Pipeline 模式
 		runtimePipeline := s.pipeline
@@ -834,58 +796,8 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 		// 创建流式 think 标签过滤器
 		thinkFilter := filter.NewThinkTagStreamFilter()
 
-		// Agentic RAG 模式
-		if req.Mode == "agentic_rag" && s.agenticRAG != nil {
-			runtimeAgentic := s.agenticRAG
-			if cc.runtimeRetriever != s.retriever {
-				created, createErr := s.buildRuntimeAgenticRAG(ctx, cc.runtimeRetriever)
-				if createErr != nil {
-					ch <- StreamEvent{Type: "error", Error: createErr.Error()}
-					return
-				}
-				runtimeAgentic = created
-			}
-
-			stream, err := runtimeAgentic.RunStream(ctx, cc.messageWithInst)
-			if err != nil {
-				ch <- StreamEvent{Type: "error", Error: err.Error()}
-				return
-			}
-
-			for event := range stream {
-				switch event.Type {
-				case pipeline.AgenticEventContent:
-					filtered := thinkFilter.Filter(event.Content)
-					if filtered != "" {
-						if !firstTokenLogged {
-							log.Printf("[Timing][ChatService] mode=agentic_rag stage=first_token duration_ms=%d", time.Since(startTime).Milliseconds())
-							firstTokenLogged = true
-						}
-						fullResponse.WriteString(filtered)
-						ch <- StreamEvent{Type: "content", Content: filtered}
-					}
-				case pipeline.AgenticEventStatus:
-					ch <- StreamEvent{Type: "status", Content: event.Content}
-				case pipeline.AgenticEventDone:
-					if remaining := thinkFilter.Flush(); remaining != "" {
-						fullResponse.WriteString(remaining)
-						ch <- StreamEvent{Type: "content", Content: remaining}
-					}
-					ch <- StreamEvent{Type: "done"}
-				case pipeline.AgenticEventError:
-					ch <- StreamEvent{Type: "error", Error: event.Content}
-				}
-			}
-
-			latencyMs := time.Since(startTime).Milliseconds()
-			sourceCount := len(s.buildSourcesFromRetriever(ctx, cc.runtimeRetriever, req.Message, s.config.RAG.TopK))
-			ch <- StreamEvent{Type: "meta", ResolvedMode: "agentic_rag", LatencyMs: latencyMs, SourceCount: sourceCount}
-			s.saveAssistantMessage(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs)
-			return
-		}
-
-		// Agent 模式（使用 per-request agent 支持动态 skill 和事件追踪）
-		if req.UseAgent && s.agent != nil {
+		// Agentic 模式（统一 agent / agentic / agentic_rag）
+		if req.UseAgent && s.config.Agent.Enabled {
 			eventSink := func(ev StreamEvent) { ch <- ev }
 			runtimeAgent, _, createErr := s.buildRuntimeAgentForRequest(ctx, cc.runtimeRetriever, req, eventSink)
 			if createErr != nil {
@@ -920,7 +832,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 				filtered := thinkFilter.Filter(chunk.Content)
 				if filtered != "" {
 					if !firstTokenLogged {
-						log.Printf("[Timing][ChatService] mode=agent stage=first_token duration_ms=%d", time.Since(startTime).Milliseconds())
+						log.Printf("[Timing][ChatService] mode=agentic stage=first_token duration_ms=%d", time.Since(startTime).Milliseconds())
 						firstTokenLogged = true
 					}
 					fullResponse.WriteString(filtered)
@@ -935,7 +847,6 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			ch <- StreamEvent{Type: "done"}
 
 			latencyMs := time.Since(startTime).Milliseconds()
-			ch <- StreamEvent{Type: "meta", ResolvedMode: "agent", LatencyMs: latencyMs}
 			s.saveAssistantMessage(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs)
 			return
 		}
@@ -987,7 +898,6 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			}
 
 			latencyMs := time.Since(startTime).Milliseconds()
-			ch <- StreamEvent{Type: "meta", ResolvedMode: "pipeline", LatencyMs: latencyMs}
 			s.saveAssistantMessage(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs)
 			return
 		}

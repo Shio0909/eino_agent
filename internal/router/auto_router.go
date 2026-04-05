@@ -7,7 +7,7 @@ import (
 
 // RouteResult 路由结果
 type RouteResult struct {
-	Mode   string // "pipeline", "agent", "agentic_rag"
+	Mode   string // "pipeline", "agentic"
 	Reason string // 人类可读的路由原因
 }
 
@@ -31,39 +31,18 @@ func RouteQuery(query string, availableModes []string) RouteResult {
 		}
 	}
 
-	// ── 优先级 1: Agentic RAG 信号 ──
-	if modeAvailable("agentic_rag", availableModes) {
+	// ── 优先级 1: Agentic 信号（复杂分析、多源、工具调用） ──
+	if modeAvailable("agentic", availableModes) {
 		agenticKeywords := []string{
 			"详细分析", "综合多个", "多个文档", "深入分析", "多角度",
 			"全面总结", "系统性", "交叉验证", "多源", "多篇",
 			"综合分析", "多维度", "全面分析",
+			"帮我搜索", "搜一下", "查一下", "搜索一下",
+			"计算", "换算", "对比", "比较",
 		}
 		for _, kw := range agenticKeywords {
 			if strings.Contains(q, kw) {
-				return RouteResult{Mode: "agentic_rag", Reason: "keyword: " + kw}
-			}
-		}
-
-		// 启发式：长 query + 分析类动词 + 文档引用
-		if runeLen > 40 {
-			hasAnalysis := containsAny(q, []string{"分析", "总结", "综合", "评估", "归纳", "梳理", "审查"})
-			hasDocRef := containsAny(q, []string{"文档", "知识库", "资料", "论文", "报告", "所有", "全部"})
-			if hasAnalysis && hasDocRef {
-				return RouteResult{Mode: "agentic_rag", Reason: "long query with analysis + doc reference"}
-			}
-		}
-	}
-
-	// ── 优先级 2: Agent 信号 ──
-	if modeAvailable("agent", availableModes) {
-		agentKeywords := []string{
-			"帮我搜索", "搜一下", "查一下", "搜索一下",
-			"计算", "换算",
-			"对比", "比较",
-		}
-		for _, kw := range agentKeywords {
-			if strings.Contains(q, kw) {
-				return RouteResult{Mode: "agent", Reason: "keyword: " + kw}
+				return RouteResult{Mode: "agentic", Reason: "keyword: " + kw}
 			}
 		}
 
@@ -73,7 +52,16 @@ func RouteQuery(query string, availableModes []string) RouteResult {
 		}
 		for _, kw := range realtimeKeywords {
 			if strings.Contains(q, kw) {
-				return RouteResult{Mode: "agent", Reason: "realtime: " + kw}
+				return RouteResult{Mode: "agentic", Reason: "realtime: " + kw}
+			}
+		}
+
+		// 启发式：长 query + 分析类动词 + 文档引用
+		if runeLen > 40 {
+			hasAnalysis := containsAny(q, []string{"分析", "总结", "综合", "评估", "归纳", "梳理", "审查"})
+			hasDocRef := containsAny(q, []string{"文档", "知识库", "资料", "论文", "报告", "所有", "全部"})
+			if hasAnalysis && hasDocRef {
+				return RouteResult{Mode: "agentic", Reason: "long query with analysis + doc reference"}
 			}
 		}
 
@@ -83,7 +71,7 @@ func RouteQuery(query string, availableModes []string) RouteResult {
 		}
 		for _, kw := range englishAgentKeywords {
 			if strings.Contains(lower, kw) {
-				return RouteResult{Mode: "agent", Reason: "english keyword: " + kw}
+				return RouteResult{Mode: "agentic", Reason: "english keyword: " + kw}
 			}
 		}
 	}

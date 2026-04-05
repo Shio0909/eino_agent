@@ -7,6 +7,7 @@ import { Copy, Check, User, Bot, RefreshCw } from 'lucide-react'
 import type { Message } from '../../types/api'
 import AgentStepCard from './AgentStepCard'
 import ReferencePanel from './ReferencePanel'
+import WebSearchWarning from './WebSearchWarning'
 
 interface Props {
   message: Message
@@ -58,7 +59,9 @@ const ChatMessage = memo(function ChatMessage({ message, isStreaming, isLast, on
           {isUser ? (
             <p className="text-[15px] text-[var(--color-text-primary)] whitespace-pre-wrap leading-relaxed">{message.content}</p>
           ) : (
-            <div className="markdown-body text-[var(--color-text-primary)]">
+            <>
+              <WebSearchWarning content={message.content} />
+              <div className="markdown-body text-[var(--color-text-primary)]">
               <ReactMarkdown
                 remarkPlugins={remarkPluginsStable}
                 components={markdownComponents}
@@ -68,7 +71,8 @@ const ChatMessage = memo(function ChatMessage({ message, isStreaming, isLast, on
               {isStreaming && (
                 <span className="inline-block w-1.5 h-4 bg-[var(--color-accent)] animate-pulse ml-0.5 align-middle rounded-sm" />
               )}
-            </div>
+              </div>
+            </>
           )}
 
           {/* Agent Steps */}

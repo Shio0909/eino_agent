@@ -24,12 +24,12 @@ import (
 // CompositeRetriever 组合检索器
 // 【Eino 特点】支持向量检索 + 关键词检索 + 图谱检索的混合模式
 type CompositeRetriever struct {
-	cfg                  *config.RAGConfig
-	embeddingCfg         *config.EmbeddingConfig
-	embedding            einoembedding.Embedder
-	vectorDB             VectorDBProvider
-	retrievalCache       cachepkg.RetrievalCache
-	graphRetriever       einoretriever.Retriever
+	cfg                   *config.RAGConfig
+	embeddingCfg          *config.EmbeddingConfig
+	embedding             einoembedding.Embedder
+	vectorDB              VectorDBProvider
+	retrievalCache        cachepkg.RetrievalCache
+	graphRetriever        einoretriever.Retriever
 	graphRetrieverFactory GraphRetrieverFactory // 用于按 KB 动态创建图谱检索器
 }
 
@@ -489,6 +489,56 @@ func (r *CompositeRetriever) rrfFuse(vectorDocs, keywordDocs, graphDocs []*Docum
 // RetrieveWithHybrid 混合检索（向量 + 关键词）
 func (r *CompositeRetriever) RetrieveWithHybrid(ctx context.Context, query string, opts ...einoretriever.Option) ([]*schema.Document, error) {
 	return r.retrieveWithHybrid(ctx, query, opts...)
+}
+
+// RetrieveWithMode 按指定模式检索。mode: "auto"|"semantic"|"exact"|"graph"。
+// auto = 默认行为（hybrid 开启时走 RRF，否则纯向量）。
+func (r *CompositeRetriever) RetrieveWithMode(ctx context.Context, query string, mode string) ([]*schema.Document, error) {
+	topK := r.cfg.TopK
+	if topK <= 0 {
+		topK = 10
+	}
+
+	switch mode {
+	case "semantic":
+		queryVector, err := r.getQueryEmbedding(ctx, query)
+		if err != nil {
+			return nil, fmt.Errorf("生成查询向量失败: %w", err)
+		}
+		docs, err := r.vectorDB.Search(ctx, queryVector, topK*2)
+		if err != nil {
+			return nil, fmt.Errorf("语义检索失败: %w", err)
+		}
+		if len(docs) > topK {
+			docs = docs[:topK]
+		}
+		return toSchemaDocuments(docs), nil
+
+	case "exact":
+		ks, ok := r.vectorDB.(keywordSearcher)
+		if !ok {
+			log.Printf("[Retriever] exact 模式不可用（无关键词检索器），降级为 auto")
+			return r.Retrieve(ctx, query)
+		}
+		docs, err := ks.SearchKeyword(ctx, query, topK*2)
+		if err != nil {
+			return nil, fmt.Errorf("关键词检索失败: %w", err)
+		}
+		if len(docs) > topK {
+			docs = docs[:topK]
+		}
+		return toSchemaDocuments(docs), nil
+
+	case "graph":
+		if r.graphRetriever == nil {
+			log.Printf("[Retriever] graph 模式不可用（无图谱检索器），降级为 auto")
+			return r.Retrieve(ctx, query)
+		}
+		return r.graphRetriever.Retrieve(ctx, query)
+
+	default: // "auto" 或其他
+		return r.Retrieve(ctx, query)
+	}
 }
 
 func (db *knowledgeBaseScopedVectorDB) Upsert(ctx context.Context, docs []*Document) error {
