@@ -23,7 +23,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cloudwego/eino-ext/devops"
 	einoembedding "github.com/cloudwego/eino/components/embedding"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -32,6 +31,7 @@ import (
 
 	_ "eino_agent/docs" // swagger docs
 	cachepkg "eino_agent/internal/cache"
+	"eino_agent/internal/codegraph"
 	"eino_agent/internal/config"
 	"eino_agent/internal/container"
 	"eino_agent/internal/database/postgres"
@@ -58,6 +58,11 @@ func main() {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatalf("加载配置失败: %v", err)
+	}
+
+	// 安全校验：release 模式下禁止使用默认 JWT 密钥
+	if cfg.Auth.Enabled && cfg.Auth.JWTSecret == "change-me-in-production" && cfg.Server.Mode == "release" {
+		log.Fatal("[Config] JWT 密钥未配置！请在配置文件中设置 auth.jwt_secret")
 	}
 
 	log.Println("========================================")
@@ -136,42 +141,30 @@ func main() {
 	// 初始化 DocReader (可选)
 	// ========================================
 	var docReaderCli *docreader.Client
-	if cfg.DocReader.Enabled {
+	if cfg.DocReader.Enabled && (cfg.DocReader.Endpoint != "" || cfg.DocReader.MinerUEndpoint != "") {
+		log.Printf("[DocReader] 模式: %s", cfg.DocReader.Mode)
 		docReaderCfg := &docreader.Config{
-			Mode:                 cfg.DocReader.Mode,
-			Endpoint:             cfg.DocReader.Endpoint,
-			Timeout:              5 * time.Minute,
-			MaxFileSize:          cfg.DocReader.MaxFileSize * 1024 * 1024,
-			ChunkSize:            cfg.RAG.ChunkSize,
-			ChunkOverlap:         cfg.RAG.ChunkOverlap,
-			EnableMultimodal:     cfg.DocReader.EnableMultimodal,
-			VLMBaseURL:           cfg.DocReader.VLMBaseURL,
-			VLMAPIKey:            cfg.DocReader.VLMAPIKey,
-			VLMModel:             cfg.DocReader.VLMModel,
-			MinIOEndpoint:        cfg.DocReader.MinIOEndpoint,
-			MinIOAccessKey:       cfg.DocReader.MinIOAccessKey,
-			MinIOSecretKey:       cfg.DocReader.MinIOSecretKey,
-			MinIOBucket:          cfg.DocReader.MinIOBucket,
-			RenderMode:            cfg.DocReader.RenderMode,
-			UserAgent:             cfg.DocReader.UserAgent,
-			MaxDownloadBytes:      cfg.DocReader.MaxDownloadBytes,
-			RequestTimeout:        time.Duration(cfg.DocReader.RequestTimeoutSeconds) * time.Second,
-			MaxRedirects:          cfg.Security.URLPolicy.MaxRedirects,
-			AllowPrivateNetworks:  cfg.Security.URLPolicy.AllowPrivateNetworks,
-			AllowedDomains:        cfg.Security.URLPolicy.AllowedDomains,
-			BlockedDomains:        cfg.Security.URLPolicy.BlockedDomains,
-			PlaywrightCommand:     cfg.DocReader.Playwright.Command,
-			PlaywrightArgs:        cfg.DocReader.Playwright.Args,
-			PlaywrightTimeout:     time.Duration(cfg.DocReader.Playwright.TimeoutSeconds) * time.Second,
-			PlaywrightWaitUntil:   cfg.DocReader.Playwright.WaitUntil,
-			PlaywrightMaxHTMLSize: cfg.DocReader.Playwright.MaxHTMLBytes,
+			Mode:             cfg.DocReader.Mode,
+			Endpoint:         cfg.DocReader.Endpoint,
+			MinerUEndpoint:   cfg.DocReader.MinerUEndpoint,
+			Timeout:          5 * time.Minute,
+			MaxFileSize:      cfg.DocReader.MaxFileSize * 1024 * 1024,
+			ChunkSize:        cfg.RAG.ChunkSize,
+			ChunkOverlap:     cfg.RAG.ChunkOverlap,
+			EnableMultimodal: cfg.DocReader.EnableMultimodal,
+			VLMBaseURL:       cfg.DocReader.VLMBaseURL,
+			VLMAPIKey:        cfg.DocReader.VLMAPIKey,
+			VLMModel:         cfg.DocReader.VLMModel,
+			MinIOEndpoint:    cfg.DocReader.MinIOEndpoint,
+			MinIOAccessKey:   cfg.DocReader.MinIOAccessKey,
+			MinIOSecretKey:   cfg.DocReader.MinIOSecretKey,
+			MinIOBucket:      cfg.DocReader.MinIOBucket,
 		}
-		log.Printf("[DocReader] 初始化模式: %s", docReaderCfg.Mode)
 		docReaderCli, err = docreader.NewClient(docReaderCfg)
 		if err != nil {
-			log.Printf("[DocReader] 初始化失败: %v", err)
+			log.Printf("[DocReader] 连接失败（将使用本地解析）: %v", err)
 		} else {
-			log.Println("[DocReader] 初始化成功")
+			log.Println("[DocReader] 连接成功")
 			defer docReaderCli.Close()
 		}
 	}
@@ -293,15 +286,10 @@ func main() {
 		log.Printf("[ImportQueue] 连接 RabbitMQ: %s", cfg.ImportQueue.URL)
 		importQueue, err = importqueue.NewRabbitMQQueue(cfg.ImportQueue)
 		if err != nil {
-			log.Printf("[ImportQueue] 初始化失败（将跳过异步导入）: %v", err)
-			importQueue = nil
-		} else {
-			defer importQueue.Close()
+			log.Fatalf("[ImportQueue] 初始化失败: %v", err)
 		}
+		defer importQueue.Close()
 	}
-
-	// 【Eino Dev】初始化可视化调试（VS Code 插件连接 127.0.0.1:52538）
-	devops.Init(ctx)
 
 	// 注入 Eino 原生组件
 	if err := chatService.InitWithComponents(chatModel, einoRetriever); err != nil {
@@ -327,6 +315,13 @@ func main() {
 			log.Printf("[GraphRAG] 初始化失败（将跳过图谱检索）: %v", err)
 		} else {
 			log.Println("[GraphRAG] 服务初始化完成")
+			// 将图谱检索器注入到 CompositeRetriever
+			if cr, ok := einoRetriever.(*container.CompositeRetriever); ok {
+				// 使用默认命名空间（查询时会通过 WithKnowledgeBaseScope 切换）
+				gr := graphRAGService.CreateGraphRetriever(&graphrag.NameSpace{}, 10)
+				cr.SetGraphRetriever(gr)
+				log.Println("[GraphRAG] 图谱检索器已注入 Retriever")
+			}
 		}
 	}
 
@@ -337,35 +332,31 @@ func main() {
 	apiHandler.SetSessionCache(sessionCache)
 	apiHandler.SetRetrievalCache(retrievalCache)
 	apiHandler.SetImportStateStore(importStateStore)
-	// 接入 GraphRAG 服务（如果初始化成功）
 	if graphRAGService != nil {
 		apiHandler.SetGraphRAGService(graphRAGService)
-		chatService.SetGraphRAGService(graphRAGService)
+	}
 
-		// 注入轻量模型用于查询时快速实体抽取
-		if cfg.GraphRAG.LightLLM != nil {
-			lightModel, lightCleanup, lightErr := container.NewLLMProvider(ctx, cfg.GraphRAG.LightLLM)
-			if lightErr != nil {
-				log.Printf("[GraphRAG] 轻量模型创建失败，退化到重模型: %v", lightErr)
-			} else {
-				if lightCleanup != nil {
-					defer lightCleanup(ctx)
-				}
-				graphRAGService.SetLightModel(lightModel)
-				log.Printf("[GraphRAG] 查询时实体抽取已切换到轻量模型: %s", cfg.GraphRAG.LightLLM.ModelID)
-			}
+	// 初始化代码知识图谱（复用 GraphRAG 的 Neo4j 连接）
+	if cfg.Agent.EnableCodeGraph && cfg.GraphRAG.Enabled {
+		log.Println("[CodeGraph] 初始化代码知识图谱...")
+		codeGraphCfg := &graphrag.Config{
+			Enabled:  true,
+			Neo4jURI: cfg.GraphRAG.Neo4jURI,
+			Neo4jUser: cfg.GraphRAG.Neo4jUsername,
+			Neo4jPass: cfg.GraphRAG.Neo4jPassword,
 		}
-
-		// 将图谱检索器工厂注入 CompositeRetriever（按 KB 动态创建作用域检索器）
-		if composite, ok := einoRetriever.(*container.CompositeRetriever); ok {
-			composite.SetGraphRetrieverFactory(graphRAGService)
-			// 同时保留全局兜底（无 KB 作用域时使用）
-			topK := cfg.GraphRAG.TopK
-			if topK <= 0 {
-				topK = 10
+		neo4jDriver, err := graphrag.InitNeo4jDriver(ctx, codeGraphCfg)
+		if err != nil {
+			log.Printf("[CodeGraph] Neo4j 连接失败: %v", err)
+		} else {
+			codeRepo := codegraph.NewNeo4jCodeGraphRepo(neo4jDriver)
+			reposDir := cfg.Agent.CodeSearchReposDir
+			if reposDir == "" {
+				reposDir = "data/test_repos"
 			}
-			composite.SetGraphRetriever(graphRAGService.CreateGraphRetriever(&graphrag.NameSpace{}, topK))
-			log.Printf("[GraphRAG] 图谱检索器已注入 Retriever (topK=%d, 支持按 KB 动态作用域)", topK)
+			codeIndexer := codegraph.NewIndexer(codeRepo, reposDir)
+			chatService.SetCodeGraph(codeRepo, codeIndexer)
+			log.Println("[CodeGraph] 代码知识图谱初始化完成")
 		}
 	}
 	if importQueue != nil {
@@ -389,12 +380,23 @@ func main() {
 	r.Use(gin.Logger())
 
 	// CORS 配置
+	corsOrigins := cfg.Server.CORSOrigins
+	if len(corsOrigins) == 0 {
+		corsOrigins = []string{"*"}
+	}
+	allowCredentials := true
+	for _, o := range corsOrigins {
+		if o == "*" {
+			allowCredentials = false
+			break
+		}
+	}
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"*"},
+		AllowOrigins:     corsOrigins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
 		ExposeHeaders:    []string{"Content-Length"},
-		AllowCredentials: true,
+		AllowCredentials: allowCredentials,
 		MaxAge:           12 * time.Hour,
 	}))
 
@@ -450,6 +452,7 @@ func main() {
 	log.Printf("  - Redis:     %v", redisClient != nil && redisClient.Status(ctx).Available)
 	log.Printf("  - Reranker:  %v", reranker != nil)
 	log.Printf("  - GraphRAG:  %v", graphRAGService != nil)
+	log.Printf("  - CodeGraph: %v", cfg.Agent.EnableCodeGraph)
 	log.Printf("  - MCP:       %v", mcpMgr != nil && len(mcpMgr.GetTools()) > 0)
 	log.Printf("  - ImportQueue: %v", importQueue != nil)
 	log.Println("========================================")
@@ -479,7 +482,7 @@ func loadDocuments(
 	log.Printf("[Documents] 加载了 %d 个文档", len(rawDocs))
 
 	// 分块
-	chunker := document.NewRecursiveCharacterChunker(cfg.RAG.ChunkSize, cfg.RAG.ChunkOverlap)
+	chunker := document.NewChunker(cfg.RAG.ChunkStrategy, cfg.RAG.ChunkSize, cfg.RAG.ChunkOverlap, "")
 	var allChunks []*container.Document
 
 	for _, rawDoc := range rawDocs {

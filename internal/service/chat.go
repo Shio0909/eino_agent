@@ -20,6 +20,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 
 	cachepkg "eino_agent/internal/cache"
+	"eino_agent/internal/codegraph"
 	"eino_agent/internal/config"
 	"eino_agent/internal/container"
 	"eino_agent/internal/database/repository"
@@ -46,6 +47,8 @@ type ChatService struct {
 	knowledgeTool   *internalTool.KnowledgeTool  // Agent 模式的知识库工具引用
 	agenticRAG      *pipeline.AgenticRAGPipeline // Deprecated: 保留字段供渐进迁移，不再在调度中使用
 	graphRAGService *graphrag.Service            // GraphRAG 服务（可选，用于按需创建图谱检索器）
+	codeGraphRepo   codegraph.CodeGraphRepository // 代码知识图谱存储（可选）
+	codeIndexer     *codegraph.Indexer            // 代码索引器（可选）
 	skillBackend    skill.Backend
 	mcpTools        []tool.BaseTool      // MCP 远程工具
 	skillMiddleware *adk.AgentMiddleware // Eino 原生 skill 中间件
@@ -123,6 +126,12 @@ func (s *ChatService) SetRepositories(sessionRepo repository.SessionRepository, 
 // SetGraphRAGService 设置 GraphRAG 服务（按需创建图谱检索器）
 func (s *ChatService) SetGraphRAGService(svc *graphrag.Service) {
 	s.graphRAGService = svc
+}
+
+// SetCodeGraph 设置代码知识图谱存储和索引器
+func (s *ChatService) SetCodeGraph(repo codegraph.CodeGraphRepository, indexer *codegraph.Indexer) {
+	s.codeGraphRepo = repo
+	s.codeIndexer = indexer
 }
 
 // InitWithComponents 使用组件初始化服务
@@ -245,6 +254,16 @@ func (s *ChatService) buildToolsWithRetriever(runtimeRetriever retriever.Retriev
 	// code_search 工具（代码仓库检索）
 	if s.config.Agent.EnableCodeSearch && s.config.Agent.CodeSearchReposDir != "" {
 		tools = append(tools, internalTool.NewCodeSearchTool(s.config.Agent.CodeSearchReposDir))
+	}
+
+	// repo_manager 工具（仓库 clone/pull/list）
+	if s.config.Agent.EnableCodeSearch && s.config.Agent.CodeSearchReposDir != "" {
+		tools = append(tools, internalTool.NewRepoManagerTool(s.config.Agent.CodeSearchReposDir))
+	}
+
+	// code_graph 工具（代码知识图谱查询）
+	if s.config.Agent.EnableCodeGraph && s.codeGraphRepo != nil {
+		tools = append(tools, internalTool.NewCodeGraphTool(s.codeGraphRepo, s.codeIndexer))
 	}
 
 	return tools, kt
