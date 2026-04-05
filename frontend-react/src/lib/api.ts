@@ -140,6 +140,17 @@ export const importMCPServer = (data: {
 // ---- Eval ----
 export const getEvalReports = () => fetchJSON<{ reports: Array<{ name: string; size: number; modified_at: string }> }>('/eval/reports')
 
+// ---- Code Repos ----
+export const getCodeRepos = () => fetchJSON<{ repos: any[] }>('/code-repos')
+export const cloneCodeRepo = (url: string, name?: string) =>
+  fetchJSON<any>('/code-repos/clone', { method: 'POST', body: JSON.stringify({ url, name: name || undefined }) })
+export const indexCodeRepo = (name: string) =>
+  fetchJSON<any>(`/code-repos/${encodeURIComponent(name)}/index`, { method: 'POST' })
+export const pullCodeRepo = (name: string) =>
+  fetchJSON<any>(`/code-repos/${encodeURIComponent(name)}/pull`, { method: 'POST' })
+export const deleteCodeRepo = (name: string) =>
+  fetchJSON<any>(`/code-repos/${encodeURIComponent(name)}`, { method: 'DELETE' })
+
 // ---- GraphRAG ----
 export interface VisNode {
   id: string

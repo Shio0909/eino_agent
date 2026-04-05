@@ -235,3 +235,17 @@ export interface CreateKBRequest {
   description: string
   embedding_model?: string
 }
+
+export interface CodeRepo {
+  name: string
+  path: string
+  branch: string
+  last_commit: string
+  last_commit_date: string
+  indexed: boolean
+  index_stats?: {
+    files: number
+    entities: number
+    relations: number
+  }
+}

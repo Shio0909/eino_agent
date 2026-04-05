@@ -1,5 +1,5 @@
 import { NavLink, useNavigate } from 'react-router-dom'
-import { MessageSquare, BookOpen, Wrench, Settings, Activity, Plus, PanelLeftClose, PanelLeft } from 'lucide-react'
+import { MessageSquare, BookOpen, Wrench, Settings, Activity, Plus, PanelLeftClose, PanelLeft, FolderGit } from 'lucide-react'
 import { useState } from 'react'
 import ThemeToggle from './ThemeToggle'
 import { useChatStore } from '../../stores/chat-store'
@@ -9,6 +9,7 @@ const navItems = [
   { to: '/', icon: MessageSquare, label: '对话' },
   { to: '/knowledge', icon: BookOpen, label: '知识库' },
   { to: '/tools', icon: Wrench, label: '工具' },
+  { to: '/code-repos', icon: FolderGit, label: '代码仓库' },
   { to: '/system', icon: Activity, label: '系统' },
 ]
 

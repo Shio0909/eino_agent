@@ -3,6 +3,7 @@ import AppLayout from './components/layout/AppLayout'
 import ChatPage from './pages/ChatPage'
 import KnowledgePage from './pages/KnowledgePage'
 import ToolsPage from './pages/ToolsPage'
+import CodeReposPage from './pages/CodeReposPage'
 import SettingsPage from './pages/SettingsPage'
 import SystemPage from './pages/SystemPage'
 import { ToastContainer } from './components/ui'
@@ -23,6 +24,7 @@ export default function App() {
           <Route path="/" element={<ChatPage />} />
           <Route path="/knowledge" element={<KnowledgePage />} />
           <Route path="/tools" element={<ToolsPage />} />
+          <Route path="/code-repos" element={<CodeReposPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="/system" element={<SystemPage />} />
         </Routes>
