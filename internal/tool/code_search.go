@@ -259,8 +259,15 @@ func (t *CodeSearchTool) doRead(ctx context.Context, params codeSearchInput) (co
 		return codeSearchOutput{}, fmt.Errorf("path is required for read action")
 	}
 
+	// 修正 LLM 常见错误：path 中包含 repo 名前缀时自动去除
+	cleanPath := filepath.FromSlash(params.Path)
+	if params.Repo != "" {
+		prefix := params.Repo + string(filepath.Separator)
+		cleanPath = strings.TrimPrefix(cleanPath, prefix)
+	}
+
 	searchDir := t.resolveDir(params.Repo)
-	fullPath := filepath.Join(searchDir, filepath.FromSlash(params.Path))
+	fullPath := filepath.Join(searchDir, cleanPath)
 
 	// 安全检查：路径不能逃逸出 reposDir
 	absPath, _ := filepath.Abs(fullPath)
@@ -269,13 +276,40 @@ func (t *CodeSearchTool) doRead(ctx context.Context, params codeSearchInput) (co
 		return codeSearchOutput{}, fmt.Errorf("path traversal not allowed")
 	}
 
+	// 如果是目录，列出内容而不是尝试读取
+	info, statErr := os.Stat(fullPath)
+	if statErr == nil && info.IsDir() {
+		entries, err := os.ReadDir(fullPath)
+		if err != nil {
+			return codeSearchOutput{}, fmt.Errorf("list directory: %w", err)
+		}
+		var results []codeSearchResult
+		for _, e := range entries {
+			if len(results) >= 50 {
+				break
+			}
+			name := e.Name()
+			if strings.HasPrefix(name, ".") {
+				continue
+			}
+			if e.IsDir() {
+				name += "/"
+			}
+			results = append(results, codeSearchResult{File: name})
+		}
+		return codeSearchOutput{
+			Action:  "read",
+			Results: results,
+			Summary: fmt.Sprintf("Listed directory: %s (%d entries)", params.Path, len(results)),
+		}, nil
+	}
+
 	data, err := os.ReadFile(fullPath)
 	if err != nil {
 		return codeSearchOutput{}, fmt.Errorf("read file: %w", err)
 	}
 
 	content := string(data)
-	// 截断过大文件
 	const maxFileChars = 2000
 	if utf8.RuneCountInString(content) > maxFileChars {
 		runes := []rune(content)
