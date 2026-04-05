@@ -125,8 +125,11 @@ func (t *KnowledgeTool) InvokableRun(ctx context.Context, input string, opts ...
 	// 缓存检索结果，供 ChatService 回填 sources 时直接使用
 	t.lastDocs = append(t.lastDocs, docs...)
 
-	// 转换结果
+	// 转换结果，截断内容防止上下文爆炸
+	const maxContentPerDoc = 500
+	const maxTotalChars = 4000
 	results := make([]KnowledgeResult, 0, t.topK)
+	totalChars := 0
 	for i, doc := range docs {
 		if i >= t.topK {
 			break
@@ -135,8 +138,16 @@ func (t *KnowledgeTool) InvokableRun(ctx context.Context, input string, opts ...
 		if score == 0 {
 			score = 1.0 - float64(i)*0.1
 		}
+		content := doc.Content
+		if len(content) > maxContentPerDoc {
+			content = content[:maxContentPerDoc] + "..."
+		}
+		if totalChars+len(content) > maxTotalChars && i > 0 {
+			break
+		}
+		totalChars += len(content)
 		results = append(results, KnowledgeResult{
-			Content: doc.Content,
+			Content: content,
 			Source:  doc.ID,
 			Score:   score,
 		})
