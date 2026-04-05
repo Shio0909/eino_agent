@@ -1,8 +1,21 @@
 import { useEffect, useState } from 'react'
-import { GitBranch, Download, RefreshCw, Database, Trash2, FolderGit } from 'lucide-react'
+import {
+  GitBranch, Download, RefreshCw, Database, Trash2,
+  FolderGit, FileCode2, Link2, Clock, Hash, Code2,
+} from 'lucide-react'
 import { getCodeRepos, cloneCodeRepo, indexCodeRepo, pullCodeRepo, deleteCodeRepo } from '../lib/api'
 import type { CodeRepo } from '../types/api'
-import { Button, Input, Card, CardTitle, EmptyState, PageSpinner, toast } from '../components/ui'
+import { Button, Badge, Input, Card, CardTitle, EmptyState, PageSpinner, ConfirmDialog, toast } from '../components/ui'
+
+function StatPill({ icon: Icon, label, value }: { icon: React.ElementType; label: string; value: number }) {
+  return (
+    <div className="flex items-center gap-1.5 rounded-lg bg-[var(--color-bg-tertiary)] px-2.5 py-1.5">
+      <Icon size={12} className="text-[var(--color-text-muted)]" />
+      <span className="text-xs font-medium text-[var(--color-text-primary)]">{value.toLocaleString()}</span>
+      <span className="text-[10px] text-[var(--color-text-muted)]">{label}</span>
+    </div>
+  )
+}
 
 export default function CodeReposPage() {
   const [repos, setRepos] = useState<CodeRepo[]>([])
@@ -10,6 +23,7 @@ export default function CodeReposPage() {
   const [cloneUrl, setCloneUrl] = useState('')
   const [cloning, setCloning] = useState(false)
   const [actionLoading, setActionLoading] = useState<Record<string, string>>({})
+  const [deleteTarget, setDeleteTarget] = useState<string | null>(null)
 
   const fetchRepos = async () => {
     try {
@@ -74,16 +88,18 @@ export default function CodeReposPage() {
     }
   }
 
-  const handleDelete = async (name: string) => {
-    setAction(name, 'delete')
+  const confirmDelete = async () => {
+    if (!deleteTarget) return
+    setAction(deleteTarget, 'delete')
     try {
-      await deleteCodeRepo(name)
-      toast(`${name} 已删除`)
+      await deleteCodeRepo(deleteTarget)
+      toast(`${deleteTarget} 已删除`)
       await fetchRepos()
     } catch (error: any) {
       toast(error?.message || '删除失败', 'error')
     } finally {
-      setAction(name, null)
+      setAction(deleteTarget, null)
+      setDeleteTarget(null)
     }
   }
 
@@ -91,16 +107,19 @@ export default function CodeReposPage() {
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
+      {/* Header */}
       <div className="px-8 py-6 border-b border-[var(--color-border-subtle)] bg-[var(--color-bg-primary)]">
         <div className="w-full">
           <h1 className="text-2xl font-semibold text-[var(--color-text-primary)]">代码仓库</h1>
-          <p className="text-base text-[var(--color-text-secondary)] mt-1">克隆 Git 仓库、构建代码索引，支持代码级问答</p>
+          <p className="text-base text-[var(--color-text-secondary)] mt-1">
+            克隆 Git 仓库、构建代码索引，支持代码级问答
+          </p>
         </div>
       </div>
 
       <div className="flex-1 overflow-y-auto px-8 py-6">
         <div className="w-full space-y-6">
-          {/* Clone */}
+          {/* Clone Section */}
           <Card>
             <CardTitle>
               <Download size={16} className="text-green-400" />
@@ -124,110 +143,135 @@ export default function CodeReposPage() {
           </Card>
 
           {/* Repo List */}
-          <Card>
-            <CardTitle>
+          <div>
+            <h2 className="flex items-center gap-2 text-base font-semibold text-[var(--color-text-primary)] mb-4">
               <FolderGit size={16} className="text-purple-400" />
-              仓库列表 ({repos.length})
-            </CardTitle>
+              仓库列表
+              <Badge variant="purple" size="sm">{repos.length}</Badge>
+            </h2>
+
             {repos.length > 0 ? (
-              <div className="space-y-3 mt-4">
+              <div className="grid grid-cols-1 gap-4">
                 {repos.map((repo) => {
                   const busy = actionLoading[repo.name]
                   return (
                     <div
                       key={repo.name}
-                      className="rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-5 py-4"
+                      className="group rounded-2xl border border-[var(--color-border)] bg-[var(--color-bg-card)] p-5 transition-all hover:border-[var(--color-border-subtle)] hover:shadow-md"
                     >
+                      {/* Top row: icon + name + badge + actions */}
                       <div className="flex items-start justify-between gap-4">
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2">
-                            <h3 className="text-sm font-semibold text-[var(--color-text-primary)] truncate">
-                              {repo.name}
-                            </h3>
-                            <span
-                              className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${
-                                repo.indexed
-                                  ? 'bg-green-500/15 text-green-400'
-                                  : 'bg-yellow-500/15 text-yellow-400'
-                              }`}
-                            >
-                              <Database size={10} />
-                              {repo.indexed ? '已索引' : '未索引'}
-                            </span>
+                        <div className="flex items-start gap-3 min-w-0">
+                          <div className="w-10 h-10 rounded-xl bg-purple-500/15 flex items-center justify-center shrink-0">
+                            <Code2 size={18} className="text-purple-400" />
                           </div>
-                          <div className="flex items-center gap-3 mt-1.5 text-xs text-[var(--color-text-muted)]">
-                            <span className="flex items-center gap-1">
-                              <GitBranch size={12} />
-                              {repo.branch}
-                            </span>
-                            {repo.last_commit_date && (
-                              <span>{new Date(repo.last_commit_date).toLocaleString()}</span>
-                            )}
-                          </div>
-                          {repo.last_commit && (
-                            <p className="text-xs text-[var(--color-text-muted)] mt-1 truncate">
-                              {repo.last_commit}
-                            </p>
-                          )}
-                          {repo.indexed && repo.index_stats && (
-                            <div className="flex items-center gap-4 mt-2 text-xs text-[var(--color-text-secondary)]">
-                              <span>{repo.index_stats.files} 文件</span>
-                              <span>{repo.index_stats.entities} 实体</span>
-                              <span>{repo.index_stats.relations} 关系</span>
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2">
+                              <h3 className="text-sm font-semibold text-[var(--color-text-primary)] truncate">
+                                {repo.name}
+                              </h3>
+                              <Badge variant={repo.indexed ? 'success' : 'warning'} size="sm">
+                                <Database size={10} />
+                                {repo.indexed ? '已索引' : '未索引'}
+                              </Badge>
                             </div>
-                          )}
+                            {/* Meta info */}
+                            <div className="flex items-center gap-3 mt-1 text-xs text-[var(--color-text-muted)]">
+                              <span className="flex items-center gap-1">
+                                <GitBranch size={11} />
+                                {repo.branch}
+                              </span>
+                              {repo.last_commit && (
+                                <span className="flex items-center gap-1 font-mono">
+                                  <Hash size={11} />
+                                  {repo.last_commit}
+                                </span>
+                              )}
+                              {repo.last_commit_date && (
+                                <span className="flex items-center gap-1">
+                                  <Clock size={11} />
+                                  {new Date(repo.last_commit_date).toLocaleDateString()}
+                                </span>
+                              )}
+                            </div>
+                          </div>
                         </div>
-                        <div className="flex items-center gap-2 flex-shrink-0">
+
+                        {/* Action buttons */}
+                        <div className="flex items-center gap-1.5 shrink-0 opacity-70 group-hover:opacity-100 transition-opacity">
                           <Button
-                            variant="outline"
+                            variant="ghost"
                             size="sm"
                             onClick={() => handlePull(repo.name)}
                             loading={busy === 'pull'}
                             disabled={!!busy}
+                            title="拉取最新代码"
                           >
-                            <RefreshCw size={13} />
+                            <RefreshCw size={14} />
                             拉取
                           </Button>
                           <Button
-                            variant="outline"
+                            variant="ghost"
                             size="sm"
                             onClick={() => handleIndex(repo.name)}
                             loading={busy === 'index'}
                             disabled={!!busy}
+                            title="重建代码索引"
                           >
-                            <Database size={13} />
+                            <Database size={14} />
                             索引
                           </Button>
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() => handleDelete(repo.name)}
-                            loading={busy === 'delete'}
+                          <button
+                            onClick={() => setDeleteTarget(repo.name)}
                             disabled={!!busy}
-                            className="text-red-400 hover:text-red-300"
+                            title="删除仓库"
+                            className="p-2 rounded-lg text-[var(--color-text-muted)] hover:bg-red-500/15 hover:text-red-400 transition-colors disabled:opacity-50"
                           >
-                            <Trash2 size={13} />
-                          </Button>
+                            <Trash2 size={14} />
+                          </button>
                         </div>
                       </div>
+
+                      {/* Stats row */}
+                      {repo.indexed && repo.index_stats && (
+                        <div className="flex items-center gap-2 mt-3 ml-[52px]">
+                          <StatPill icon={FileCode2} label="文件" value={repo.index_stats.files} />
+                          <StatPill icon={Code2} label="实体" value={repo.index_stats.entities} />
+                          <StatPill icon={Link2} label="关系" value={repo.index_stats.relations} />
+                        </div>
+                      )}
+
+                      {/* Not indexed hint */}
+                      {!repo.indexed && (
+                        <p className="text-xs text-[var(--color-text-muted)] mt-3 ml-[52px]">
+                          点击「索引」按钮构建代码知识图谱，启用代码级问答
+                        </p>
+                      )}
                     </div>
                   )
                 })}
               </div>
             ) : (
-              <p className="text-sm text-[var(--color-text-muted)] mt-3">还没有克隆的仓库</p>
+              <EmptyState
+                icon={FolderGit}
+                title="暂无代码仓库"
+                description="克隆一个 Git 仓库开始使用代码问答功能"
+              />
             )}
-          </Card>
-
-          {repos.length === 0 && (
-            <EmptyState
-              icon={FolderGit}
-              title="暂无代码仓库"
-              description="克隆一个 Git 仓库开始使用代码问答功能"
-            />
-          )}
+          </div>
         </div>
       </div>
+
+      {/* Delete confirmation */}
+      <ConfirmDialog
+        open={!!deleteTarget}
+        onClose={() => setDeleteTarget(null)}
+        onConfirm={confirmDelete}
+        title={`删除仓库 ${deleteTarget}？`}
+        description="将同时删除本地代码和 Neo4j 中的知识图谱数据，此操作不可撤销。"
+        confirmText="删除"
+        variant="danger"
+      />
     </div>
   )
 }
