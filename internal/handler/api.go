@@ -1253,15 +1253,42 @@ func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeI
 		},
 	}
 
+	// 构建分块器选项（语义分块需要 embedder）
+	var chunkerOpts []document.ChunkerOption
+	if h.cfg.RAG.ChunkStrategy == "semantic" && h.embedding != nil {
+		chunkerOpts = append(chunkerOpts, document.WithEmbedder(h.embedding))
+		if h.cfg.RAG.SemanticSimilarityPct > 0 {
+			chunkerOpts = append(chunkerOpts, document.WithSimilarityPct(h.cfg.RAG.SemanticSimilarityPct))
+		}
+	}
+
 	chunker := document.NewChunker(
 		h.cfg.RAG.ChunkStrategy,
 		h.cfg.RAG.ChunkSize,
 		h.cfg.RAG.ChunkOverlap,
 		filename,
+		chunkerOpts...,
 	)
 	chunks, err := chunker.Chunk(ctx, rawDoc)
 	if err != nil {
 		return 0, fmt.Errorf("文档分块失败: %w", err)
+	}
+
+	// 上下文富化（可选）
+	if h.cfg.RAG.EnableContextualEnrichment && h.cfg.Agent.AgenticRAG.LightLLM != nil && h.cfg.Agent.AgenticRAG.LightLLM.BaseURL != "" {
+		lightLLM, _, llmErr := container.NewLLMProvider(ctx, h.cfg.Agent.AgenticRAG.LightLLM)
+		if llmErr != nil {
+			log.Printf("[Enricher] 创建 LLM 失败，跳过富化: %v", llmErr)
+		} else {
+			enricher := document.NewContextualEnricher(lightLLM)
+			enrichedChunks, enrichErr := enricher.Enrich(ctx, string(content), chunks)
+			if enrichErr != nil {
+				log.Printf("[Enricher] 富化失败，使用原始 chunks: %v", enrichErr)
+			} else {
+				chunks = enrichedChunks
+				log.Printf("[Enricher] 成功富化 %d 个 chunks", len(chunks))
+			}
+		}
 	}
 
 	contents := make([]string, len(chunks))
@@ -2004,8 +2031,10 @@ func (h *Handler) GetSettings(c *gin.Context) {
 			"enable_hybrid":      h.cfg.RAG.EnableHybrid,
 			"enable_rewrite":     h.cfg.RAG.EnableRewrite,
 			"enable_rerank":      h.cfg.RAG.EnableRerank,
-			"chunk_size":         h.cfg.RAG.ChunkSize,
-			"chunk_overlap":      h.cfg.RAG.ChunkOverlap,
+			"chunk_size":                   h.cfg.RAG.ChunkSize,
+			"chunk_overlap":                h.cfg.RAG.ChunkOverlap,
+			"chunk_strategy":               h.cfg.RAG.ChunkStrategy,
+			"enable_contextual_enrichment": h.cfg.RAG.EnableContextualEnrichment,
 			"embedding_model":    h.cfg.Embedding.ModelID,
 			"knowledge_base_ids": []string{},
 		},

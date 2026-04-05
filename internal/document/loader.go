@@ -16,6 +16,8 @@ import (
 	"unicode/utf8"
 
 	"eino_agent/internal/container"
+
+	einoembedding "github.com/cloudwego/eino/components/embedding"
 )
 
 // Loader 文档加载器接口
@@ -165,13 +167,44 @@ func NewRecursiveCharacterChunker(chunkSize, chunkOverlap int) *RecursiveCharact
 	}
 }
 
+// ChunkerOption 分块器可选参数
+type ChunkerOption func(*chunkerOpts)
+
+type chunkerOpts struct {
+	embedder            einoembedding.Embedder
+	similarityThreshold float64 // 百分位阈值
+}
+
+// WithEmbedder 为语义分块器注入 Embedder
+func WithEmbedder(e einoembedding.Embedder) ChunkerOption {
+	return func(o *chunkerOpts) { o.embedder = e }
+}
+
+// WithSimilarityPct 设置语义分块百分位阈值
+func WithSimilarityPct(pct float64) ChunkerOption {
+	return func(o *chunkerOpts) { o.similarityThreshold = pct }
+}
+
 // NewChunker 根据策略创建分块器
-// strategy: "recursive"=递归字符, "markdown"=Markdown 结构, "auto"=根据文件扩展名自动选择
-func NewChunker(strategy string, chunkSize, chunkOverlap int, filename string) Chunker {
+// strategy: "recursive"=递归字符, "markdown"=Markdown 结构, "semantic"=语义分块, "auto"=根据文件扩展名自动选择
+func NewChunker(strategy string, chunkSize, chunkOverlap int, filename string, opts ...ChunkerOption) Chunker {
+	o := &chunkerOpts{similarityThreshold: 0.25}
+	for _, opt := range opts {
+		opt(o)
+	}
+
 	ext := strings.ToLower(filepath.Ext(filename))
 	switch strategy {
 	case "markdown":
 		return NewMarkdownChunker(chunkSize, chunkOverlap)
+	case "semantic":
+		if o.embedder != nil {
+			sc := NewSemanticChunker(o.embedder, chunkSize)
+			sc.PercentileThreshold = o.similarityThreshold
+			return sc
+		}
+		log.Printf("[Chunker] semantic 策略需要 Embedder，退回 auto")
+		return NewChunker("auto", chunkSize, chunkOverlap, filename)
 	case "auto":
 		if ext == ".md" || ext == ".markdown" {
 			log.Printf("[Chunker] 文件 %s 使用 MarkdownChunker", filename)
@@ -201,10 +234,10 @@ func (c *RecursiveCharacterChunker) Chunk(ctx context.Context, doc *RawDocument)
 			ID:      chunkID,
 			Content: chunk,
 			Metadata: map[string]interface{}{
-				"source":      doc.Source,
-				"chunk_index": i,
+				"source":       doc.Source,
+				"chunk_index":  i,
 				"total_chunks": len(chunks),
-				"doc_id":      doc.ID,
+				"doc_id":       doc.ID,
 			},
 		})
 	}

@@ -165,9 +165,11 @@ type RAGConfig struct {
 	RetrievalCacheTTLMinutes int  `yaml:"retrieval_cache_ttl_minutes"`
 
 	// 分块配置
-	ChunkSize     int    `yaml:"chunk_size"`
-	ChunkOverlap  int    `yaml:"chunk_overlap"`
-	ChunkStrategy string `yaml:"chunk_strategy"` // recursive, markdown, auto
+	ChunkSize                  int     `yaml:"chunk_size"`
+	ChunkOverlap               int     `yaml:"chunk_overlap"`
+	ChunkStrategy              string  `yaml:"chunk_strategy"`               // recursive, markdown, auto, semantic
+	SemanticSimilarityPct      float64 `yaml:"semantic_similarity_pct"`      // 语义分块百分位阈值 (0-1), 默认 0.25
+	EnableContextualEnrichment bool    `yaml:"enable_contextual_enrichment"` // 启用上下文富化（LLM生成chunk前缀）
 
 	// 文档路径
 	DocumentsPath string `yaml:"documents_path"`
