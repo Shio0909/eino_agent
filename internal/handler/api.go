@@ -18,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	cachepkg "eino_agent/internal/cache"
+	"eino_agent/internal/codegraph"
 	"eino_agent/internal/config"
 	"eino_agent/internal/container"
 	"eino_agent/internal/database/postgres"
@@ -49,6 +50,8 @@ type Handler struct {
 	importStateStore cachepkg.ImportStateStore
 	auditLogger      *AuditLogger
 	graphRAGService  *graphrag.Service
+	codeGraphRepo    codegraph.CodeGraphRepository
+	codeIndexer      *codegraph.Indexer
 
 	// Repositories
 	kbRepo        repository.KnowledgeBaseRepository
@@ -86,6 +89,12 @@ func (h *Handler) SetImportStateStore(importStateStore cachepkg.ImportStateStore
 // SetGraphRAGService 设置 GraphRAG 服务。
 func (h *Handler) SetGraphRAGService(svc *graphrag.Service) {
 	h.graphRAGService = svc
+}
+
+// SetCodeGraph 设置代码知识图谱组件。
+func (h *Handler) SetCodeGraph(repo codegraph.CodeGraphRepository, indexer *codegraph.Indexer) {
+	h.codeGraphRepo = repo
+	h.codeIndexer = indexer
 }
 
 // NewHandler 创建新的处理器
@@ -224,6 +233,16 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			graphragAPI.GET("/status", h.GetGraphRAGStatus)
 			graphragAPI.POST("/build/:kbId", h.BuildGraphForKB)
 			graphragAPI.DELETE("/:kbId", h.DeleteGraphForKB)
+		}
+
+		// 代码仓库管理
+		codeRepos := protected.Group("/code-repos")
+		{
+			codeRepos.GET("", h.ListCodeRepos)
+			codeRepos.POST("/clone", h.CloneCodeRepo)
+			codeRepos.POST("/:name/index", h.IndexCodeRepo)
+			codeRepos.POST("/:name/pull", h.PullCodeRepo)
+			codeRepos.DELETE("/:name", h.DeleteCodeRepo)
 		}
 	}
 

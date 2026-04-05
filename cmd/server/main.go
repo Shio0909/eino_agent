@@ -356,6 +356,7 @@ func main() {
 			}
 			codeIndexer := codegraph.NewIndexer(codeRepo, reposDir)
 			chatService.SetCodeGraph(codeRepo, codeIndexer)
+			apiHandler.SetCodeGraph(codeRepo, codeIndexer)
 			log.Println("[CodeGraph] 代码知识图谱初始化完成")
 		}
 	}
