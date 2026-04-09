@@ -22,7 +22,7 @@ import (
 )
 
 // CompositeRetriever 组合检索器
-// 【Eino 特点】支持向量检索 + 关键词检索 + 图谱检索的混合模式
+// 【Eino 特点】支持向量检索 + 关键词检索 + 图谱检索 + Markdown全文检索的混合模式
 type CompositeRetriever struct {
 	cfg                   *config.RAGConfig
 	embeddingCfg          *config.EmbeddingConfig
@@ -31,6 +31,7 @@ type CompositeRetriever struct {
 	retrievalCache        cachepkg.RetrievalCache
 	graphRetriever        einoretriever.Retriever
 	graphRetrieverFactory GraphRetrieverFactory // 用于按 KB 动态创建图谱检索器
+	markdownRetriever     *MarkdownRetriever    // Markdown 模式全文检索器（可选）
 }
 
 // GraphRetrieverFactory 按命名空间创建图谱检索器（由 graphRAG Service 实现）
@@ -80,6 +81,11 @@ func (r *CompositeRetriever) SetGraphRetrieverFactory(f GraphRetrieverFactory) {
 	r.graphRetrieverFactory = f
 }
 
+// SetMarkdownRetriever 注入 Markdown 检索器
+func (r *CompositeRetriever) SetMarkdownRetriever(mr *MarkdownRetriever) {
+	r.markdownRetriever = mr
+}
+
 // Retrieve 执行检索
 func (r *CompositeRetriever) Retrieve(ctx context.Context, query string, opts ...einoretriever.Option) ([]*schema.Document, error) {
 	if cachedDocs, ok, err := r.getCachedRetrievalDocuments(ctx, query, false); err != nil {
@@ -97,19 +103,27 @@ func (r *CompositeRetriever) Retrieve(ctx context.Context, query string, opts ..
 		topK = 10
 	}
 
-	// 1. 生成查询向量
+	// 尝试向量检索
 	queryVector, err := r.getQueryEmbedding(ctx, query)
 	if err != nil {
+		// 向量化失败时，回退到 Markdown 全文检索（如果可用）
+		if r.markdownRetriever != nil {
+			log.Printf("[Retriever] 向量化失败，回退到 Markdown 全文检索: %v", err)
+			return r.markdownRetriever.Retrieve(ctx, query, opts...)
+		}
 		return nil, fmt.Errorf("生成查询向量失败: %w", err)
 	}
 
-	// 2. 向量检索
-	docs, err := r.vectorDB.Search(ctx, queryVector, topK*2) // 多取一些用于后续过滤
+	docs, err := r.vectorDB.Search(ctx, queryVector, topK*2)
 	if err != nil {
 		return nil, fmt.Errorf("向量检索失败: %w", err)
 	}
 
-	// 4. 限制返回数量
+	// 如果向量检索结果为空且有 Markdown 检索器，补充 Markdown FTS 结果
+	if len(docs) == 0 && r.markdownRetriever != nil {
+		return r.markdownRetriever.Retrieve(ctx, query, opts...)
+	}
+
 	if len(docs) > topK {
 		docs = docs[:topK]
 	}
@@ -181,6 +195,30 @@ func (r *CompositeRetriever) retrieveWithHybrid(ctx context.Context, query strin
 	}
 
 	fused := r.rrfFuse(vectorDocs, keywordDocs, graphDocs, topK)
+
+	// Markdown 全文检索补充（如果有 Markdown 模式的 KB，结果会从 chunks 表返回）
+	if r.markdownRetriever != nil {
+		mdDocs, mdErr := r.markdownRetriever.Retrieve(ctx, query)
+		if mdErr != nil {
+			log.Printf("[Retriever] Markdown 全文检索失败（降级继续）: %v", mdErr)
+		} else if len(mdDocs) > 0 {
+			// 将 Markdown 结果追加到 fused（不参与 RRF，作为补充）
+			seen := make(map[string]struct{}, len(fused))
+			for _, d := range fused {
+				seen[d.ID] = struct{}{}
+			}
+			for _, d := range mdDocs {
+				if _, exists := seen[d.ID]; !exists {
+					fused = append(fused, &Document{
+						ID:       d.ID,
+						Content:  d.Content,
+						Metadata: d.MetaData,
+					})
+				}
+			}
+			log.Printf("[Retriever] 补充 %d 个 Markdown 全文检索结果", len(mdDocs))
+		}
+	}
 
 	// 将图谱上下文作为补充信息追加到检索结果中（不占 topK 名额）
 	if graphContextDoc != nil {

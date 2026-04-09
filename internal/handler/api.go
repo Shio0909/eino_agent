@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -56,6 +57,7 @@ type Handler struct {
 	// Repositories
 	kbRepo        repository.KnowledgeBaseRepository
 	knowledgeRepo repository.KnowledgeRepository
+	chunkRepo     repository.ChunkRepository
 	embeddingRepo repository.EmbeddingRepository
 	sessionRepo   repository.SessionRepository
 	messageRepo   repository.MessageRepository
@@ -135,6 +137,7 @@ func NewHandler(
 	if db != nil {
 		h.kbRepo = repository.NewKnowledgeBaseRepository(db)
 		h.knowledgeRepo = repository.NewKnowledgeRepository(db)
+		h.chunkRepo = repository.NewChunkRepository(db)
 		h.embeddingRepo = repository.NewEmbeddingRepository(db)
 		h.sessionRepo = repository.NewSessionRepository(db)
 		h.messageRepo = repository.NewMessageRepository(db)
@@ -644,6 +647,7 @@ func (h *Handler) evaluatePromptRisk(input string) security.PromptDecision {
 type KnowledgeBaseRequest struct {
 	Name                string         `json:"name" binding:"required"`
 	Description         string         `json:"description"`
+	Mode                string         `json:"mode"` // "vector"(默认) 或 "markdown"
 	EmbeddingModelID    string         `json:"embedding_model_id"`
 	EmbeddingDimensions int            `json:"embedding_dimensions"`
 	ChunkingConfig      map[string]any `json:"chunking_config"`
@@ -708,10 +712,21 @@ func (h *Handler) CreateKnowledgeBase(c *gin.Context) {
 		dimensions = h.cfg.Embedding.Dimensions
 	}
 
+	// 确定 KB 模式
+	mode := req.Mode
+	if mode == "" {
+		mode = "vector"
+	}
+	if mode != "vector" && mode != "markdown" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "mode 只能是 'vector' 或 'markdown'"})
+		return
+	}
+
 	kb := &repository.KnowledgeBase{
 		TenantID:            h.getTenantID(c),
 		Name:                req.Name,
 		Description:         req.Description,
+		Mode:                mode,
 		EmbeddingModelID:    embeddingModelID,
 		EmbeddingDimensions: dimensions,
 		ChunkingConfig:      repository.JSON(req.ChunkingConfig),
@@ -842,8 +857,11 @@ func (h *Handler) DeleteKnowledgeBase(c *gin.Context) {
 // @Router /knowledge-bases/{id}/documents [post]
 func (h *Handler) UploadDocument(c *gin.Context) {
 	kbID := c.Param("id")
+	var kb *repository.KnowledgeBase
 	if h.kbRepo != nil {
-		if _, ok := h.ensureKnowledgeBaseAccess(c, kbID); !ok {
+		var ok bool
+		kb, ok = h.ensureKnowledgeBaseAccess(c, kbID)
+		if !ok {
 			return
 		}
 	}
@@ -856,6 +874,12 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 		return
 	}
 	defer file.Close()
+
+	// Markdown 模式: 跳过 embedding，直接存储到 chunks 表
+	if kb != nil && kb.IsMarkdownMode() {
+		h.uploadMarkdownDocument(c, kb, header, file)
+		return
+	}
 
 	if h.importQueue != nil {
 		knowledge, err := h.enqueueFileImport(c.Request.Context(), kbID, header.Filename, header.Size, file)
@@ -1260,6 +1284,95 @@ func inferFileType(filename string) string {
 	return ext
 }
 
+// uploadMarkdownDocument 处理 Markdown 模式的文档上传
+// 分块后直接存入 chunks 表，跳过 embedding 向量化
+func (h *Handler) uploadMarkdownDocument(c *gin.Context, kb *repository.KnowledgeBase, header *multipart.FileHeader, file multipart.File) {
+	kbID := kb.ID
+	ctx := c.Request.Context()
+
+	knowledge, err := h.createKnowledgeRecord(ctx, h.newFileKnowledge(kbID, header.Filename, header.Size, "processing"))
+	if err != nil {
+		h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error(), "filename": header.Filename})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建文档记录失败: " + err.Error()})
+		return
+	}
+
+	content, err := io.ReadAll(file)
+	if err != nil {
+		h.markKnowledgeFailed(ctx, knowledge.ID, 0, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取文件失败: " + err.Error()})
+		return
+	}
+
+	chunkCount, err := h.processMarkdownChunks(ctx, kbID, knowledge.ID, header.Filename, content)
+	if err != nil {
+		h.markKnowledgeFailed(ctx, knowledge.ID, chunkCount, err)
+		h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error(), "filename": header.Filename})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "文档处理失败: " + err.Error()})
+		return
+	}
+
+	h.markKnowledgeCompleted(ctx, knowledge, chunkCount)
+	h.audit(c, "doc.upload", kbID, true, map[string]interface{}{"filename": header.Filename, "chunk_count": chunkCount, "mode": "markdown"})
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":      "文档上传成功（Markdown模式，无向量化）",
+		"chunk_count":  chunkCount,
+		"knowledge_id": knowledge.ID,
+		"mode":         "markdown",
+	})
+}
+
+// processMarkdownChunks 处理 Markdown 模式的文档分块（不做 embedding）
+func (h *Handler) processMarkdownChunks(ctx context.Context, kbID, knowledgeID, filename string, content []byte) (int, error) {
+	rawDoc := &document.RawDocument{
+		ID:      knowledgeID,
+		Source:  filename,
+		Content: string(content),
+		Metadata: map[string]interface{}{
+			"filename":     filename,
+			"size":         len(content),
+			"knowledge_id": knowledgeID,
+		},
+	}
+
+	// Markdown 模式默认使用 markdown 分块策略
+	strategy := h.cfg.RAG.ChunkStrategy
+	if strategy == "semantic" {
+		strategy = "markdown" // 语义分块需要 embedder，降级为 markdown
+	}
+
+	chunker := document.NewChunker(strategy, h.cfg.RAG.ChunkSize, h.cfg.RAG.ChunkOverlap, filename)
+	chunks, err := chunker.Chunk(ctx, rawDoc)
+	if err != nil {
+		return 0, fmt.Errorf("文档分块失败: %w", err)
+	}
+
+	if h.chunkRepo == nil {
+		return 0, fmt.Errorf("chunk repository 未初始化（需要数据库连接）")
+	}
+
+	// 转换为 repository.Chunk 并存入 chunks 表
+	repoChunks := make([]*repository.Chunk, len(chunks))
+	for i, chunk := range chunks {
+		repoChunks[i] = &repository.Chunk{
+			KnowledgeID:     knowledgeID,
+			KnowledgeBaseID: kbID,
+			ChunkIndex:      i,
+			Content:         chunk.Content,
+			ContentLength:   len(chunk.Content),
+			Metadata:        repository.JSON(chunk.Metadata),
+		}
+	}
+
+	if err := h.chunkRepo.BatchCreate(ctx, repoChunks); err != nil {
+		return len(chunks), fmt.Errorf("存储 chunks 失败: %w", err)
+	}
+
+	log.Printf("[Upload] Markdown 模式: %s → %d chunks (无向量化)", filename, len(chunks))
+	return len(chunks), nil
+}
+
 func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeID, filename string, content []byte) (int, error) {
 	rawDoc := &document.RawDocument{
 		ID:      knowledgeID,
@@ -1274,7 +1387,7 @@ func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeI
 
 	// 构建分块器选项（语义分块需要 embedder）
 	var chunkerOpts []document.ChunkerOption
-	if h.cfg.RAG.ChunkStrategy == "semantic" && h.embedding != nil {
+	if (h.cfg.RAG.ChunkStrategy == "semantic" || h.cfg.RAG.ChunkStrategy == "auto") && h.embedding != nil {
 		chunkerOpts = append(chunkerOpts, document.WithEmbedder(h.embedding))
 		if h.cfg.RAG.SemanticSimilarityPct > 0 {
 			chunkerOpts = append(chunkerOpts, document.WithSimilarityPct(h.cfg.RAG.SemanticSimilarityPct))

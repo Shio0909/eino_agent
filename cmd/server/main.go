@@ -325,6 +325,15 @@ func main() {
 		}
 	}
 
+	// 注入 Markdown 检索器（Markdown 模式 KB 使用全文检索替代向量检索）
+	if db != nil {
+		if cr, ok := einoRetriever.(*container.CompositeRetriever); ok {
+			mdRetriever := container.NewMarkdownRetriever(db, cfg.RAG.TopK)
+			cr.SetMarkdownRetriever(mdRetriever)
+			log.Println("[MarkdownRetriever] Markdown 全文检索器已注入 Retriever")
+		}
+	}
+
 	// 创建 HTTP 处理器
 	apiHandler := handler.NewHandler(cfg, *configPath, chatService, embedding, vectorDB, docReaderCli, db, importQueue)
 	apiHandler.SetMCPManager(mcpMgr)
