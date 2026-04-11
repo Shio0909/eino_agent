@@ -35,6 +35,7 @@ type KnowledgeBase struct {
 	TenantID            int       `json:"tenant_id"`
 	Name                string    `json:"name"`
 	Description         string    `json:"description"`
+	Mode                string    `json:"mode"` // "vector"(默认) 或 "wiki"(LLM编译的Wiki知识库)
 	EmbeddingModelID    *string   `json:"embedding_model_id"` // nullable FK → models(id)
 	EmbeddingDimensions int       `json:"embedding_dimensions"`
 	ChunkingConfig      JSON      `json:"chunking_config"`
@@ -43,6 +44,11 @@ type KnowledgeBase struct {
 	ChunkCount          int       `json:"chunk_count"`
 	CreatedAt           time.Time `json:"created_at"`
 	UpdatedAt           time.Time `json:"updated_at"`
+}
+
+// IsWikiMode 是否为 Wiki (Karpathy) 模式
+func (kb *KnowledgeBase) IsWikiMode() bool {
+	return kb.Mode == "wiki"
 }
 
 // Knowledge 知识文档
@@ -215,11 +221,16 @@ func (r *pgKnowledgeBaseRepo) Create(ctx context.Context, kb *KnowledgeBase) err
 	chunkingConfig, _ := json.Marshal(kb.ChunkingConfig)
 	extractConfig, _ := json.Marshal(kb.ExtractConfig)
 
+	mode := kb.Mode
+	if mode == "" {
+		mode = "vector"
+	}
+
 	return r.db.QueryRow(ctx, `
-		INSERT INTO knowledge_bases (tenant_id, name, description, embedding_model_id, embedding_dimensions, chunking_config, extract_config)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO knowledge_bases (tenant_id, name, description, mode, embedding_model_id, embedding_dimensions, chunking_config, extract_config)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING id, created_at, updated_at
-	`, kb.TenantID, kb.Name, kb.Description, kb.EmbeddingModelID, kb.EmbeddingDimensions, chunkingConfig, extractConfig).
+	`, kb.TenantID, kb.Name, kb.Description, mode, kb.EmbeddingModelID, kb.EmbeddingDimensions, chunkingConfig, extractConfig).
 		Scan(&kb.ID, &kb.CreatedAt, &kb.UpdatedAt)
 }
 
@@ -228,11 +239,11 @@ func (r *pgKnowledgeBaseRepo) GetByID(ctx context.Context, id string) (*Knowledg
 	var chunkingConfig, extractConfig []byte
 
 	err := r.db.QueryRow(ctx, `
-		SELECT id, tenant_id, name, description, embedding_model_id, embedding_dimensions, 
+		SELECT id, tenant_id, name, description, mode, embedding_model_id, embedding_dimensions, 
 		       chunking_config, extract_config, document_count, chunk_count, created_at, updated_at
 		FROM knowledge_bases WHERE id = $1 AND deleted_at IS NULL
 	`, id).Scan(
-		&kb.ID, &kb.TenantID, &kb.Name, &kb.Description, &kb.EmbeddingModelID, &kb.EmbeddingDimensions,
+		&kb.ID, &kb.TenantID, &kb.Name, &kb.Description, &kb.Mode, &kb.EmbeddingModelID, &kb.EmbeddingDimensions,
 		&chunkingConfig, &extractConfig, &kb.DocumentCount, &kb.ChunkCount, &kb.CreatedAt, &kb.UpdatedAt,
 	)
 	if err == pgx.ErrNoRows {
@@ -249,7 +260,7 @@ func (r *pgKnowledgeBaseRepo) GetByID(ctx context.Context, id string) (*Knowledg
 
 func (r *pgKnowledgeBaseRepo) List(ctx context.Context, tenantID int, offset, limit int) ([]*KnowledgeBase, error) {
 	rows, err := r.db.Query(ctx, `
-		SELECT id, tenant_id, name, description, embedding_model_id, embedding_dimensions,
+		SELECT id, tenant_id, name, description, mode, embedding_model_id, embedding_dimensions,
 		       chunking_config, extract_config, document_count, chunk_count, created_at, updated_at
 		FROM knowledge_bases WHERE tenant_id = $1 AND deleted_at IS NULL
 		ORDER BY created_at DESC LIMIT $2 OFFSET $3
@@ -264,7 +275,7 @@ func (r *pgKnowledgeBaseRepo) List(ctx context.Context, tenantID int, offset, li
 		kb := &KnowledgeBase{}
 		var chunkingConfig, extractConfig []byte
 		if err := rows.Scan(
-			&kb.ID, &kb.TenantID, &kb.Name, &kb.Description, &kb.EmbeddingModelID, &kb.EmbeddingDimensions,
+			&kb.ID, &kb.TenantID, &kb.Name, &kb.Description, &kb.Mode, &kb.EmbeddingModelID, &kb.EmbeddingDimensions,
 			&chunkingConfig, &extractConfig, &kb.DocumentCount, &kb.ChunkCount, &kb.CreatedAt, &kb.UpdatedAt,
 		); err != nil {
 			return nil, err
@@ -545,6 +556,73 @@ func (r *pgSessionRepo) List(ctx context.Context, tenantID int, userID string, o
 		result = append(result, s)
 	}
 	return result, rows.Err()
+}
+
+// ============================================================================
+// ChunkRepository 实现 (Markdown 模式使用)
+// ============================================================================
+
+type pgChunkRepo struct {
+	db *postgres.DB
+}
+
+// NewChunkRepository 创建文本块仓储
+func NewChunkRepository(db *postgres.DB) ChunkRepository {
+	return &pgChunkRepo{db: db}
+}
+
+func (r *pgChunkRepo) BatchCreate(ctx context.Context, chunks []*Chunk) error {
+	if len(chunks) == 0 {
+		return nil
+	}
+
+	for _, chunk := range chunks {
+		if chunk.ID == "" {
+			chunk.ID = fmt.Sprintf("%s_%d", chunk.KnowledgeID, chunk.ChunkIndex)
+		}
+		metadata, _ := json.Marshal(chunk.Metadata)
+
+		err := r.db.QueryRow(ctx, `
+			INSERT INTO chunks (knowledge_id, knowledge_base_id, chunk_index, content, content_length, metadata)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content, metadata = EXCLUDED.metadata
+			RETURNING id, created_at
+		`, chunk.KnowledgeID, chunk.KnowledgeBaseID, chunk.ChunkIndex, chunk.Content, len(chunk.Content), metadata).
+			Scan(&chunk.ID, &chunk.CreatedAt)
+		if err != nil {
+			return fmt.Errorf("插入 chunk %d 失败: %w", chunk.ChunkIndex, err)
+		}
+	}
+	return nil
+}
+
+func (r *pgChunkRepo) GetByKnowledgeID(ctx context.Context, knowledgeID string) ([]*Chunk, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT id, knowledge_id, knowledge_base_id, chunk_index, content, content_length, metadata, created_at
+		FROM chunks WHERE knowledge_id = $1
+		ORDER BY chunk_index
+	`, knowledgeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []*Chunk
+	for rows.Next() {
+		c := &Chunk{}
+		var metaRaw []byte
+		if err := rows.Scan(&c.ID, &c.KnowledgeID, &c.KnowledgeBaseID, &c.ChunkIndex, &c.Content, &c.ContentLength, &metaRaw, &c.CreatedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal(metaRaw, &c.Metadata)
+		result = append(result, c)
+	}
+	return result, rows.Err()
+}
+
+func (r *pgChunkRepo) DeleteByKnowledgeID(ctx context.Context, knowledgeID string) error {
+	_, err := r.db.Pool().Exec(ctx, `DELETE FROM chunks WHERE knowledge_id = $1`, knowledgeID)
+	return err
 }
 
 func (r *pgSessionRepo) Delete(ctx context.Context, id string) error {

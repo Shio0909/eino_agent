@@ -12,6 +12,7 @@
 - **MCP 工具**：通过 MCP 协议动态挂载远程工具（Streamable HTTP / SSE / Stdio）
 - **Eino Skill**：渐进式披露（Progressive Disclosure）skill 中间件，支持按请求动态选择技能
 - **智能分块**：支持 recursive / markdown / semantic / auto 四种分块策略，可选上下文增强（LLM 生成分块摘要前缀）
+- **Markdown 模式**：知识库可选「纯文本全文检索」模式，无需 embedding 模型，使用 PostgreSQL FTS 检索（适合 Markdown 文档/个人知识库）
 - **记忆系统**：Redis 短期缓存 + PostgreSQL 长期记忆（跨会话）
 - **安全防护**：Prompt Injection 检测 + SSRF 防护（URL 白名单/黑名单）
 - **GraphRAG**：Neo4j 实体关系图谱增强检索（可选）
@@ -197,7 +198,7 @@ curl http://localhost:19093/health
 | `/api/v1/auth/me` | GET | 获取当前用户信息 |
 | `/api/v1/chat` | POST | 聊天（非流式） |
 | `/api/v1/chat/stream` | POST | 聊天（SSE 流式） |
-| `/api/v1/knowledge-bases` | GET/POST | 知识库列表 / 创建 |
+| `/api/v1/knowledge-bases` | GET/POST | 知识库列表 / 创建（支持 mode: vector/markdown） |
 | `/api/v1/knowledge-bases/:id` | GET/PUT/DELETE | 知识库详情 / 更新 / 删除 |
 | `/api/v1/knowledge-bases/:id/documents` | POST/GET | 上传文档 / 文档列表 |
 | `/api/v1/knowledge-bases/:id/documents/url` | POST | 通过 URL 导入文档 |

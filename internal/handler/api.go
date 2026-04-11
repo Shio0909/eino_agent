@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -31,6 +32,7 @@ import (
 	"eino_agent/internal/rediscache"
 	"eino_agent/internal/security"
 	"eino_agent/internal/service"
+	"eino_agent/internal/wiki"
 )
 
 // Handler HTTP 处理器
@@ -52,10 +54,13 @@ type Handler struct {
 	graphRAGService  *graphrag.Service
 	codeGraphRepo    codegraph.CodeGraphRepository
 	codeIndexer      *codegraph.Indexer
+	wikiCompiler     *wiki.Compiler
 
 	// Repositories
 	kbRepo        repository.KnowledgeBaseRepository
 	knowledgeRepo repository.KnowledgeRepository
+	chunkRepo     repository.ChunkRepository
+	wikiRepo      repository.WikiPageRepository
 	embeddingRepo repository.EmbeddingRepository
 	sessionRepo   repository.SessionRepository
 	messageRepo   repository.MessageRepository
@@ -97,6 +102,11 @@ func (h *Handler) SetCodeGraph(repo codegraph.CodeGraphRepository, indexer *code
 	h.codeIndexer = indexer
 }
 
+// SetWikiCompiler 设置 Wiki 编译器（Wiki 模式 KB 上传时使用）
+func (h *Handler) SetWikiCompiler(compiler *wiki.Compiler) {
+	h.wikiCompiler = compiler
+}
+
 // NewHandler 创建新的处理器
 func NewHandler(
 	cfg *config.Config,
@@ -135,6 +145,8 @@ func NewHandler(
 	if db != nil {
 		h.kbRepo = repository.NewKnowledgeBaseRepository(db)
 		h.knowledgeRepo = repository.NewKnowledgeRepository(db)
+		h.chunkRepo = repository.NewChunkRepository(db)
+		h.wikiRepo = repository.NewWikiPageRepository(db)
 		h.embeddingRepo = repository.NewEmbeddingRepository(db)
 		h.sessionRepo = repository.NewSessionRepository(db)
 		h.messageRepo = repository.NewMessageRepository(db)
@@ -644,6 +656,7 @@ func (h *Handler) evaluatePromptRisk(input string) security.PromptDecision {
 type KnowledgeBaseRequest struct {
 	Name                string         `json:"name" binding:"required"`
 	Description         string         `json:"description"`
+	Mode                string         `json:"mode"` // "vector"(默认) 或 "wiki"(LLM编译Wiki)
 	EmbeddingModelID    string         `json:"embedding_model_id"`
 	EmbeddingDimensions int            `json:"embedding_dimensions"`
 	ChunkingConfig      map[string]any `json:"chunking_config"`
@@ -708,10 +721,21 @@ func (h *Handler) CreateKnowledgeBase(c *gin.Context) {
 		dimensions = h.cfg.Embedding.Dimensions
 	}
 
+	// 确定 KB 模式
+	mode := req.Mode
+	if mode == "" {
+		mode = "vector"
+	}
+	if mode != "vector" && mode != "wiki" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "mode 只能是 'vector' 或 'wiki'"})
+		return
+	}
+
 	kb := &repository.KnowledgeBase{
 		TenantID:            h.getTenantID(c),
 		Name:                req.Name,
 		Description:         req.Description,
+		Mode:                mode,
 		EmbeddingModelID:    embeddingModelID,
 		EmbeddingDimensions: dimensions,
 		ChunkingConfig:      repository.JSON(req.ChunkingConfig),
@@ -842,8 +866,11 @@ func (h *Handler) DeleteKnowledgeBase(c *gin.Context) {
 // @Router /knowledge-bases/{id}/documents [post]
 func (h *Handler) UploadDocument(c *gin.Context) {
 	kbID := c.Param("id")
+	var kb *repository.KnowledgeBase
 	if h.kbRepo != nil {
-		if _, ok := h.ensureKnowledgeBaseAccess(c, kbID); !ok {
+		var ok bool
+		kb, ok = h.ensureKnowledgeBaseAccess(c, kbID)
+		if !ok {
 			return
 		}
 	}
@@ -856,6 +883,12 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 		return
 	}
 	defer file.Close()
+
+	// Wiki 模式: LLM 编译为结构化 wiki 页面
+	if kb != nil && kb.IsWikiMode() {
+		h.uploadWikiDocument(c, kb, header, file)
+		return
+	}
 
 	if h.importQueue != nil {
 		knowledge, err := h.enqueueFileImport(c.Request.Context(), kbID, header.Filename, header.Size, file)
@@ -1260,6 +1293,58 @@ func inferFileType(filename string) string {
 	return ext
 }
 
+// uploadWikiDocument 处理 Wiki 模式的文档上传
+// LLM 将原始文档编译为结构化 wiki 页面，存入 wiki_pages 表
+func (h *Handler) uploadWikiDocument(c *gin.Context, kb *repository.KnowledgeBase, header *multipart.FileHeader, file multipart.File) {
+	kbID := kb.ID
+	ctx := c.Request.Context()
+
+	knowledge, err := h.createKnowledgeRecord(ctx, h.newFileKnowledge(kbID, header.Filename, header.Size, "processing"))
+	if err != nil {
+		h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error(), "filename": header.Filename})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建文档记录失败: " + err.Error()})
+		return
+	}
+
+	content, err := io.ReadAll(file)
+	if err != nil {
+		h.markKnowledgeFailed(ctx, knowledge.ID, 0, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取文件失败: " + err.Error()})
+		return
+	}
+
+	if h.wikiCompiler == nil {
+		h.markKnowledgeFailed(ctx, knowledge.ID, 0, fmt.Errorf("wiki compiler 未初始化"))
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Wiki 编译器未初始化（需要 LLM 配置）"})
+		return
+	}
+
+	result, err := h.wikiCompiler.Compile(ctx, kbID, knowledge.ID, header.Filename, string(content))
+	if err != nil {
+		h.markKnowledgeFailed(ctx, knowledge.ID, 0, err)
+		h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error(), "filename": header.Filename})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Wiki 编译失败: " + err.Error()})
+		return
+	}
+
+	pageCount := len(result.Pages)
+	h.markKnowledgeCompleted(ctx, knowledge, pageCount)
+	h.audit(c, "doc.upload", kbID, true, map[string]interface{}{
+		"filename":   header.Filename,
+		"page_count": pageCount,
+		"link_count": result.LinkCount,
+		"mode":       "wiki",
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":      "文档上传成功（Wiki模式，LLM已编译为结构化知识页面）",
+		"page_count":   pageCount,
+		"link_count":   result.LinkCount,
+		"knowledge_id": knowledge.ID,
+		"mode":         "wiki",
+	})
+}
+
 func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeID, filename string, content []byte) (int, error) {
 	rawDoc := &document.RawDocument{
 		ID:      knowledgeID,
@@ -1274,7 +1359,7 @@ func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeI
 
 	// 构建分块器选项（语义分块需要 embedder）
 	var chunkerOpts []document.ChunkerOption
-	if h.cfg.RAG.ChunkStrategy == "semantic" && h.embedding != nil {
+	if (h.cfg.RAG.ChunkStrategy == "semantic" || h.cfg.RAG.ChunkStrategy == "auto") && h.embedding != nil {
 		chunkerOpts = append(chunkerOpts, document.WithEmbedder(h.embedding))
 		if h.cfg.RAG.SemanticSimilarityPct > 0 {
 			chunkerOpts = append(chunkerOpts, document.WithSimilarityPct(h.cfg.RAG.SemanticSimilarityPct))

@@ -50,8 +50,11 @@ rag:
     retrieval_cache_ttl_minutes: 10
     chunk_size: 512
     chunk_overlap: 50
-    chunk_strategy: auto  # recursive, markdown, auto(根据文件类型自动选择)
+    chunk_strategy: auto  # recursive, markdown, auto(根据文件类型自动选择), semantic
     documents_path: ./data/documents
+    # 知识库模式说明:
+    # 创建 KB 时可指定 mode: "vector"(默认，使用 embedding 向量检索) 或 "markdown"(纯文本全文检索，无需 embedding)
+    # markdown 模式适合: 个人知识库、Markdown 文档、不需要语义检索的场景
 agent:
     enabled: true
     system_prompt: |
