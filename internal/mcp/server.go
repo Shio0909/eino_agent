@@ -24,11 +24,16 @@ import (
 	"eino_agent/internal/service"
 )
 
+// chatProvider 定义 MCP Server 需要的聊天能力（用于解耦和测试）
+type chatProvider interface {
+	Chat(ctx context.Context, req *service.ChatRequest) (*service.ChatResponse, error)
+}
+
 // Server 封装 MCP Server，暴露项目核心能力
 type Server struct {
 	mcpSrv  *mcpServer.MCPServer
 	config  *config.Config
-	chatSvc *service.ChatService
+	chatSvc chatProvider
 	kbRepo  repository.KnowledgeBaseRepository
 }
 
