@@ -167,6 +167,10 @@ mcp_export:
     enabled: false
     transport: streamable_http  # sse / streamable_http / stdio
     address: ":19094"
+    api_keys: []  # 可选: 配置后需要 Authorization: Bearer <key> 或 X-API-Key: <key> 认证
+    # api_keys:
+    #   - "sk-your-secret-key-1"
+    #   - "sk-your-secret-key-2"
 graphrag:
     enabled: false
     neo4j_uri: bolt://localhost:7687

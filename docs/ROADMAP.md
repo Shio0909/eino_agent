@@ -55,7 +55,7 @@
 - [x] **Phase 2 扩展**：`get_knowledge_base`、`code_search`、`graphrag_query`、`code_graph_query` 四个工具
 - [x] **依赖注入**：Setter 模式注入可选依赖 + Init() 延迟注册
 - [x] **测试**：32 个单元测试覆盖全部 7 个工具
-- [ ] **认证**：MCP 请求的 API Key / JWT 认证
+- [x] **认证**：API Key 认证（Bearer Token / X-API-Key），支持多 Key 配置
 - [ ] **README / 接入文档**：Claude Desktop / Cursor 接入配置示例
 
 ### 已有基础可快速推进

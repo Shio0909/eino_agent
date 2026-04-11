@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"strings"
 
 	mcpProto "github.com/mark3labs/mcp-go/mcp"
@@ -27,6 +28,11 @@ import (
 	"eino_agent/internal/graphrag"
 	"eino_agent/internal/service"
 )
+
+// contextKey 用于在 context 中传递认证信息
+type contextKey string
+
+const ctxKeyAuthenticated contextKey = "mcp_authenticated"
 
 // chatProvider 定义 MCP Server 需要的聊天能力（用于解耦和测试）
 type chatProvider interface {
@@ -52,6 +58,7 @@ type Server struct {
 	codeTool  codeSearchProvider  // 可选：代码搜索工具
 	graphRAG  graphRAGProvider    // 可选：GraphRAG 服务
 	codeGraph codegraph.CodeGraphRepository // 可选：代码知识图谱
+	apiKeySet map[string]struct{} // 已配置的 API Key 集合，为空则不验证
 }
 
 // NewServer 创建 MCP Server
@@ -62,10 +69,36 @@ func NewServer(cfg *config.Config, chatSvc *service.ChatService, kbRepo reposito
 		kbRepo:  kbRepo,
 	}
 
+	opts := []mcpServer.ServerOption{
+		mcpServer.WithToolCapabilities(false),
+	}
+
+	// 如果配置了 API Keys，添加认证中间件
+	if len(cfg.MCPExport.APIKeys) > 0 {
+		keySet := make(map[string]struct{}, len(cfg.MCPExport.APIKeys))
+		for _, k := range cfg.MCPExport.APIKeys {
+			keySet[k] = struct{}{}
+		}
+
+		opts = append(opts, mcpServer.WithToolHandlerMiddleware(
+			func(next mcpServer.ToolHandlerFunc) mcpServer.ToolHandlerFunc {
+				return func(ctx context.Context, request mcpProto.CallToolRequest) (*mcpProto.CallToolResult, error) {
+					authenticated, _ := ctx.Value(ctxKeyAuthenticated).(bool)
+					if !authenticated {
+						return mcpProto.NewToolResultError("认证失败：缺少有效的 API Key"), nil
+					}
+					return next(ctx, request)
+				}
+			},
+		))
+
+		s.apiKeySet = keySet
+	}
+
 	s.mcpSrv = mcpServer.NewMCPServer(
 		"eino-rag-agent",
 		"1.0.0",
-		mcpServer.WithToolCapabilities(false),
+		opts...,
 	)
 
 	return s
@@ -525,22 +558,58 @@ func (s *Server) MCPServer() *mcpServer.MCPServer {
 	return s.mcpSrv
 }
 
+// extractAPIKey 从 HTTP 请求中提取 API Key
+// 支持 Authorization: Bearer <key> 和 X-API-Key: <key> 两种方式
+func (s *Server) extractAPIKey(r *http.Request) string {
+	// 优先检查 Authorization header
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "Bearer ") {
+		return strings.TrimPrefix(auth, "Bearer ")
+	}
+	// 其次检查 X-API-Key header
+	if key := r.Header.Get("X-API-Key"); key != "" {
+		return key
+	}
+	return ""
+}
+
+// httpContextFunc 创建用于 HTTP 传输的 context 注入函数
+func (s *Server) httpContextFunc() func(ctx context.Context, r *http.Request) context.Context {
+	return func(ctx context.Context, r *http.Request) context.Context {
+		if len(s.apiKeySet) == 0 {
+			// 未配置 API Keys，放行所有请求
+			return context.WithValue(ctx, ctxKeyAuthenticated, true)
+		}
+		key := s.extractAPIKey(r)
+		_, valid := s.apiKeySet[key]
+		return context.WithValue(ctx, ctxKeyAuthenticated, valid)
+	}
+}
+
 // ServeSSE 启动 SSE 传输的 MCP Server
 func (s *Server) ServeSSE(addr string) error {
-	sseServer := mcpServer.NewSSEServer(s.mcpSrv)
-	log.Printf("[MCP Server] SSE 模式启动于 %s", addr)
+	opts := []mcpServer.SSEOption{}
+	if len(s.apiKeySet) > 0 {
+		opts = append(opts, mcpServer.WithSSEContextFunc(s.httpContextFunc()))
+	}
+	sseServer := mcpServer.NewSSEServer(s.mcpSrv, opts...)
+	log.Printf("[MCP Server] SSE 模式启动于 %s (认证: %v)", addr, len(s.apiKeySet) > 0)
 	return sseServer.Start(addr)
 }
 
 // ServeStreamableHTTP 启动 Streamable HTTP 传输的 MCP Server
 func (s *Server) ServeStreamableHTTP(addr string) error {
-	httpServer := mcpServer.NewStreamableHTTPServer(s.mcpSrv)
-	log.Printf("[MCP Server] Streamable HTTP 模式启动于 %s", addr)
+	opts := []mcpServer.StreamableHTTPOption{}
+	if len(s.apiKeySet) > 0 {
+		opts = append(opts, mcpServer.WithHTTPContextFunc(s.httpContextFunc()))
+	}
+	httpServer := mcpServer.NewStreamableHTTPServer(s.mcpSrv, opts...)
+	log.Printf("[MCP Server] Streamable HTTP 模式启动于 %s (认证: %v)", addr, len(s.apiKeySet) > 0)
 	return httpServer.Start(addr)
 }
 
-// ServeStdio 以 Stdio 模式启动 MCP Server
+// ServeStdio 以 Stdio 模式启动 MCP Server（本地进程，跳过认证）
 func (s *Server) ServeStdio() error {
-	log.Printf("[MCP Server] Stdio 模式启动")
+	log.Printf("[MCP Server] Stdio 模式启动（本地模式，无认证）")
 	return mcpServer.ServeStdio(s.mcpSrv)
 }

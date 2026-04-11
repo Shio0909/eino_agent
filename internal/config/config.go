@@ -269,9 +269,10 @@ type MCPConfig struct {
 
 // MCPExportConfig MCP Server 导出配置（将项目能力暴露给外部 Agent）
 type MCPExportConfig struct {
-	Enabled   bool   `yaml:"enabled"`
-	Transport string `yaml:"transport"` // sse / streamable_http / stdio
-	Address   string `yaml:"address"`   // 监听地址，如 :19094
+	Enabled   bool     `yaml:"enabled"`
+	Transport string   `yaml:"transport"` // sse / streamable_http / stdio
+	Address   string   `yaml:"address"`   // 监听地址，如 :19094
+	APIKeys   []string `yaml:"api_keys"`  // 可选：允许访问的 API Key 列表，为空则不验证
 }
 
 // MCPServerConfig 单个 MCP 服务器配置

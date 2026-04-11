@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"testing"
 
 	mcpProto "github.com/mark3labs/mcp-go/mcp"
@@ -737,6 +738,113 @@ func TestHandleCodeGraphQuery_UnknownAction(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	assertToolError(t, result, "未知操作")
+}
+
+// ---- 认证中间件测试 ----
+
+func TestExtractAPIKey_BearerToken(t *testing.T) {
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+
+	r, _ := http.NewRequest("POST", "/mcp", nil)
+	r.Header.Set("Authorization", "Bearer sk-test-123")
+
+	key := s.extractAPIKey(r)
+	if key != "sk-test-123" {
+		t.Errorf("got %q, want %q", key, "sk-test-123")
+	}
+}
+
+func TestExtractAPIKey_XAPIKey(t *testing.T) {
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+
+	r, _ := http.NewRequest("POST", "/mcp", nil)
+	r.Header.Set("X-API-Key", "my-key-456")
+
+	key := s.extractAPIKey(r)
+	if key != "my-key-456" {
+		t.Errorf("got %q, want %q", key, "my-key-456")
+	}
+}
+
+func TestExtractAPIKey_BearerPriority(t *testing.T) {
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+
+	r, _ := http.NewRequest("POST", "/mcp", nil)
+	r.Header.Set("Authorization", "Bearer bearer-key")
+	r.Header.Set("X-API-Key", "xapi-key")
+
+	key := s.extractAPIKey(r)
+	if key != "bearer-key" {
+		t.Errorf("Bearer should take priority, got %q", key)
+	}
+}
+
+func TestExtractAPIKey_NoHeader(t *testing.T) {
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+
+	r, _ := http.NewRequest("POST", "/mcp", nil)
+	key := s.extractAPIKey(r)
+	if key != "" {
+		t.Errorf("got %q, want empty string", key)
+	}
+}
+
+func TestHTTPContextFunc_NoAPIKeys(t *testing.T) {
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	// apiKeySet 为空，所有请求都应认证通过
+
+	ctxFunc := s.httpContextFunc()
+	r, _ := http.NewRequest("POST", "/mcp", nil)
+	ctx := ctxFunc(context.Background(), r)
+
+	authenticated, _ := ctx.Value(ctxKeyAuthenticated).(bool)
+	if !authenticated {
+		t.Error("should be authenticated when no API keys configured")
+	}
+}
+
+func TestHTTPContextFunc_ValidKey(t *testing.T) {
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	s.apiKeySet = map[string]struct{}{"valid-key": {}}
+
+	ctxFunc := s.httpContextFunc()
+	r, _ := http.NewRequest("POST", "/mcp", nil)
+	r.Header.Set("Authorization", "Bearer valid-key")
+	ctx := ctxFunc(context.Background(), r)
+
+	authenticated, _ := ctx.Value(ctxKeyAuthenticated).(bool)
+	if !authenticated {
+		t.Error("should be authenticated with valid key")
+	}
+}
+
+func TestHTTPContextFunc_InvalidKey(t *testing.T) {
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	s.apiKeySet = map[string]struct{}{"valid-key": {}}
+
+	ctxFunc := s.httpContextFunc()
+	r, _ := http.NewRequest("POST", "/mcp", nil)
+	r.Header.Set("Authorization", "Bearer wrong-key")
+	ctx := ctxFunc(context.Background(), r)
+
+	authenticated, _ := ctx.Value(ctxKeyAuthenticated).(bool)
+	if authenticated {
+		t.Error("should NOT be authenticated with invalid key")
+	}
+}
+
+func TestHTTPContextFunc_MissingKey(t *testing.T) {
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	s.apiKeySet = map[string]struct{}{"valid-key": {}}
+
+	ctxFunc := s.httpContextFunc()
+	r, _ := http.NewRequest("POST", "/mcp", nil)
+	ctx := ctxFunc(context.Background(), r)
+
+	authenticated, _ := ctx.Value(ctxKeyAuthenticated).(bool)
+	if authenticated {
+		t.Error("should NOT be authenticated without any key")
+	}
 }
 
 // ---- 断言工具函数 ----
