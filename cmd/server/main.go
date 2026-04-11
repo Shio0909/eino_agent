@@ -43,6 +43,8 @@ import (
 	mcpmanager "eino_agent/internal/mcp"
 	"eino_agent/internal/rediscache"
 	"eino_agent/internal/service"
+	"eino_agent/internal/wiki"
+	"eino_agent/internal/database/repository"
 )
 
 func main() {
@@ -325,13 +327,21 @@ func main() {
 		}
 	}
 
-	// 注入 Markdown 检索器（Markdown 模式 KB 使用全文检索替代向量检索）
+	// 注入 Wiki 检索器（Wiki 模式 KB 使用 LLM 编译 + wiki 页面检索）
+	var wikiCompiler *wiki.Compiler
 	if db != nil {
+		wikiRepo := repository.NewWikiPageRepository(db)
+
+		// Wiki 检索器注入到 CompositeRetriever
 		if cr, ok := einoRetriever.(*container.CompositeRetriever); ok {
-			mdRetriever := container.NewMarkdownRetriever(db, cfg.RAG.TopK)
-			cr.SetMarkdownRetriever(mdRetriever)
-			log.Println("[MarkdownRetriever] Markdown 全文检索器已注入 Retriever")
+			wikiRetriever := container.NewWikiRetriever(wikiRepo, cfg.RAG.TopK)
+			cr.SetWikiRetriever(wikiRetriever)
+			log.Println("[WikiRetriever] Wiki 页面检索器已注入 Retriever")
 		}
+
+		// 创建 Wiki 编译器（后续注入到 Handler）
+		wikiCompiler = wiki.NewCompiler(chatModel, wikiRepo)
+		log.Println("[WikiCompiler] Wiki 编译器已创建")
 	}
 
 	// 创建 HTTP 处理器
@@ -343,6 +353,9 @@ func main() {
 	apiHandler.SetImportStateStore(importStateStore)
 	if graphRAGService != nil {
 		apiHandler.SetGraphRAGService(graphRAGService)
+	}
+	if wikiCompiler != nil {
+		apiHandler.SetWikiCompiler(wikiCompiler)
 	}
 
 	// 初始化代码知识图谱（复用 GraphRAG 的 Neo4j 连接）

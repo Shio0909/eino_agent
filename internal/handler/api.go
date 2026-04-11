@@ -32,6 +32,7 @@ import (
 	"eino_agent/internal/rediscache"
 	"eino_agent/internal/security"
 	"eino_agent/internal/service"
+	"eino_agent/internal/wiki"
 )
 
 // Handler HTTP 处理器
@@ -53,11 +54,13 @@ type Handler struct {
 	graphRAGService  *graphrag.Service
 	codeGraphRepo    codegraph.CodeGraphRepository
 	codeIndexer      *codegraph.Indexer
+	wikiCompiler     *wiki.Compiler
 
 	// Repositories
 	kbRepo        repository.KnowledgeBaseRepository
 	knowledgeRepo repository.KnowledgeRepository
 	chunkRepo     repository.ChunkRepository
+	wikiRepo      repository.WikiPageRepository
 	embeddingRepo repository.EmbeddingRepository
 	sessionRepo   repository.SessionRepository
 	messageRepo   repository.MessageRepository
@@ -99,6 +102,11 @@ func (h *Handler) SetCodeGraph(repo codegraph.CodeGraphRepository, indexer *code
 	h.codeIndexer = indexer
 }
 
+// SetWikiCompiler 设置 Wiki 编译器（Wiki 模式 KB 上传时使用）
+func (h *Handler) SetWikiCompiler(compiler *wiki.Compiler) {
+	h.wikiCompiler = compiler
+}
+
 // NewHandler 创建新的处理器
 func NewHandler(
 	cfg *config.Config,
@@ -138,6 +146,7 @@ func NewHandler(
 		h.kbRepo = repository.NewKnowledgeBaseRepository(db)
 		h.knowledgeRepo = repository.NewKnowledgeRepository(db)
 		h.chunkRepo = repository.NewChunkRepository(db)
+		h.wikiRepo = repository.NewWikiPageRepository(db)
 		h.embeddingRepo = repository.NewEmbeddingRepository(db)
 		h.sessionRepo = repository.NewSessionRepository(db)
 		h.messageRepo = repository.NewMessageRepository(db)
@@ -647,7 +656,7 @@ func (h *Handler) evaluatePromptRisk(input string) security.PromptDecision {
 type KnowledgeBaseRequest struct {
 	Name                string         `json:"name" binding:"required"`
 	Description         string         `json:"description"`
-	Mode                string         `json:"mode"` // "vector"(默认) 或 "markdown"
+	Mode                string         `json:"mode"` // "vector"(默认) 或 "wiki"(LLM编译Wiki)
 	EmbeddingModelID    string         `json:"embedding_model_id"`
 	EmbeddingDimensions int            `json:"embedding_dimensions"`
 	ChunkingConfig      map[string]any `json:"chunking_config"`
@@ -717,8 +726,8 @@ func (h *Handler) CreateKnowledgeBase(c *gin.Context) {
 	if mode == "" {
 		mode = "vector"
 	}
-	if mode != "vector" && mode != "markdown" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "mode 只能是 'vector' 或 'markdown'"})
+	if mode != "vector" && mode != "wiki" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "mode 只能是 'vector' 或 'wiki'"})
 		return
 	}
 
@@ -875,9 +884,9 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 	}
 	defer file.Close()
 
-	// Markdown 模式: 跳过 embedding，直接存储到 chunks 表
-	if kb != nil && kb.IsMarkdownMode() {
-		h.uploadMarkdownDocument(c, kb, header, file)
+	// Wiki 模式: LLM 编译为结构化 wiki 页面
+	if kb != nil && kb.IsWikiMode() {
+		h.uploadWikiDocument(c, kb, header, file)
 		return
 	}
 
@@ -1284,9 +1293,9 @@ func inferFileType(filename string) string {
 	return ext
 }
 
-// uploadMarkdownDocument 处理 Markdown 模式的文档上传
-// 分块后直接存入 chunks 表，跳过 embedding 向量化
-func (h *Handler) uploadMarkdownDocument(c *gin.Context, kb *repository.KnowledgeBase, header *multipart.FileHeader, file multipart.File) {
+// uploadWikiDocument 处理 Wiki 模式的文档上传
+// LLM 将原始文档编译为结构化 wiki 页面，存入 wiki_pages 表
+func (h *Handler) uploadWikiDocument(c *gin.Context, kb *repository.KnowledgeBase, header *multipart.FileHeader, file multipart.File) {
 	kbID := kb.ID
 	ctx := c.Request.Context()
 
@@ -1304,73 +1313,36 @@ func (h *Handler) uploadMarkdownDocument(c *gin.Context, kb *repository.Knowledg
 		return
 	}
 
-	chunkCount, err := h.processMarkdownChunks(ctx, kbID, knowledge.ID, header.Filename, content)
-	if err != nil {
-		h.markKnowledgeFailed(ctx, knowledge.ID, chunkCount, err)
-		h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error(), "filename": header.Filename})
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "文档处理失败: " + err.Error()})
+	if h.wikiCompiler == nil {
+		h.markKnowledgeFailed(ctx, knowledge.ID, 0, fmt.Errorf("wiki compiler 未初始化"))
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Wiki 编译器未初始化（需要 LLM 配置）"})
 		return
 	}
 
-	h.markKnowledgeCompleted(ctx, knowledge, chunkCount)
-	h.audit(c, "doc.upload", kbID, true, map[string]interface{}{"filename": header.Filename, "chunk_count": chunkCount, "mode": "markdown"})
+	result, err := h.wikiCompiler.Compile(ctx, kbID, knowledge.ID, header.Filename, string(content))
+	if err != nil {
+		h.markKnowledgeFailed(ctx, knowledge.ID, 0, err)
+		h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error(), "filename": header.Filename})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Wiki 编译失败: " + err.Error()})
+		return
+	}
+
+	pageCount := len(result.Pages)
+	h.markKnowledgeCompleted(ctx, knowledge, pageCount)
+	h.audit(c, "doc.upload", kbID, true, map[string]interface{}{
+		"filename":   header.Filename,
+		"page_count": pageCount,
+		"link_count": result.LinkCount,
+		"mode":       "wiki",
+	})
 
 	c.JSON(http.StatusOK, gin.H{
-		"message":      "文档上传成功（Markdown模式，无向量化）",
-		"chunk_count":  chunkCount,
+		"message":      "文档上传成功（Wiki模式，LLM已编译为结构化知识页面）",
+		"page_count":   pageCount,
+		"link_count":   result.LinkCount,
 		"knowledge_id": knowledge.ID,
-		"mode":         "markdown",
+		"mode":         "wiki",
 	})
-}
-
-// processMarkdownChunks 处理 Markdown 模式的文档分块（不做 embedding）
-func (h *Handler) processMarkdownChunks(ctx context.Context, kbID, knowledgeID, filename string, content []byte) (int, error) {
-	rawDoc := &document.RawDocument{
-		ID:      knowledgeID,
-		Source:  filename,
-		Content: string(content),
-		Metadata: map[string]interface{}{
-			"filename":     filename,
-			"size":         len(content),
-			"knowledge_id": knowledgeID,
-		},
-	}
-
-	// Markdown 模式默认使用 markdown 分块策略
-	strategy := h.cfg.RAG.ChunkStrategy
-	if strategy == "semantic" {
-		strategy = "markdown" // 语义分块需要 embedder，降级为 markdown
-	}
-
-	chunker := document.NewChunker(strategy, h.cfg.RAG.ChunkSize, h.cfg.RAG.ChunkOverlap, filename)
-	chunks, err := chunker.Chunk(ctx, rawDoc)
-	if err != nil {
-		return 0, fmt.Errorf("文档分块失败: %w", err)
-	}
-
-	if h.chunkRepo == nil {
-		return 0, fmt.Errorf("chunk repository 未初始化（需要数据库连接）")
-	}
-
-	// 转换为 repository.Chunk 并存入 chunks 表
-	repoChunks := make([]*repository.Chunk, len(chunks))
-	for i, chunk := range chunks {
-		repoChunks[i] = &repository.Chunk{
-			KnowledgeID:     knowledgeID,
-			KnowledgeBaseID: kbID,
-			ChunkIndex:      i,
-			Content:         chunk.Content,
-			ContentLength:   len(chunk.Content),
-			Metadata:        repository.JSON(chunk.Metadata),
-		}
-	}
-
-	if err := h.chunkRepo.BatchCreate(ctx, repoChunks); err != nil {
-		return len(chunks), fmt.Errorf("存储 chunks 失败: %w", err)
-	}
-
-	log.Printf("[Upload] Markdown 模式: %s → %d chunks (无向量化)", filename, len(chunks))
-	return len(chunks), nil
 }
 
 func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeID, filename string, content []byte) (int, error) {

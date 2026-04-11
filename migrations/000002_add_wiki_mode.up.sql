@@ -1,8 +1,8 @@
--- 为知识库添加 mode 字段，支持 markdown 纯文本模式（无需 embedding）
+-- 为知识库添加 mode 字段，支持 wiki 模式（LLM编译知识）
 ALTER TABLE knowledge_bases
     ADD COLUMN IF NOT EXISTS mode VARCHAR(20) DEFAULT 'vector' NOT NULL;
 
-COMMENT ON COLUMN knowledge_bases.mode IS '知识库模式: vector(向量检索) / markdown(全文检索，无需embedding)';
+COMMENT ON COLUMN knowledge_bases.mode IS '知识库模式: vector(向量检索) / wiki(LLM编译Wiki知识库)';
 
 -- 为 chunks 表添加全文搜索索引（markdown 模式使用）
 CREATE INDEX IF NOT EXISTS idx_chunks_content_fts

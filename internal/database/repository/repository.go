@@ -35,7 +35,7 @@ type KnowledgeBase struct {
 	TenantID            int       `json:"tenant_id"`
 	Name                string    `json:"name"`
 	Description         string    `json:"description"`
-	Mode                string    `json:"mode"` // "vector"(默认) 或 "markdown"(纯文本全文检索)
+	Mode                string    `json:"mode"` // "vector"(默认) 或 "wiki"(LLM编译的Wiki知识库)
 	EmbeddingModelID    *string   `json:"embedding_model_id"` // nullable FK → models(id)
 	EmbeddingDimensions int       `json:"embedding_dimensions"`
 	ChunkingConfig      JSON      `json:"chunking_config"`
@@ -46,9 +46,9 @@ type KnowledgeBase struct {
 	UpdatedAt           time.Time `json:"updated_at"`
 }
 
-// IsMarkdownMode 是否为 Markdown 纯文本模式
-func (kb *KnowledgeBase) IsMarkdownMode() bool {
-	return kb.Mode == "markdown"
+// IsWikiMode 是否为 Wiki (Karpathy) 模式
+func (kb *KnowledgeBase) IsWikiMode() bool {
+	return kb.Mode == "wiki"
 }
 
 // Knowledge 知识文档
