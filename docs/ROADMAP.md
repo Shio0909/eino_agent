@@ -4,29 +4,27 @@
 
 ---
 
-## 一、Markdown 模式增强（当前分支：feat/markdown-kb-mode）
+## 一、Wiki 模式（当前分支：feat/markdown-kb-mode）
 
-### 已完成（MVP）
-- [x] 知识库 `mode` 字段（`vector` / `markdown`）
-- [x] Markdown 模式上传跳过 embedding，存入 `chunks` 表
-- [x] `MarkdownRetriever` 基于 PostgreSQL FTS 检索
-- [x] `ChunkRepository` 实现（之前只有接口定义）
-- [x] 数据库迁移 `000002_add_wiki_mode`
+### 已完成
+- [x] 知识库 `mode` 字段（`vector` / `wiki`）
+- [x] 数据库迁移 `000002_add_wiki_mode` + `000003_add_wiki_pages`
+- [x] `wiki_pages` + `wiki_links` 表（FTS 索引、交叉引用）
+- [x] `WikiPageRepository`：页面 UPSERT、FTS 搜索、链接解析
+- [x] `WikiCompiler`：LLM 编译原始文档为结构化 wiki 页面 + 自动生成 index.md
+- [x] `WikiRetriever`：FTS + 交叉引用扩展检索
+- [x] `[[wiki link]]` 解析器与渲染器
+- [x] API 端 wiki 上传流程（替代原 markdown 上传）
+- [x] 删除旧 markdown 模式（MarkdownRetriever、ChunkRepository）
 
 ### 待开发
-- [ ] **前端 KB 创建表单**：添加模式选择器（vector / markdown）
-- [ ] **前端文档上传反馈**：显示 "Markdown 模式，无需向量化"
+- [ ] **前端 KB 创建表单**：添加模式选择器（vector / wiki）
+- [ ] **前端文档上传反馈**：显示 "Wiki 模式，LLM 编译中"
 - [ ] **KB 详情页显示模式**：列表和详情页展示当前 KB 模式
-- [ ] **混合检索优化**：当 session 绑定多个 KB（vector + markdown 混合）时，自动按 KB 模式路由到对应检索器
-- [ ] **Markdown 检索增强**：支持中文分词（jieba/gojieba），替代 PostgreSQL `simple` 配置
-
-### 远期：Karpathy LLM Wiki 模式
-核心思想：让 LLM **主动构建并维护**一个 Markdown Wiki，而非被动检索碎片。
-
-- [ ] **Ingest 增强**：上传文档时 LLM 自动生成摘要页、更新实体页和索引
-- [ ] **Wiki 索引页**：自动生成 `index.md`，LLM 通过索引导航查询
-- [ ] **交叉引用**：解析 `[[wiki links]]`，检索时自动扩展关联页面
-- [ ] **Lint 操作**：定期让 LLM 检查 wiki 健康度（矛盾、过时、孤岛页面）
+- [ ] **Wiki 页面浏览器**：前端展示 wiki 页面树、交叉引用导航
+- [ ] **混合检索优化**：当 session 绑定多个 KB（vector + wiki 混合）时，自动按 KB 模式路由到对应检索器
+- [ ] **中文分词增强**：替代 PostgreSQL `simple` 配置，支持 jieba 分词
+- [ ] **Wiki Lint 操作**：定期让 LLM 检查 wiki 健康度（矛盾、过时、孤岛页面）
 - [ ] **Query 结果回写**：好的回答可以反写回 wiki 作为新知识
 
 ---
@@ -95,9 +93,9 @@
 
 | 优先级 | 方向 | 理由 |
 |--------|------|------|
-| 🔴 高 | Markdown 模式前端 | MVP 后端已完成，需要前端界面才能使用 |
+| 🔴 高 | Wiki 模式前端 | 后端已完成，需要前端界面才能使用 |
 | 🔴 高 | 集成测试 | 当前零测试覆盖，重构风险高 |
 | 🟡 中 | 工具层类型安全 | 减少 900+ 行样板代码，提升开发效率 |
 | 🟡 中 | 检索指标监控 | 无法量化检索质量，优化无据可依 |
-| 🟢 低 | Karpathy Wiki 模式 | 理念有趣但 ROI 不确定 |
+| 🟡 中 | Wiki Lint / 回写 | 提升 wiki 知识质量的闭环机制 |
 | 🟢 低 | 框架替换 | 沉没成本已付，替换收益边际递减 |
