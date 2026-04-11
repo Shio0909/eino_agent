@@ -163,6 +163,10 @@ mcp:
           api_key_header: Authorization
           api_key_prefix: Bearer
           tool_names: []
+mcp_export:
+    enabled: false
+    transport: streamable_http  # sse / streamable_http / stdio
+    address: ":19094"
 graphrag:
     enabled: false
     neo4j_uri: bolt://localhost:7687

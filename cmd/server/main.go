@@ -390,6 +390,36 @@ func main() {
 	}
 
 	// ========================================
+	// 启动 MCP Export Server（将项目能力暴露给外部 Agent）
+	// ========================================
+	if cfg.MCPExport.Enabled {
+		kbRepo := repository.NewKnowledgeBaseRepository(db)
+		mcpExportServer := mcpmanager.NewServer(cfg, chatService, kbRepo)
+
+		transport := cfg.MCPExport.Transport
+		address := cfg.MCPExport.Address
+		if address == "" {
+			address = ":19094"
+		}
+
+		go func() {
+			var serverErr error
+			switch transport {
+			case "sse":
+				serverErr = mcpExportServer.ServeSSE(address)
+			case "stdio":
+				serverErr = mcpExportServer.ServeStdio()
+			default:
+				serverErr = mcpExportServer.ServeStreamableHTTP(address)
+			}
+			if serverErr != nil {
+				log.Printf("[MCP Export] 服务启动失败: %v", serverErr)
+			}
+		}()
+		log.Printf("[MCP Export] 已启动 (%s) 地址: %s", transport, address)
+	}
+
+	// ========================================
 	// 设置 Gin 路由
 	// ========================================
 	if cfg.Server.Mode == "release" {
@@ -477,6 +507,7 @@ func main() {
 	log.Printf("  - GraphRAG:  %v", graphRAGService != nil)
 	log.Printf("  - CodeGraph: %v", cfg.Agent.EnableCodeGraph)
 	log.Printf("  - MCP:       %v", mcpMgr != nil && len(mcpMgr.GetTools()) > 0)
+	log.Printf("  - MCP Export: %v", cfg.MCPExport.Enabled)
 	log.Printf("  - ImportQueue: %v", importQueue != nil)
 	log.Println("========================================")
 

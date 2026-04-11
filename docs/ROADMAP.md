@@ -48,6 +48,14 @@
 
 ## 三、功能扩展
 
+### MCP Server 导出层（分支：feat/mcp-server）
+- [x] **MCP Server 核心**：暴露 `knowledge_search`、`chat`、`list_knowledge_bases` 三个工具
+- [x] **多传输支持**：SSE / Streamable HTTP / Stdio 三种模式
+- [x] **配置集成**：`mcp_export` 配置节 + `cmd/server/main.go` 自动启动
+- [ ] **更多工具**：`code_search`（代码检索）、`graphrag_query`（图谱查询）、`manage_documents`（文档管理）
+- [ ] **认证**：MCP 请求的 API Key / JWT 认证
+- [ ] **README / 接入文档**：Claude Desktop / Cursor 接入配置示例
+
 ### 已有基础可快速推进
 - [ ] **FAQ 知识库**：`source_type: faq` 路径已预留但未完整实现，可快速补全
 - [ ] **文档版本管理**：chunks 表已有 `parent_chunk_id`，可实现文档更新时增量重索引
@@ -94,6 +102,7 @@
 | 优先级 | 方向 | 理由 |
 |--------|------|------|
 | 🔴 高 | Wiki 模式前端 | 后端已完成，需要前端界面才能使用 |
+| 🔴 高 | MCP Server 扩展 | 核心已完成，需要更多工具和接入文档 |
 | 🔴 高 | 集成测试 | 当前零测试覆盖，重构风险高 |
 | 🟡 中 | 工具层类型安全 | 减少 900+ 行样板代码，提升开发效率 |
 | 🟡 中 | 检索指标监控 | 无法量化检索质量，优化无据可依 |
