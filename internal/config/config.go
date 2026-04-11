@@ -26,6 +26,7 @@ type Config struct {
 	Redis       RedisConfig       `yaml:"redis"`
 	ImportQueue ImportQueueConfig `yaml:"import_queue"`
 	MCP         MCPConfig         `yaml:"mcp"`
+	MCPExport   MCPExportConfig   `yaml:"mcp_export"`
 	GraphRAG    GraphRAGConfig    `yaml:"graphrag"`
 }
 
@@ -260,10 +261,17 @@ type RedisConfig struct {
 	DB       int    `yaml:"db"`
 }
 
-// MCPConfig MCP 配置
+// MCPConfig MCP 配置（客户端，连接外部 MCP 服务器）
 type MCPConfig struct {
 	Enabled bool              `yaml:"enabled"`
 	Servers []MCPServerConfig `yaml:"servers"`
+}
+
+// MCPExportConfig MCP Server 导出配置（将项目能力暴露给外部 Agent）
+type MCPExportConfig struct {
+	Enabled   bool   `yaml:"enabled"`
+	Transport string `yaml:"transport"` // sse / streamable_http / stdio
+	Address   string `yaml:"address"`   // 监听地址，如 :19094
 }
 
 // MCPServerConfig 单个 MCP 服务器配置
