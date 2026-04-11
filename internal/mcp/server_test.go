@@ -8,8 +8,12 @@ import (
 
 	mcpProto "github.com/mark3labs/mcp-go/mcp"
 
+	einoTool "github.com/cloudwego/eino/components/tool"
+
+	"eino_agent/internal/codegraph"
 	"eino_agent/internal/config"
 	"eino_agent/internal/database/repository"
+	"eino_agent/internal/graphrag"
 	"eino_agent/internal/service"
 )
 
@@ -28,13 +32,18 @@ func (m *mockChatProvider) Chat(_ context.Context, req *service.ChatRequest) (*s
 }
 
 type mockKBRepo struct {
-	kbs []*repository.KnowledgeBase
-	err error
+	kbs    []*repository.KnowledgeBase
+	kb     *repository.KnowledgeBase
+	err    error
+	getErr error
 }
 
-func (m *mockKBRepo) Create(_ context.Context, _ *repository.KnowledgeBase) error  { return nil }
-func (m *mockKBRepo) GetByID(_ context.Context, _ string) (*repository.KnowledgeBase, error) {
-	return nil, nil
+func (m *mockKBRepo) Create(_ context.Context, _ *repository.KnowledgeBase) error { return nil }
+func (m *mockKBRepo) GetByID(_ context.Context, id string) (*repository.KnowledgeBase, error) {
+	if m.getErr != nil {
+		return nil, m.getErr
+	}
+	return m.kb, nil
 }
 func (m *mockKBRepo) List(_ context.Context, _ int, _, _ int) ([]*repository.KnowledgeBase, error) {
 	return m.kbs, m.err
@@ -42,6 +51,56 @@ func (m *mockKBRepo) List(_ context.Context, _ int, _, _ int) ([]*repository.Kno
 func (m *mockKBRepo) Update(_ context.Context, _ *repository.KnowledgeBase) error { return nil }
 func (m *mockKBRepo) Delete(_ context.Context, _ string) error                     { return nil }
 func (m *mockKBRepo) IncrementCounts(_ context.Context, _ string, _, _ int) error  { return nil }
+
+type mockCodeSearchProvider struct {
+	result string
+	err    error
+}
+
+func (m *mockCodeSearchProvider) InvokableRun(_ context.Context, input string, _ ...einoTool.Option) (string, error) {
+	return m.result, m.err
+}
+
+type mockGraphRAGProvider struct {
+	graph *graphrag.VisGraph
+	err   error
+}
+
+func (m *mockGraphRAGProvider) GetGraphForVis(_ context.Context, _ string, _ int) (*graphrag.VisGraph, error) {
+	return m.graph, m.err
+}
+
+type mockCodeGraphRepo struct {
+	callers    []codegraph.CodeRelation
+	callees    []codegraph.CodeRelation
+	entities   []codegraph.CodeEntity
+	overview   *codegraph.RepoOverview
+	err        error
+}
+
+func (m *mockCodeGraphRepo) UpsertFile(_ context.Context, _ string, _ string, _ string) error { return nil }
+func (m *mockCodeGraphRepo) UpsertEntities(_ context.Context, _ string, _ []codegraph.CodeEntity) error { return nil }
+func (m *mockCodeGraphRepo) UpsertRelations(_ context.Context, _ string, _ []codegraph.CodeRelation) error { return nil }
+func (m *mockCodeGraphRepo) DeleteFileGraph(_ context.Context, _ string, _ string) error { return nil }
+func (m *mockCodeGraphRepo) DeleteRepoGraph(_ context.Context, _ string) error { return nil }
+func (m *mockCodeGraphRepo) FindCallers(_ context.Context, _ string, _ string, _ int) ([]codegraph.CodeRelation, error) {
+	return m.callers, m.err
+}
+func (m *mockCodeGraphRepo) FindCallees(_ context.Context, _ string, _ string, _ int) ([]codegraph.CodeRelation, error) {
+	return m.callees, m.err
+}
+func (m *mockCodeGraphRepo) FindDefinition(_ context.Context, _ string, _ string) ([]codegraph.CodeEntity, error) {
+	return m.entities, m.err
+}
+func (m *mockCodeGraphRepo) GetFileStructure(_ context.Context, _ string, _ string) ([]codegraph.CodeEntity, error) {
+	return m.entities, m.err
+}
+func (m *mockCodeGraphRepo) SearchSymbol(_ context.Context, _ string, _ string, _ int) ([]codegraph.CodeEntity, error) {
+	return m.entities, m.err
+}
+func (m *mockCodeGraphRepo) GetRepoOverview(_ context.Context, _ string) (*codegraph.RepoOverview, error) {
+	return m.overview, m.err
+}
 
 // ---- Helper ----
 
@@ -396,6 +455,288 @@ func TestNewServer_RegistersTools(t *testing.T) {
 	// 这里测试 registerTools 独立调用
 	// 由于 mcpSrv 为 nil 会 panic，我们跳过直接调用
 	// 改为验证 NewServer 的工具注册通过 MCP Server 工具列表
+}
+
+// ---- handleGetKnowledgeBase 测试 ----
+
+func TestHandleGetKnowledgeBase_EmptyID(t *testing.T) {
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+
+	result, err := s.handleGetKnowledgeBase(context.Background(), makeCallToolRequest(map[string]any{}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertToolError(t, result, "id 参数不能为空")
+}
+
+func TestHandleGetKnowledgeBase_NotFound(t *testing.T) {
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{kb: nil})
+
+	result, err := s.handleGetKnowledgeBase(context.Background(), makeCallToolRequest(map[string]any{
+		"id": "nonexistent-kb",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertToolError(t, result, "不存在")
+}
+
+func TestHandleGetKnowledgeBase_Success(t *testing.T) {
+	kb := &repository.KnowledgeBase{
+		ID: "kb-1", Name: "测试知识库", Description: "desc", Mode: "vector", DocumentCount: 5,
+	}
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{kb: kb})
+
+	result, err := s.handleGetKnowledgeBase(context.Background(), makeCallToolRequest(map[string]any{
+		"id": "kb-1",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	assertToolSuccess(t, result)
+	text := getToolResultText(t, result)
+	if !contains(text, "测试知识库") {
+		t.Errorf("result should contain KB name, got: %s", text)
+	}
+}
+
+func TestHandleGetKnowledgeBase_DBError(t *testing.T) {
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{getErr: fmt.Errorf("db down")})
+
+	result, err := s.handleGetKnowledgeBase(context.Background(), makeCallToolRequest(map[string]any{
+		"id": "kb-1",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertToolError(t, result, "获取知识库失败")
+}
+
+// ---- handleCodeSearch 测试 ----
+
+func TestHandleCodeSearch_Success(t *testing.T) {
+	mock := &mockCodeSearchProvider{
+		result: `{"action":"grep","results":[{"file":"main.go","line":10,"content":"func main()"}],"summary":"1 match"}`,
+	}
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	s.codeTool = mock
+
+	result, err := s.handleCodeSearch(context.Background(), makeCallToolRequest(map[string]any{
+		"action":  "grep",
+		"pattern": "func main",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	assertToolSuccess(t, result)
+	text := getToolResultText(t, result)
+	if !contains(text, "main.go") {
+		t.Errorf("result should contain file name, got: %s", text)
+	}
+}
+
+func TestHandleCodeSearch_Error(t *testing.T) {
+	mock := &mockCodeSearchProvider{err: fmt.Errorf("no repos")}
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	s.codeTool = mock
+
+	result, err := s.handleCodeSearch(context.Background(), makeCallToolRequest(map[string]any{
+		"pattern": "test",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertToolError(t, result, "代码搜索失败")
+}
+
+// ---- handleGraphRAGQuery 测试 ----
+
+func TestHandleGraphRAGQuery_EmptyKBID(t *testing.T) {
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	s.graphRAG = &mockGraphRAGProvider{}
+
+	result, err := s.handleGraphRAGQuery(context.Background(), makeCallToolRequest(map[string]any{}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertToolError(t, result, "knowledge_base_id 参数不能为空")
+}
+
+func TestHandleGraphRAGQuery_Success(t *testing.T) {
+	mock := &mockGraphRAGProvider{
+		graph: &graphrag.VisGraph{
+			Nodes: []graphrag.VisNode{{ID: "n1", Label: "Go", Degree: 5}},
+			Edges: []graphrag.VisEdge{{Source: "n1", Target: "n2", Label: "RELATED_TO"}},
+		},
+	}
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	s.graphRAG = mock
+
+	result, err := s.handleGraphRAGQuery(context.Background(), makeCallToolRequest(map[string]any{
+		"knowledge_base_id": "kb-1",
+		"limit":             float64(10),
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	assertToolSuccess(t, result)
+	text := getToolResultText(t, result)
+
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(text), &parsed); err != nil {
+		t.Fatalf("failed to parse JSON: %v", err)
+	}
+	if parsed["node_count"] != float64(1) {
+		t.Errorf("node_count = %v, want 1", parsed["node_count"])
+	}
+}
+
+func TestHandleGraphRAGQuery_Error(t *testing.T) {
+	mock := &mockGraphRAGProvider{err: fmt.Errorf("neo4j down")}
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	s.graphRAG = mock
+
+	result, err := s.handleGraphRAGQuery(context.Background(), makeCallToolRequest(map[string]any{
+		"knowledge_base_id": "kb-1",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertToolError(t, result, "图谱查询失败")
+}
+
+// ---- handleCodeGraphQuery 测试 ----
+
+func TestHandleCodeGraphQuery_EmptyAction(t *testing.T) {
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	s.codeGraph = &mockCodeGraphRepo{}
+
+	result, err := s.handleCodeGraphQuery(context.Background(), makeCallToolRequest(map[string]any{
+		"repo": "test-repo",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertToolError(t, result, "action 参数不能为空")
+}
+
+func TestHandleCodeGraphQuery_EmptyRepo(t *testing.T) {
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	s.codeGraph = &mockCodeGraphRepo{}
+
+	result, err := s.handleCodeGraphQuery(context.Background(), makeCallToolRequest(map[string]any{
+		"action": "callers",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertToolError(t, result, "repo 参数不能为空")
+}
+
+func TestHandleCodeGraphQuery_Callers(t *testing.T) {
+	mock := &mockCodeGraphRepo{
+		callers: []codegraph.CodeRelation{
+			{Type: "calls", Source: "handleRequest", Target: "processData"},
+		},
+	}
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	s.codeGraph = mock
+
+	result, err := s.handleCodeGraphQuery(context.Background(), makeCallToolRequest(map[string]any{
+		"action": "callers",
+		"repo":   "test-repo",
+		"name":   "processData",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	assertToolSuccess(t, result)
+	text := getToolResultText(t, result)
+	if !contains(text, "handleRequest") {
+		t.Errorf("result should contain caller name, got: %s", text)
+	}
+}
+
+func TestHandleCodeGraphQuery_CallersMissingName(t *testing.T) {
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	s.codeGraph = &mockCodeGraphRepo{}
+
+	result, err := s.handleCodeGraphQuery(context.Background(), makeCallToolRequest(map[string]any{
+		"action": "callers",
+		"repo":   "test-repo",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertToolError(t, result, "需要 name 参数")
+}
+
+func TestHandleCodeGraphQuery_Overview(t *testing.T) {
+	mock := &mockCodeGraphRepo{
+		overview: &codegraph.RepoOverview{
+			Repo: "test-repo", FileCount: 10, EntityCount: 50, RelationCount: 30,
+			TypeCounts: map[string]int{"function": 40, "class": 10},
+		},
+	}
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	s.codeGraph = mock
+
+	result, err := s.handleCodeGraphQuery(context.Background(), makeCallToolRequest(map[string]any{
+		"action": "overview",
+		"repo":   "test-repo",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	assertToolSuccess(t, result)
+	text := getToolResultText(t, result)
+	if !contains(text, "test-repo") {
+		t.Errorf("result should contain repo name, got: %s", text)
+	}
+}
+
+func TestHandleCodeGraphQuery_Search(t *testing.T) {
+	mock := &mockCodeGraphRepo{
+		entities: []codegraph.CodeEntity{
+			{Name: "HandleRequest", Type: "function", FilePath: "handler.go", LineStart: 10, LineEnd: 30},
+		},
+	}
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	s.codeGraph = mock
+
+	result, err := s.handleCodeGraphQuery(context.Background(), makeCallToolRequest(map[string]any{
+		"action": "search",
+		"repo":   "test-repo",
+		"name":   "Handle",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	assertToolSuccess(t, result)
+	text := getToolResultText(t, result)
+	if !contains(text, "HandleRequest") {
+		t.Errorf("result should contain symbol name, got: %s", text)
+	}
+}
+
+func TestHandleCodeGraphQuery_UnknownAction(t *testing.T) {
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	s.codeGraph = &mockCodeGraphRepo{}
+
+	result, err := s.handleCodeGraphQuery(context.Background(), makeCallToolRequest(map[string]any{
+		"action": "invalid",
+		"repo":   "test-repo",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertToolError(t, result, "未知操作")
 }
 
 // ---- 断言工具函数 ----

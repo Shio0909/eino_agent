@@ -43,6 +43,7 @@ import (
 	mcpmanager "eino_agent/internal/mcp"
 	"eino_agent/internal/rediscache"
 	"eino_agent/internal/service"
+	"eino_agent/internal/tool"
 	"eino_agent/internal/wiki"
 	"eino_agent/internal/database/repository"
 )
@@ -359,6 +360,7 @@ func main() {
 	}
 
 	// 初始化代码知识图谱（复用 GraphRAG 的 Neo4j 连接）
+	var codeGraphRepo codegraph.CodeGraphRepository
 	if cfg.Agent.EnableCodeGraph && cfg.GraphRAG.Enabled {
 		log.Println("[CodeGraph] 初始化代码知识图谱...")
 		codeGraphCfg := &graphrag.Config{
@@ -371,14 +373,14 @@ func main() {
 		if err != nil {
 			log.Printf("[CodeGraph] Neo4j 连接失败: %v", err)
 		} else {
-			codeRepo := codegraph.NewNeo4jCodeGraphRepo(neo4jDriver)
+			codeGraphRepo = codegraph.NewNeo4jCodeGraphRepo(neo4jDriver)
 			reposDir := cfg.Agent.CodeSearchReposDir
 			if reposDir == "" {
 				reposDir = "data/test_repos"
 			}
-			codeIndexer := codegraph.NewIndexer(codeRepo, reposDir)
-			chatService.SetCodeGraph(codeRepo, codeIndexer)
-			apiHandler.SetCodeGraph(codeRepo, codeIndexer)
+			codeIndexer := codegraph.NewIndexer(codeGraphRepo, reposDir)
+			chatService.SetCodeGraph(codeGraphRepo, codeIndexer)
+			apiHandler.SetCodeGraph(codeGraphRepo, codeIndexer)
 			log.Println("[CodeGraph] 代码知识图谱初始化完成")
 		}
 	}
@@ -395,6 +397,24 @@ func main() {
 	if cfg.MCPExport.Enabled {
 		kbRepo := repository.NewKnowledgeBaseRepository(db)
 		mcpExportServer := mcpmanager.NewServer(cfg, chatService, kbRepo)
+
+		// 注入可选依赖
+		if graphRAGService != nil {
+			mcpExportServer.SetGraphRAGService(graphRAGService)
+		}
+		if codeGraphRepo != nil {
+			mcpExportServer.SetCodeGraph(codeGraphRepo)
+		}
+		if cfg.Agent.EnableCodeSearch {
+			reposDir := cfg.Agent.CodeSearchReposDir
+			if reposDir == "" {
+				reposDir = "data/test_repos"
+			}
+			codeTool := tool.NewCodeSearchTool(reposDir)
+			mcpExportServer.SetCodeSearchTool(codeTool)
+		}
+
+		mcpExportServer.Init()
 
 		transport := cfg.MCPExport.Transport
 		address := cfg.MCPExport.Address
