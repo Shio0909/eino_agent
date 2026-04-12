@@ -405,6 +405,8 @@ func main() {
 		if codeGraphRepo != nil {
 			mcpExportServer.SetCodeGraph(codeGraphRepo)
 		}
+		// 注入知识库写入能力（通过 apiHandler 提供）
+		mcpExportServer.SetKBWriter(apiHandler)
 		if cfg.Agent.EnableCodeSearch {
 			reposDir := cfg.Agent.CodeSearchReposDir
 			if reposDir == "" {

@@ -49,16 +49,23 @@ type graphRAGProvider interface {
 	GetGraphForVis(ctx context.Context, kbID string, limit int) (*graphrag.VisGraph, error)
 }
 
+// kbWriteProvider 定义知识库写入能力（创建 KB、导入 URL 等）
+type kbWriteProvider interface {
+	MCPCreateKB(ctx context.Context, name, desc, mode string) (*repository.KnowledgeBase, error)
+	MCPImportURL(ctx context.Context, kbID, url, title string) (string, int, error)
+}
+
 // Server 封装 MCP Server，暴露项目核心能力
 type Server struct {
 	mcpSrv    *mcpServer.MCPServer
 	config    *config.Config
 	chatSvc   chatProvider
 	kbRepo    repository.KnowledgeBaseRepository
-	codeTool  codeSearchProvider  // 可选：代码搜索工具
-	graphRAG  graphRAGProvider    // 可选：GraphRAG 服务
-	codeGraph codegraph.CodeGraphRepository // 可选：代码知识图谱
-	apiKeySet map[string]struct{} // 已配置的 API Key 集合，为空则不验证
+	kbWriter  kbWriteProvider                      // 可选：知识库写入（创建 KB、导入 URL）
+	codeTool  codeSearchProvider                   // 可选：代码搜索工具
+	graphRAG  graphRAGProvider                     // 可选：GraphRAG 服务
+	codeGraph codegraph.CodeGraphRepository        // 可选：代码知识图谱
+	apiKeySet map[string]struct{}                  // 已配置的 API Key 集合，为空则不验证
 }
 
 // NewServer 创建 MCP Server
@@ -112,6 +119,9 @@ func (s *Server) SetGraphRAGService(svc graphRAGProvider) { s.graphRAG = svc }
 
 // SetCodeGraph 注入代码知识图谱仓储（可选）
 func (s *Server) SetCodeGraph(repo codegraph.CodeGraphRepository) { s.codeGraph = repo }
+
+// SetKBWriter 注入知识库写入能力（可选）
+func (s *Server) SetKBWriter(w kbWriteProvider) { s.kbWriter = w }
 
 // Init 注册所有工具并初始化 MCP Server（在设置好所有可选依赖后调用）
 func (s *Server) Init() {
@@ -260,6 +270,51 @@ func (s *Server) registerTools() {
 			s.handleCodeGraphQuery,
 		)
 		log.Println("[MCP Server] 已注册工具: code_graph_query")
+	}
+
+	// ── 写入工具（按 kbWriter 注入情况注册） ──
+
+	// 8. create_knowledge_base — 创建知识库
+	if s.kbWriter != nil {
+		s.mcpSrv.AddTool(
+			mcpProto.NewTool(
+				"create_knowledge_base",
+				mcpProto.WithDescription("创建新的知识库。返回新知识库的 ID 和详细信息。"),
+				mcpProto.WithString("name",
+					mcpProto.Required(),
+					mcpProto.Description("知识库名称"),
+				),
+				mcpProto.WithString("description",
+					mcpProto.Description("知识库描述"),
+				),
+				mcpProto.WithString("mode",
+					mcpProto.Description("知识库模式: vector（向量检索，默认）/ wiki（LLM编译Wiki知识库）"),
+				),
+			),
+			s.handleCreateKnowledgeBase,
+		)
+		log.Println("[MCP Server] 已注册工具: create_knowledge_base")
+
+		// 9. import_url — 导入网页到知识库
+		s.mcpSrv.AddTool(
+			mcpProto.NewTool(
+				"import_url",
+				mcpProto.WithDescription("将网页内容导入到指定知识库。自动抓取、解析、分块、向量化并存储。支持任何公开可访问的 HTTP/HTTPS 网址。"),
+				mcpProto.WithString("knowledge_base_id",
+					mcpProto.Required(),
+					mcpProto.Description("目标知识库 ID（可通过 list_knowledge_bases 获取）"),
+				),
+				mcpProto.WithString("url",
+					mcpProto.Required(),
+					mcpProto.Description("要导入的网页 URL"),
+				),
+				mcpProto.WithString("title",
+					mcpProto.Description("文档标题（留空则自动使用 URL）"),
+				),
+			),
+			s.handleImportURL,
+		)
+		log.Println("[MCP Server] 已注册工具: import_url")
 	}
 }
 
@@ -551,6 +606,55 @@ func truncateContent(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+// ── MCP 写入工具处理函数 ──
+
+// handleCreateKnowledgeBase 处理 create_knowledge_base 工具调用
+func (s *Server) handleCreateKnowledgeBase(ctx context.Context, request mcpProto.CallToolRequest) (*mcpProto.CallToolResult, error) {
+	name := request.GetString("name", "")
+	desc := request.GetString("description", "")
+	mode := request.GetString("mode", "")
+
+	kb, err := s.kbWriter.MCPCreateKB(ctx, name, desc, mode)
+	if err != nil {
+		return mcpProto.NewToolResultError(fmt.Sprintf("创建知识库失败: %v", err)), nil
+	}
+
+	result := map[string]any{
+		"id":          kb.ID,
+		"name":        kb.Name,
+		"description": kb.Description,
+		"mode":        kb.Mode,
+		"message":     fmt.Sprintf("知识库 '%s' 创建成功", kb.Name),
+	}
+	return marshalToolResult(result)
+}
+
+// handleImportURL 处理 import_url 工具调用
+func (s *Server) handleImportURL(ctx context.Context, request mcpProto.CallToolRequest) (*mcpProto.CallToolResult, error) {
+	kbID := request.GetString("knowledge_base_id", "")
+	rawURL := request.GetString("url", "")
+	title := request.GetString("title", "")
+
+	if kbID == "" {
+		return mcpProto.NewToolResultError("knowledge_base_id 不能为空"), nil
+	}
+	if rawURL == "" {
+		return mcpProto.NewToolResultError("url 不能为空"), nil
+	}
+
+	knowledgeID, chunkCount, err := s.kbWriter.MCPImportURL(ctx, kbID, rawURL, title)
+	if err != nil {
+		return mcpProto.NewToolResultError(fmt.Sprintf("导入失败: %v", err)), nil
+	}
+
+	result := map[string]any{
+		"knowledge_id": knowledgeID,
+		"chunk_count":  chunkCount,
+		"message":      fmt.Sprintf("网页导入成功，生成 %d 个分块", chunkCount),
+	}
+	return marshalToolResult(result)
 }
 
 // MCPServer 返回底层 MCPServer 实例（供启动 SSE/HTTP/Stdio 使用）
