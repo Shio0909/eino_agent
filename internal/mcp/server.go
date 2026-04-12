@@ -53,6 +53,11 @@ type graphRAGProvider interface {
 type kbWriteProvider interface {
 	MCPCreateKB(ctx context.Context, name, desc, mode string) (*repository.KnowledgeBase, error)
 	MCPImportURL(ctx context.Context, kbID, url, title string) (string, int, error)
+	MCPDeleteKB(ctx context.Context, kbID string) error
+	MCPListDocuments(ctx context.Context, kbID string) ([]map[string]any, error)
+	MCPDeleteDocument(ctx context.Context, kbID, docID string) error
+	MCPCloneCodeRepo(ctx context.Context, repoURL, name string) (string, error)
+	MCPIndexCodeRepo(ctx context.Context, name string) (map[string]any, error)
 }
 
 // Server 封装 MCP Server，暴露项目核心能力
@@ -315,6 +320,83 @@ func (s *Server) registerTools() {
 			s.handleImportURL,
 		)
 		log.Println("[MCP Server] 已注册工具: import_url")
+
+		// 10. delete_knowledge_base — 删除知识库
+		s.mcpSrv.AddTool(
+			mcpProto.NewTool(
+				"delete_knowledge_base",
+				mcpProto.WithDescription("删除指定知识库及其所有文档。此操作不可恢复。"),
+				mcpProto.WithString("knowledge_base_id",
+					mcpProto.Required(),
+					mcpProto.Description("要删除的知识库 ID"),
+				),
+			),
+			s.handleDeleteKnowledgeBase,
+		)
+		log.Println("[MCP Server] 已注册工具: delete_knowledge_base")
+
+		// 11. list_documents — 列出知识库中的文档
+		s.mcpSrv.AddTool(
+			mcpProto.NewTool(
+				"list_documents",
+				mcpProto.WithDescription("列出指定知识库中的所有文档，包括名称、类型、状态、分块数等信息。"),
+				mcpProto.WithString("knowledge_base_id",
+					mcpProto.Required(),
+					mcpProto.Description("知识库 ID"),
+				),
+			),
+			s.handleListDocuments,
+		)
+		log.Println("[MCP Server] 已注册工具: list_documents")
+
+		// 12. delete_document — 删除文档
+		s.mcpSrv.AddTool(
+			mcpProto.NewTool(
+				"delete_document",
+				mcpProto.WithDescription("从知识库中删除指定文档。此操作不可恢复。"),
+				mcpProto.WithString("knowledge_base_id",
+					mcpProto.Required(),
+					mcpProto.Description("知识库 ID"),
+				),
+				mcpProto.WithString("document_id",
+					mcpProto.Required(),
+					mcpProto.Description("要删除的文档 ID"),
+				),
+			),
+			s.handleDeleteDocument,
+		)
+		log.Println("[MCP Server] 已注册工具: delete_document")
+
+		// 13. clone_code_repo — 克隆代码仓库
+		s.mcpSrv.AddTool(
+			mcpProto.NewTool(
+				"clone_code_repo",
+				mcpProto.WithDescription("克隆 Git 仓库到本地，用于代码搜索和知识图谱分析。使用 --depth=1 浅克隆。"),
+				mcpProto.WithString("url",
+					mcpProto.Required(),
+					mcpProto.Description("Git 仓库 URL（HTTPS）"),
+				),
+				mcpProto.WithString("name",
+					mcpProto.Description("仓库名称（留空则从 URL 自动提取）"),
+				),
+			),
+			s.handleCloneCodeRepo,
+		)
+		log.Println("[MCP Server] 已注册工具: clone_code_repo")
+
+		// 14. index_code_repo — 索引代码仓库
+		s.mcpSrv.AddTool(
+			mcpProto.NewTool(
+				"index_code_repo",
+				mcpProto.WithDescription("对已克隆的代码仓库建立知识图谱索引，提取函数、类、调用关系等结构信息。索引后可通过 code_graph_query 查询。"),
+				mcpProto.WithString("name",
+					mcpProto.Required(),
+					mcpProto.Description("仓库名称（clone_code_repo 返回的名称）"),
+				),
+			),
+			s.handleIndexCodeRepo,
+		)
+		log.Println("[MCP Server] 已注册工具: index_code_repo")
 	}
 }
 
@@ -655,6 +737,80 @@ func (s *Server) handleImportURL(ctx context.Context, request mcpProto.CallToolR
 		"message":      fmt.Sprintf("网页导入成功，生成 %d 个分块", chunkCount),
 	}
 	return marshalToolResult(result)
+}
+
+// handleDeleteKnowledgeBase 处理 delete_knowledge_base 工具调用
+func (s *Server) handleDeleteKnowledgeBase(ctx context.Context, request mcpProto.CallToolRequest) (*mcpProto.CallToolResult, error) {
+	kbID := request.GetString("knowledge_base_id", "")
+	if kbID == "" {
+		return mcpProto.NewToolResultError("knowledge_base_id 不能为空"), nil
+	}
+	if err := s.kbWriter.MCPDeleteKB(ctx, kbID); err != nil {
+		return mcpProto.NewToolResultError(fmt.Sprintf("删除知识库失败: %v", err)), nil
+	}
+	return mcpProto.NewToolResultText(fmt.Sprintf("知识库 %s 已删除", kbID)), nil
+}
+
+// handleListDocuments 处理 list_documents 工具调用
+func (s *Server) handleListDocuments(ctx context.Context, request mcpProto.CallToolRequest) (*mcpProto.CallToolResult, error) {
+	kbID := request.GetString("knowledge_base_id", "")
+	if kbID == "" {
+		return mcpProto.NewToolResultError("knowledge_base_id 不能为空"), nil
+	}
+	docs, err := s.kbWriter.MCPListDocuments(ctx, kbID)
+	if err != nil {
+		return mcpProto.NewToolResultError(fmt.Sprintf("列出文档失败: %v", err)), nil
+	}
+	return marshalToolResult(map[string]any{
+		"knowledge_base_id": kbID,
+		"document_count":    len(docs),
+		"documents":         docs,
+	})
+}
+
+// handleDeleteDocument 处理 delete_document 工具调用
+func (s *Server) handleDeleteDocument(ctx context.Context, request mcpProto.CallToolRequest) (*mcpProto.CallToolResult, error) {
+	kbID := request.GetString("knowledge_base_id", "")
+	docID := request.GetString("document_id", "")
+	if kbID == "" || docID == "" {
+		return mcpProto.NewToolResultError("knowledge_base_id 和 document_id 不能为空"), nil
+	}
+	if err := s.kbWriter.MCPDeleteDocument(ctx, kbID, docID); err != nil {
+		return mcpProto.NewToolResultError(fmt.Sprintf("删除文档失败: %v", err)), nil
+	}
+	return mcpProto.NewToolResultText(fmt.Sprintf("文档 %s 已从知识库 %s 中删除", docID, kbID)), nil
+}
+
+// handleCloneCodeRepo 处理 clone_code_repo 工具调用
+func (s *Server) handleCloneCodeRepo(ctx context.Context, request mcpProto.CallToolRequest) (*mcpProto.CallToolResult, error) {
+	repoURL := request.GetString("url", "")
+	name := request.GetString("name", "")
+	if repoURL == "" {
+		return mcpProto.NewToolResultError("url 不能为空"), nil
+	}
+	repoName, err := s.kbWriter.MCPCloneCodeRepo(ctx, repoURL, name)
+	if err != nil {
+		return mcpProto.NewToolResultError(fmt.Sprintf("克隆仓库失败: %v", err)), nil
+	}
+	return marshalToolResult(map[string]any{
+		"name":    repoName,
+		"message": fmt.Sprintf("仓库 %s 克隆成功", repoName),
+	})
+}
+
+// handleIndexCodeRepo 处理 index_code_repo 工具调用
+func (s *Server) handleIndexCodeRepo(ctx context.Context, request mcpProto.CallToolRequest) (*mcpProto.CallToolResult, error) {
+	name := request.GetString("name", "")
+	if name == "" {
+		return mcpProto.NewToolResultError("name 不能为空"), nil
+	}
+	stats, err := s.kbWriter.MCPIndexCodeRepo(ctx, name)
+	if err != nil {
+		return mcpProto.NewToolResultError(fmt.Sprintf("索引仓库失败: %v", err)), nil
+	}
+	stats["name"] = name
+	stats["message"] = fmt.Sprintf("仓库 %s 索引完成", name)
+	return marshalToolResult(stats)
 }
 
 // MCPServer 返回底层 MCPServer 实例（供启动 SSE/HTTP/Stdio 使用）
