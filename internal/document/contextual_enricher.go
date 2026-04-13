@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
+	"time"
 	"unicode/utf8"
 
 	"eino_agent/internal/container"
@@ -19,6 +21,7 @@ import (
 type ContextualEnricher struct {
 	LLM           model.ChatModel
 	MaxDocContext int // 传给 LLM 的文档上下文最大字符数
+	Concurrency   int // 并发 worker 数量（0=使用默认值 4）
 }
 
 // NewContextualEnricher 创建上下文富化器
@@ -26,6 +29,7 @@ func NewContextualEnricher(llm model.ChatModel) *ContextualEnricher {
 	return &ContextualEnricher{
 		LLM:           llm,
 		MaxDocContext:  4000,
+		Concurrency:   4,
 	}
 }
 
@@ -45,34 +49,82 @@ const enrichPromptTemplate = `<document>
 - 不要复述片段内容，只说明"这段内容位于文档的哪个部分，讲的是什么主题"
 - 控制在50字以内`
 
-// Enrich 为一组 chunks 添加上下文前缀
-// docContent: 原始完整文档内容
-// chunks: 待富化的 chunk 列表
-// 返回新的 chunk 列表（Content 被添加了上下文前缀）
+// enrichTask 并发富化任务
+type enrichTask struct {
+	index int
+	chunk *container.Document
+}
+
+// Enrich 为一组 chunks 并发添加上下文前缀
 func (e *ContextualEnricher) Enrich(ctx context.Context, docContent string, chunks []*container.Document) ([]*container.Document, error) {
-	// 截断文档上下文
+	if len(chunks) == 0 {
+		return chunks, nil
+	}
+
 	docCtx := truncateText(docContent, e.MaxDocContext)
+	concurrency := e.Concurrency
+	if concurrency <= 0 {
+		concurrency = 4
+	}
+	// 不超过 chunk 数量
+	if concurrency > len(chunks) {
+		concurrency = len(chunks)
+	}
 
 	enriched := make([]*container.Document, len(chunks))
-	for i, chunk := range chunks {
-		prefix, err := e.generateContext(ctx, docCtx, chunk.Content)
-		if err != nil {
-			log.Printf("[ContextualEnricher] chunk %d 富化失败，保留原文: %v", i, err)
-			enriched[i] = chunk
-			continue
-		}
+	taskCh := make(chan enrichTask, len(chunks))
+	var wg sync.WaitGroup
+	var successCount int32
+	var mu sync.Mutex
 
-		// 复制 chunk，添加前缀
-		newChunk := &container.Document{
-			ID:       chunk.ID,
-			Content:  fmt.Sprintf("[上下文: %s]\n%s", prefix, chunk.Content),
-			Vector:   chunk.Vector,
-			Metadata: copyMetadata(chunk.Metadata),
-		}
-		newChunk.Metadata["contextual_prefix"] = prefix
-		newChunk.Metadata["enriched"] = true
-		enriched[i] = newChunk
+	start := time.Now()
+
+	// 启动 worker 池
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for task := range taskCh {
+				if ctx.Err() != nil {
+					// context 已取消，保留原文
+					enriched[task.index] = task.chunk
+					continue
+				}
+
+				prefix, err := e.generateContext(ctx, docCtx, task.chunk.Content)
+				if err != nil {
+					log.Printf("[ContextualEnricher] worker=%d chunk=%d 富化失败，保留原文: %v", workerID, task.index, err)
+					enriched[task.index] = task.chunk
+					continue
+				}
+
+				newChunk := &container.Document{
+					ID:       task.chunk.ID,
+					Content:  fmt.Sprintf("[上下文: %s]\n%s", prefix, task.chunk.Content),
+					Vector:   task.chunk.Vector,
+					Metadata: copyMetadata(task.chunk.Metadata),
+				}
+				newChunk.Metadata["contextual_prefix"] = prefix
+				newChunk.Metadata["enriched"] = true
+				enriched[task.index] = newChunk
+
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+			}
+		}(w)
 	}
+
+	// 分发任务
+	for i, chunk := range chunks {
+		taskCh <- enrichTask{index: i, chunk: chunk}
+	}
+	close(taskCh)
+
+	wg.Wait()
+
+	log.Printf("[ContextualEnricher] 完成: %d/%d 成功, 并发=%d, 耗时=%dms",
+		successCount, len(chunks), concurrency, time.Since(start).Milliseconds())
 
 	return enriched, nil
 }
