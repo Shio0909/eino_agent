@@ -937,7 +937,7 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 		}
 
 		// 向量化并存储
-		chunkCount, err := h.storeParsedChunks(c.Request.Context(), kbID, knowledge.ID, result.Chunks)
+		chunkCount, err := h.storeParsedChunks(c.Request.Context(), kbID, knowledge.ID, header.Filename, result.Chunks)
 		if err != nil {
 			log.Printf("[Upload] 向量化失败（文档已解析 %d 块）: %v", chunkCount, err)
 			h.markKnowledgeFailed(c.Request.Context(), knowledge.ID, chunkCount, err)
@@ -1067,7 +1067,7 @@ func (h *Handler) UploadDocumentURL(c *gin.Context) {
 		return
 	}
 
-	chunkCount, err := h.storeParsedChunks(c.Request.Context(), kbID, knowledge.ID, result.Chunks)
+	chunkCount, err := h.storeParsedChunks(c.Request.Context(), kbID, knowledge.ID, title, result.Chunks)
 	if err != nil {
 		log.Printf("[UploadURL] 向量化失败（URL 已解析 %d 块）: %v", chunkCount, err)
 		h.markKnowledgeFailed(c.Request.Context(), knowledge.ID, chunkCount, err)
@@ -1409,6 +1409,8 @@ func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeI
 		chunk.Vector = vectors[i]
 		chunk.Metadata["knowledge_base_id"] = kbID
 		chunk.Metadata["knowledge_id"] = knowledgeID
+		chunk.Metadata["source_filename"] = filename
+		chunk.Metadata["uploaded_at"] = time.Now().Format(time.RFC3339)
 	}
 
 	if err := h.vectorDB.Upsert(ctx, chunks); err != nil {
@@ -1418,8 +1420,8 @@ func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeI
 	return len(chunks), nil
 }
 
-func (h *Handler) storeParsedChunks(ctx context.Context, kbID, knowledgeID string, chunks []docreader.ParsedChunk) (int, error) {
-	if err := h.processAndStoreChunks(ctx, kbID, knowledgeID, chunks); err != nil {
+func (h *Handler) storeParsedChunks(ctx context.Context, kbID, knowledgeID, sourceFilename string, chunks []docreader.ParsedChunk) (int, error) {
+	if err := h.processAndStoreChunks(ctx, kbID, knowledgeID, sourceFilename, chunks); err != nil {
 		return len(chunks), err
 	}
 	return len(chunks), nil
@@ -1486,7 +1488,7 @@ func (h *Handler) processQueuedFileImport(ctx context.Context, task importqueue.
 		if err != nil {
 			return 0, fmt.Errorf("文档解析失败: %w", err)
 		}
-		return h.storeParsedChunks(ctx, task.KnowledgeBaseID, task.KnowledgeID, result.Chunks)
+		return h.storeParsedChunks(ctx, task.KnowledgeBaseID, task.KnowledgeID, task.FileName, result.Chunks)
 	}
 
 	content, err := os.ReadFile(task.FilePath)
@@ -1505,7 +1507,7 @@ func (h *Handler) processQueuedURLImport(ctx context.Context, task importqueue.T
 		if err != nil {
 			return 0, fmt.Errorf("网页解析失败: %w", err)
 		}
-		return h.storeParsedChunks(ctx, task.KnowledgeBaseID, task.KnowledgeID, result.Chunks)
+		return h.storeParsedChunks(ctx, task.KnowledgeBaseID, task.KnowledgeID, task.Title, result.Chunks)
 	}
 
 	// docreader 不可用时，直接 HTTP 抓取并按纯文本处理
@@ -1532,7 +1534,7 @@ func (h *Handler) processQueuedURLImport(ctx context.Context, task importqueue.T
 }
 
 // processAndStoreChunks 处理并存储文档块
-func (h *Handler) processAndStoreChunks(ctx context.Context, kbID, knowledgeID string, chunks []docreader.ParsedChunk) error {
+func (h *Handler) processAndStoreChunks(ctx context.Context, kbID, knowledgeID, sourceFilename string, chunks []docreader.ParsedChunk) error {
 	if len(chunks) == 0 {
 		return nil
 	}
@@ -1560,6 +1562,8 @@ func (h *Handler) processAndStoreChunks(ctx context.Context, kbID, knowledgeID s
 				"chunk_index":       chunk.Seq,
 				"start_pos":         chunk.Start,
 				"end_pos":           chunk.End,
+				"source_filename":   sourceFilename,
+				"uploaded_at":       time.Now().Format(time.RFC3339),
 			},
 		}
 		contents[i] = chunk.Content

@@ -45,9 +45,11 @@ type KnowledgeToolOutput struct {
 
 // KnowledgeResult 检索结果
 type KnowledgeResult struct {
-	Content string  `json:"content"`
-	Source  string  `json:"source"`
-	Score   float64 `json:"score"`
+	Content        string  `json:"content"`
+	Source         string  `json:"source"`
+	SourceFilename string  `json:"source_filename,omitempty"`
+	UploadedAt     string  `json:"uploaded_at,omitempty"`
+	Score          float64 `json:"score"`
 }
 
 // NewKnowledgeTool 创建知识库工具
@@ -154,10 +156,16 @@ func (t *KnowledgeTool) InvokableRun(ctx context.Context, input string, opts ...
 			break
 		}
 		totalChars += len(content)
+		// 从 metadata 提取来源文件名和上传时间
+		sourceFilename, _ := doc.MetaData["source_filename"].(string)
+		uploadedAt, _ := doc.MetaData["uploaded_at"].(string)
+
 		results = append(results, KnowledgeResult{
-			Content: content,
-			Source:  doc.ID,
-			Score:   score,
+			Content:        content,
+			Source:         doc.ID,
+			SourceFilename: sourceFilename,
+			UploadedAt:     uploadedAt,
+			Score:          score,
 		})
 	}
 
