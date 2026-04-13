@@ -235,6 +235,9 @@ func (s *ChatService) buildToolsWithRetriever(runtimeRetriever retriever.Retriev
 
 	if s.config.Agent.EnableKnowledgeTool && runtimeRetriever != nil {
 		kt = internalTool.NewKnowledgeTool(runtimeRetriever, s.config.RAG.TopK, s.config.Agent.MaxContentPerDoc, s.config.Agent.MaxTotalContent)
+		if s.config.Agent.EnableConflictDetection && s.lightModel != nil {
+			kt.SetLightModel(s.lightModel)
+		}
 		tools = append(tools, kt)
 	}
 

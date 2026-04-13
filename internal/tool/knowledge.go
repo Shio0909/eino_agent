@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/retriever"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
@@ -29,6 +30,7 @@ type KnowledgeTool struct {
 	maxContentPerDoc int                // 每篇文档最大字符数
 	maxTotalContent  int                // 总内容最大字符数
 	lastDocs         []*schema.Document // 缓存最近一次检索结果，供 Agent 模式回填 sources
+	lightModel       model.ChatModel    // 轻量模型（用于冲突检测，可为 nil）
 }
 
 // KnowledgeToolInput 知识库工具输入
@@ -175,11 +177,19 @@ func (t *KnowledgeTool) InvokableRun(ctx context.Context, input string, opts ...
 		return "", err
 	}
 
-	return string(jsonBytes), nil
+	// P1 冲突检测：使用 lightModel 分析检索结果间的矛盾
+	conflictWarning := t.detectConflicts(ctx, params.Query, results)
+
+	return string(jsonBytes) + conflictWarning, nil
 }
 
 // Ensure interface implementation
 var _ tool.InvokableTool = (*KnowledgeTool)(nil)
+
+// SetLightModel 注入轻量模型（用于冲突检测）
+func (t *KnowledgeTool) SetLightModel(m model.ChatModel) {
+	t.lightModel = m
+}
 
 // LastDocs 返回所有检索的文档结果（支持多次检索累积）
 func (t *KnowledgeTool) LastDocs() []*schema.Document {
@@ -189,4 +199,90 @@ func (t *KnowledgeTool) LastDocs() []*schema.Document {
 // ResetDocs 重置缓存的文档（每次请求开始时调用）
 func (t *KnowledgeTool) ResetDocs() {
 	t.lastDocs = nil
+}
+
+// detectConflicts 使用 lightModel 检测检索结果中的信息冲突
+func (t *KnowledgeTool) detectConflicts(ctx context.Context, query string, results []KnowledgeResult) string {
+	if t.lightModel == nil || len(results) < 2 {
+		return ""
+	}
+
+	// 构建文档摘要供 LLM 分析
+	var sb strings.Builder
+	for i, r := range results {
+		source := r.SourceFilename
+		if source == "" {
+			source = r.Source
+		}
+		sb.WriteString(fmt.Sprintf("[文档%d] 来源: %s\n%s\n\n", i+1, source, r.Content))
+	}
+
+	prompt := fmt.Sprintf(`你是一个信息一致性检查器。分析以下检索结果，判断不同来源对同一事实是否存在矛盾或冲突。
+
+用户查询：%s
+
+检索结果：
+%s
+
+分析要求：
+1. 只关注**事实性矛盾**（数值不同、结论相反、流程步骤不一致），忽略表述差异和补充性信息
+2. 如果没有发现冲突，返回：{"conflicts": []}
+3. 如果有冲突，返回 JSON：
+{"conflicts": [{"topic": "冲突主题", "doc_a": "来源A说法", "doc_b": "来源B说法", "sources": ["文档1", "文档2"]}]}
+
+只返回 JSON，不要附加说明。`, query, sb.String())
+
+	detectStart := time.Now()
+	resp, err := t.lightModel.Generate(ctx, []*schema.Message{
+		{Role: schema.User, Content: prompt},
+	})
+	log.Printf("[Timing][ConflictDetect] duration_ms=%d query=%q",
+		time.Since(detectStart).Milliseconds(), query)
+
+	if err != nil {
+		log.Printf("[ConflictDetect] LLM 调用失败: %v", err)
+		return ""
+	}
+
+	content := strings.TrimSpace(resp.Content)
+	content = strings.TrimPrefix(content, "```json")
+	content = strings.TrimPrefix(content, "```")
+	content = strings.TrimSuffix(content, "```")
+	content = strings.TrimSpace(content)
+
+	// 解析冲突结果
+	var result struct {
+		Conflicts []struct {
+			Topic   string   `json:"topic"`
+			DocA    string   `json:"doc_a"`
+			DocB    string   `json:"doc_b"`
+			Sources []string `json:"sources"`
+		} `json:"conflicts"`
+	}
+	if err := json.Unmarshal([]byte(content), &result); err != nil {
+		log.Printf("[ConflictDetect] JSON 解析失败: %v (content: %s)", err, content)
+		return ""
+	}
+
+	if len(result.Conflicts) == 0 {
+		return ""
+	}
+
+	// 格式化冲突警告
+	var warnings strings.Builder
+	warnings.WriteString("\n\n⚠️ 检索结果冲突警告：\n")
+	for _, c := range result.Conflicts {
+		warnings.WriteString(fmt.Sprintf("• %s：", c.Topic))
+		if len(c.Sources) >= 2 {
+			warnings.WriteString(fmt.Sprintf("[%s] 认为「%s」", c.Sources[0], c.DocA))
+			warnings.WriteString(fmt.Sprintf("，而 [%s] 认为「%s」", c.Sources[1], c.DocB))
+		} else {
+			warnings.WriteString(fmt.Sprintf("一方认为「%s」，另一方认为「%s」", c.DocA, c.DocB))
+		}
+		warnings.WriteString("\n")
+	}
+	warnings.WriteString("请在回答中标记这些冲突，不要只采信一方。")
+
+	log.Printf("[ConflictDetect] 发现 %d 处冲突", len(result.Conflicts))
+	return warnings.String()
 }

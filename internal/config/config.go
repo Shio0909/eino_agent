@@ -193,6 +193,9 @@ type AgentConfig struct {
 	MaxContentPerDoc int `yaml:"max_content_per_doc"` // 每篇文档返回给 Agent 的最大字符数（0=使用默认值）
 	MaxTotalContent  int `yaml:"max_total_content"`   // 单次检索返回的总字符数上限（0=使用默认值）
 
+	// 冲突检测
+	EnableConflictDetection bool `yaml:"enable_conflict_detection"` // 是否启用检索结果冲突检测（使用 lightModel）
+
 	// Skills 配置（Eino 原生渐进式披露）
 	EnableSkills bool   `yaml:"enable_skills"`
 	SkillsDir    string `yaml:"skills_dir"`
