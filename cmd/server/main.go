@@ -333,13 +333,6 @@ func main() {
 	if db != nil {
 		wikiRepo := repository.NewWikiPageRepository(db)
 
-		// Wiki 检索器注入到 CompositeRetriever
-		if cr, ok := einoRetriever.(*container.CompositeRetriever); ok {
-			wikiRetriever := container.NewWikiRetriever(wikiRepo, cfg.RAG.TopK)
-			cr.SetWikiRetriever(wikiRetriever)
-			log.Println("[WikiRetriever] Wiki 页面检索器已注入 Retriever")
-		}
-
 		// 创建 Wiki 编译器（后续注入到 Handler）
 		wikiCompiler = wiki.NewCompiler(chatModel, wikiRepo)
 		log.Println("[WikiCompiler] Wiki 编译器已创建")

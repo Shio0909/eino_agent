@@ -22,7 +22,7 @@ import (
 )
 
 // CompositeRetriever 组合检索器
-// 【Eino 特点】支持向量检索 + 关键词检索 + 图谱检索 + Wiki页面检索的混合模式
+// 【Eino 特点】支持向量检索 + 关键词检索 + 图谱检索的混合模式
 type CompositeRetriever struct {
 	cfg                   *config.RAGConfig
 	embeddingCfg          *config.EmbeddingConfig
@@ -31,7 +31,6 @@ type CompositeRetriever struct {
 	retrievalCache        cachepkg.RetrievalCache
 	graphRetriever        einoretriever.Retriever
 	graphRetrieverFactory GraphRetrieverFactory // 用于按 KB 动态创建图谱检索器
-	wikiRetriever         *WikiRetriever        // Wiki 模式检索器（可选）
 }
 
 // GraphRetrieverFactory 按命名空间创建图谱检索器（由 graphRAG Service 实现）
@@ -81,11 +80,6 @@ func (r *CompositeRetriever) SetGraphRetrieverFactory(f GraphRetrieverFactory) {
 	r.graphRetrieverFactory = f
 }
 
-// SetWikiRetriever 注入 Wiki 检索器
-func (r *CompositeRetriever) SetWikiRetriever(wr *WikiRetriever) {
-	r.wikiRetriever = wr
-}
-
 // Retrieve 执行检索
 func (r *CompositeRetriever) Retrieve(ctx context.Context, query string, opts ...einoretriever.Option) ([]*schema.Document, error) {
 	if cachedDocs, ok, err := r.getCachedRetrievalDocuments(ctx, query, false); err != nil {
@@ -106,22 +100,12 @@ func (r *CompositeRetriever) Retrieve(ctx context.Context, query string, opts ..
 	// 尝试向量检索
 	queryVector, err := r.getQueryEmbedding(ctx, query)
 	if err != nil {
-		// 向量化失败时，回退到 Wiki 页面检索（如果可用）
-		if r.wikiRetriever != nil {
-			log.Printf("[Retriever] 向量化失败，回退到 Wiki 页面检索: %v", err)
-			return r.wikiRetriever.Retrieve(ctx, query, opts...)
-		}
 		return nil, fmt.Errorf("生成查询向量失败: %w", err)
 	}
 
 	docs, err := r.vectorDB.Search(ctx, queryVector, topK*2)
 	if err != nil {
 		return nil, fmt.Errorf("向量检索失败: %w", err)
-	}
-
-	// 如果向量检索结果为空且有 Wiki 检索器，补充 Wiki 页面结果
-	if len(docs) == 0 && r.wikiRetriever != nil {
-		return r.wikiRetriever.Retrieve(ctx, query, opts...)
 	}
 
 	if len(docs) > topK {
@@ -195,29 +179,6 @@ func (r *CompositeRetriever) retrieveWithHybrid(ctx context.Context, query strin
 	}
 
 	fused := r.rrfFuse(vectorDocs, keywordDocs, graphDocs, topK)
-
-	// Wiki 页面检索补充（如果有 Wiki 模式的 KB，结果从 wiki_pages 表返回）
-	if r.wikiRetriever != nil {
-		wikiDocs, wikiErr := r.wikiRetriever.Retrieve(ctx, query)
-		if wikiErr != nil {
-			log.Printf("[Retriever] Wiki 页面检索失败（降级继续）: %v", wikiErr)
-		} else if len(wikiDocs) > 0 {
-			seen := make(map[string]struct{}, len(fused))
-			for _, d := range fused {
-				seen[d.ID] = struct{}{}
-			}
-			for _, d := range wikiDocs {
-				if _, exists := seen[d.ID]; !exists {
-					fused = append(fused, &Document{
-						ID:       d.ID,
-						Content:  d.Content,
-						Metadata: d.MetaData,
-					})
-				}
-			}
-			log.Printf("[Retriever] 补充 %d 个 Wiki 页面检索结果", len(wikiDocs))
-		}
-	}
 
 	// 将图谱上下文作为补充信息追加到检索结果中（不占 topK 名额）
 	if graphContextDoc != nil {
