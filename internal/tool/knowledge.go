@@ -245,6 +245,10 @@ func (t *KnowledgeTool) detectConflicts(ctx context.Context, query string, resul
 	}
 
 	content := strings.TrimSpace(resp.Content)
+	// 去除推理模型的 <think>...</think> 标签
+	if idx := strings.Index(content, "</think>"); idx >= 0 {
+		content = strings.TrimSpace(content[idx+len("</think>"):])
+	}
 	content = strings.TrimPrefix(content, "```json")
 	content = strings.TrimPrefix(content, "```")
 	content = strings.TrimSuffix(content, "```")
