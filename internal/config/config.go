@@ -189,6 +189,10 @@ type AgentConfig struct {
 	EnableCodeGraph     bool   `yaml:"enable_code_graph"`
 	CodeSearchReposDir  string `yaml:"code_search_repos_dir"`
 
+	// 知识库工具输出控制
+	MaxContentPerDoc int `yaml:"max_content_per_doc"` // 每篇文档返回给 Agent 的最大字符数（0=使用默认值）
+	MaxTotalContent  int `yaml:"max_total_content"`   // 单次检索返回的总字符数上限（0=使用默认值）
+
 	// Skills 配置（Eino 原生渐进式披露）
 	EnableSkills bool   `yaml:"enable_skills"`
 	SkillsDir    string `yaml:"skills_dir"`
@@ -424,6 +428,12 @@ func setDefaults(cfg *Config) {
 
 	if cfg.Agent.MaxSteps == 0 {
 		cfg.Agent.MaxSteps = 10
+	}
+	if cfg.Agent.MaxContentPerDoc == 0 {
+		cfg.Agent.MaxContentPerDoc = 800
+	}
+	if cfg.Agent.MaxTotalContent == 0 {
+		cfg.Agent.MaxTotalContent = 8000
 	}
 
 	if cfg.Security.PromptGuard.Enabled == nil {

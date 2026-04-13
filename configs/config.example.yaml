@@ -62,6 +62,8 @@ agent:
         当用户询问知识性问题时，优先使用知识库检索工具。
         当需要实时信息时，使用网络搜索工具。
     max_steps: 10
+    max_content_per_doc: 800  # 每篇文档返回给 Agent 的最大字符数（默认 800）
+    max_total_content: 8000   # 单次检索返回的总字符数上限（默认 8000）
     enable_knowledge_tool: true
     enable_web_search: false
     enable_skills: true

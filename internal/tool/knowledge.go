@@ -24,9 +24,11 @@ type ModeRetriever interface {
 
 // KnowledgeTool 知识库检索工具
 type KnowledgeTool struct {
-	retriever retriever.Retriever
-	topK      int
-	lastDocs  []*schema.Document // 缓存最近一次检索结果，供 Agent 模式回填 sources
+	retriever        retriever.Retriever
+	topK             int
+	maxContentPerDoc int                // 每篇文档最大字符数
+	maxTotalContent  int                // 总内容最大字符数
+	lastDocs         []*schema.Document // 缓存最近一次检索结果，供 Agent 模式回填 sources
 }
 
 // KnowledgeToolInput 知识库工具输入
@@ -49,13 +51,21 @@ type KnowledgeResult struct {
 }
 
 // NewKnowledgeTool 创建知识库工具
-func NewKnowledgeTool(r retriever.Retriever, topK int) *KnowledgeTool {
+func NewKnowledgeTool(r retriever.Retriever, topK, maxContentPerDoc, maxTotalContent int) *KnowledgeTool {
 	if topK <= 0 {
 		topK = 5
 	}
+	if maxContentPerDoc <= 0 {
+		maxContentPerDoc = 800
+	}
+	if maxTotalContent <= 0 {
+		maxTotalContent = 8000
+	}
 	return &KnowledgeTool{
-		retriever: r,
-		topK:      topK,
+		retriever:        r,
+		topK:             topK,
+		maxContentPerDoc: maxContentPerDoc,
+		maxTotalContent:  maxTotalContent,
 	}
 }
 
@@ -126,8 +136,6 @@ func (t *KnowledgeTool) InvokableRun(ctx context.Context, input string, opts ...
 	t.lastDocs = append(t.lastDocs, docs...)
 
 	// 转换结果，截断内容防止上下文爆炸
-	const maxContentPerDoc = 500
-	const maxTotalChars = 4000
 	results := make([]KnowledgeResult, 0, t.topK)
 	totalChars := 0
 	for i, doc := range docs {
@@ -139,10 +147,10 @@ func (t *KnowledgeTool) InvokableRun(ctx context.Context, input string, opts ...
 			score = 1.0 - float64(i)*0.1
 		}
 		content := doc.Content
-		if len(content) > maxContentPerDoc {
-			content = content[:maxContentPerDoc] + "..."
+		if len(content) > t.maxContentPerDoc {
+			content = content[:t.maxContentPerDoc] + "..."
 		}
-		if totalChars+len(content) > maxTotalChars && i > 0 {
+		if totalChars+len(content) > t.maxTotalContent && i > 0 {
 			break
 		}
 		totalChars += len(content)
