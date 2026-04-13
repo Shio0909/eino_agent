@@ -266,6 +266,14 @@ func (s *ChatService) buildToolsWithRetriever(runtimeRetriever retriever.Retriev
 		tools = append(tools, internalTool.NewCodeGraphTool(s.codeGraphRepo, s.codeIndexer))
 	}
 
+	// 为所有工具包装参数 schema 自动校验
+	// kt 变量已在包装前赋值，LastDocs() 等方法不受影响
+	for i, t := range tools {
+		if invokable, ok := t.(tool.InvokableTool); ok {
+			tools[i] = internalTool.WrapWithValidation(invokable)
+		}
+	}
+
 	return tools, kt
 }
 
