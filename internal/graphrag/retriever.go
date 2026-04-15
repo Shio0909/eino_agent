@@ -65,7 +65,7 @@ func (g *GraphRetriever) Retrieve(ctx context.Context, query string, opts ...ret
 		return nil, nil
 	}
 
-	log.Printf("[GraphRetriever] 抽取到实体: %v", entities)
+	log.Printf("[GraphRetriever] 抽取到实体: %v", entityNames(entities))
 
 	// 2. 在 Neo4j 中搜索实体及关系
 	graphData, err := g.repository.SearchNode(ctx, *g.namespace, entities)
@@ -82,12 +82,15 @@ func (g *GraphRetriever) Retrieve(ctx context.Context, query string, opts ...ret
 		for _, chunk := range node.Chunks {
 			chunkSet[chunk] = struct{}{}
 		}
-		// 构建实体描述
-		if len(node.Attributes) > 0 {
-			entityInfo = append(entityInfo, fmt.Sprintf("%s(%s)", node.Name, strings.Join(node.Attributes, ", ")))
-		} else {
-			entityInfo = append(entityInfo, node.Name)
+		// 构建实体描述（包含类型信息）
+		desc := node.Name
+		if node.Type != "" && node.Type != "Other" {
+			desc = fmt.Sprintf("[%s]%s", node.Type, node.Name)
 		}
+		if len(node.Attributes) > 0 {
+			desc = fmt.Sprintf("%s(%s)", desc, strings.Join(node.Attributes, ", "))
+		}
+		entityInfo = append(entityInfo, desc)
 	}
 
 	// 4. 构建关系描述
@@ -144,4 +147,17 @@ func (g *GraphRetriever) Retrieve(ctx context.Context, query string, opts ...ret
 	}
 
 	return docs, nil
+}
+
+// entityNames 从 QueryEntity 列表中提取名称列表（用于日志输出）
+func entityNames(entities []QueryEntity) []string {
+	names := make([]string, len(entities))
+	for i, e := range entities {
+		if e.Type != "" && e.Type != "Other" {
+			names[i] = fmt.Sprintf("%s(%s)", e.Name, e.Type)
+		} else {
+			names[i] = e.Name
+		}
+	}
+	return names
 }

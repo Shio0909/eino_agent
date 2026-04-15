@@ -13,9 +13,10 @@ import "context"
 
 // GraphNode 图谱节点 — 对应 Neo4j 中的 ENTITY 标签节点
 type GraphNode struct {
-	Name       string   `json:"name,omitempty"`       // 实体名称
-	Chunks     []string `json:"chunks,omitempty"`     // 关联的文档 Chunk IDs
-	Attributes []string `json:"attributes,omitempty"` // 实体属性列表
+	Name       string   `json:"name,omitempty"`        // 实体名称
+	Type       string   `json:"type,omitempty"`        // 实体类型（Technology/Concept/Component/Person 等）
+	Chunks     []string `json:"chunks,omitempty"`      // 关联的文档 Chunk IDs
+	Attributes []string `json:"attributes,omitempty"`  // 实体属性列表
 }
 
 // GraphRelation 图谱关系
@@ -74,6 +75,12 @@ type VisGraph struct {
 	Edges []VisEdge `json:"edges"`
 }
 
+// QueryEntity 查询时抽取的实体（带类型信息用于图谱检索过滤）
+type QueryEntity struct {
+	Name string `json:"entity"`      // 实体名称
+	Type string `json:"entity_type"` // 实体类型
+}
+
 // ── GraphRAG 配置 ──
 
 // Config GraphRAG 配置
@@ -94,8 +101,8 @@ type GraphRepository interface {
 	AddGraph(ctx context.Context, namespace NameSpace, graphs []*GraphData) error
 	// DelGraph 删除指定命名空间的图数据
 	DelGraph(ctx context.Context, namespaces []NameSpace) error
-	// SearchNode 根据实体名称列表在图中检索
-	SearchNode(ctx context.Context, namespace NameSpace, nodes []string) (*GraphData, error)
+	// SearchNode 根据实体列表在图中检索（支持类型约束）
+	SearchNode(ctx context.Context, namespace NameSpace, entities []QueryEntity) (*GraphData, error)
 	// GetGraphForVis 获取可视化用的子图（节点+边，带 limit）
 	GetGraphForVis(ctx context.Context, namespace NameSpace, limit int) (*VisGraph, error)
 }

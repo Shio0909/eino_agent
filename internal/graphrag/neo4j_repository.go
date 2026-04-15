@@ -104,7 +104,7 @@ func (r *Neo4jRepository) addGraph(ctx context.Context, namespace NameSpace, gra
 			nodeData = append(nodeData, map[string]interface{}{
 				"name":         node.Name,
 				"knowledge_id": namespace.Knowledge,
-				"props":        map[string][]string{"attributes": node.Attributes},
+				"props":        map[string]interface{}{"attributes": node.Attributes, "entity_type": node.Type},
 				"chunks":       node.Chunks,
 				"labels":       r.Labels(namespace),
 			})
@@ -207,18 +207,29 @@ func (r *Neo4jRepository) DelGraph(ctx context.Context, namespaces []NameSpace) 
 	return nil
 }
 
-// SearchNode 根据实体名称列表在 Neo4j 中检索
+// SearchNode 根据实体列表在 Neo4j 中检索（支持类型约束过滤）
 // 使用 CONTAINS 匹配，返回匹配节点及其关系和关联的 Chunk IDs
 func (r *Neo4jRepository) SearchNode(
 	ctx context.Context,
 	namespace NameSpace,
-	nodes []string,
+	entities []QueryEntity,
 ) (*GraphData, error) {
 	if r.driver == nil {
 		return nil, nil
 	}
 	session := r.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
 	defer session.Close(ctx)
+
+	// 提取实体名称列表用于 Cypher 匹配
+	entityNames := make([]string, len(entities))
+	// 构建名称→类型映射，用于后过滤
+	entityTypeMap := make(map[string]string)
+	for i, e := range entities {
+		entityNames[i] = e.Name
+		if e.Type != "" && e.Type != "Other" {
+			entityTypeMap[strings.ToLower(e.Name)] = e.Type
+		}
+	}
 
 	result, err := session.ExecuteRead(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
 		labelExpr := r.Label(namespace)
@@ -248,7 +259,7 @@ func (r *Neo4jRepository) SearchNode(
 				LIMIT $maxResults
 			`
 		}
-		params := map[string]interface{}{"nodes": nodes, "maxResults": 200}
+		params := map[string]interface{}{"nodes": entityNames, "maxResults": 200}
 		result, err := tx.Run(ctx, query, params)
 		if err != nil {
 			return nil, fmt.Errorf("Cypher 查询失败: %w", err)
@@ -273,8 +284,10 @@ func (r *Neo4jRepository) SearchNode(
 				}
 				if !nodeSeen[nameStr] {
 					nodeSeen[nameStr] = true
+					entityType, _ := n.Props["entity_type"].(string)
 					graphData.Node = append(graphData.Node, &GraphNode{
 						Name:       nameStr,
+						Type:       entityType,
 						Chunks:     listToStrings(n.Props["chunks"]),
 						Attributes: listToStrings(n.Props["attributes"]),
 					})
@@ -291,6 +304,43 @@ func (r *Neo4jRepository) SearchNode(
 				Type:  relData.Type,
 			})
 		}
+
+		// 类型后过滤：如果查询实体指定了类型，降低不匹配类型的节点优先级
+		if len(entityTypeMap) > 0 {
+			filtered := make([]*GraphNode, 0, len(graphData.Node))
+			for _, node := range graphData.Node {
+				// 检查此节点是否匹配了某个带类型的查询实体
+				nameLower := strings.ToLower(node.Name)
+				matched := false
+				for queryName, queryType := range entityTypeMap {
+					if strings.Contains(nameLower, queryName) || strings.Contains(queryName, nameLower) {
+						if node.Type != "" && node.Type != queryType {
+							continue // 类型不匹配，跳过
+						}
+						matched = true
+						break
+					}
+				}
+				// 保留：类型匹配的、没有类型约束的、以及通过关系连接的邻居节点
+				if matched || node.Type == "" {
+					filtered = append(filtered, node)
+				} else {
+					// 非直接匹配的节点（邻居节点）保留
+					isDirectMatch := false
+					for _, name := range entityNames {
+						if strings.Contains(nameLower, strings.ToLower(name)) || strings.Contains(strings.ToLower(name), nameLower) {
+							isDirectMatch = true
+							break
+						}
+					}
+					if !isDirectMatch {
+						filtered = append(filtered, node) // 邻居节点不过滤
+					}
+				}
+			}
+			graphData.Node = filtered
+		}
+
 		return graphData, nil
 	})
 	if err != nil {
