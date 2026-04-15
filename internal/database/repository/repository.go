@@ -195,6 +195,7 @@ type SessionRepository interface {
 	GetByID(ctx context.Context, id string) (*Session, error)
 	List(ctx context.Context, tenantID int, userID string, offset, limit int) ([]*Session, error)
 	Delete(ctx context.Context, id string) error
+	TouchUpdatedAt(ctx context.Context, id string) error
 }
 
 // MessageRepository 消息仓储接口
@@ -627,6 +628,11 @@ func (r *pgChunkRepo) DeleteByKnowledgeID(ctx context.Context, knowledgeID strin
 
 func (r *pgSessionRepo) Delete(ctx context.Context, id string) error {
 	_, err := r.db.Pool().Exec(ctx, `UPDATE sessions SET deleted_at = CURRENT_TIMESTAMP WHERE id = $1`, id)
+	return err
+}
+
+func (r *pgSessionRepo) TouchUpdatedAt(ctx context.Context, id string) error {
+	_, err := r.db.Pool().Exec(ctx, `UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND deleted_at IS NULL`, id)
 	return err
 }
 

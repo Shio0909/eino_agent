@@ -60,10 +60,10 @@ func NewKnowledgeTool(r retriever.Retriever, topK, maxContentPerDoc, maxTotalCon
 		topK = 5
 	}
 	if maxContentPerDoc <= 0 {
-		maxContentPerDoc = 800
+		maxContentPerDoc = 1500
 	}
 	if maxTotalContent <= 0 {
-		maxTotalContent = 8000
+		maxTotalContent = 15000
 	}
 	return &KnowledgeTool{
 		retriever:        r,

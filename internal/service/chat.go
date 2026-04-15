@@ -497,7 +497,7 @@ func (s *ChatService) buildMemoryInstruction(ctx context.Context, req *ChatReque
 
 	maxChars := s.config.Memory.MaxContextChars
 	if maxChars <= 0 {
-		maxChars = 3000
+		maxChars = 5000
 	}
 
 	parts := make([]string, 0, 2)
@@ -601,7 +601,7 @@ func formatMemoryMessages(messages []*repository.Message, maxChars int) string {
 		}
 		sb.WriteString(role)
 		sb.WriteString(": ")
-		sb.WriteString(truncateText(content, 180))
+		sb.WriteString(truncateText(content, 400))
 		sb.WriteString("\n")
 		if sb.Len() >= maxChars {
 			break

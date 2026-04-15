@@ -66,5 +66,13 @@ func (s *ChatService) saveAssistantMessage(ctx context.Context, sessionID, conte
 		log.Printf("[ChatService] save assistant message failed: %v", err)
 		return
 	}
+
+	// 刷新 session.updated_at，确保长期记忆按活跃度排序
+	if s.sessionRepo != nil {
+		if err := s.sessionRepo.TouchUpdatedAt(ctx, sessionID); err != nil {
+			log.Printf("[ChatService] touch session updated_at failed (session=%s): %v", sessionID, err)
+		}
+	}
+
 	s.refreshSessionCache(ctx, sessionID, msg)
 }

@@ -433,10 +433,10 @@ func setDefaults(cfg *Config) {
 		cfg.Agent.MaxSteps = 10
 	}
 	if cfg.Agent.MaxContentPerDoc == 0 {
-		cfg.Agent.MaxContentPerDoc = 800
+		cfg.Agent.MaxContentPerDoc = 1500
 	}
 	if cfg.Agent.MaxTotalContent == 0 {
-		cfg.Agent.MaxTotalContent = 8000
+		cfg.Agent.MaxTotalContent = 15000
 	}
 
 	if cfg.Security.PromptGuard.Enabled == nil {
