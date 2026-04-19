@@ -622,8 +622,16 @@ func (db *PgVectorDB) Close() error {
 	return nil
 }
 
-// MilvusVectorDB Milvus 实现
-// TODO: 实际实现
+// MilvusVectorDB Milvus 实现（未完成）
+//
+// TODO: 实现 Milvus 支持。需要:
+//   - 引入 go.milvus.io/milvus-sdk-go/v2 依赖
+//   - 在 newMilvusVectorDB 中建立 gRPC 连接并创建 Collection
+//   - 实现 Upsert（InsertRows + Flush）、Search（Search with ANN）
+//   - 实现 Delete/DeleteByKnowledgeID/DeleteByKnowledgeBaseID（Delete by expr）
+//
+// 当前 newMilvusVectorDB 始终返回错误，系统会自动降级到 pgvector。
+// 若不打算支持 Milvus，可删除此文件中整个 MilvusVectorDB 结构体及其方法。
 type MilvusVectorDB struct {
 	dimensions int
 }
