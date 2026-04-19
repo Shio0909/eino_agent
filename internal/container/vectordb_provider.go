@@ -1,7 +1,7 @@
 // Package container - 向量数据库提供者实现
 //
 // 【Eino 特点】支持多种向量数据库后端
-// 支持: PostgreSQL+pgvector, Milvus, 内存存储
+// 支持: PostgreSQL+pgvector, 内存存储
 package container
 
 import (
@@ -23,16 +23,7 @@ import (
 
 // NewVectorDBProvider 创建向量数据库提供者
 func NewVectorDBProvider(ctx context.Context, cfg *config.DatabaseConfig, dimensions int) (VectorDBProvider, CleanupFunc, error) {
-	// 优先使用 Milvus
-	if cfg.MilvusAddr != "" {
-		db, cleanup, err := newMilvusVectorDB(ctx, cfg, dimensions)
-		if err == nil {
-			return db, cleanup, nil
-		}
-		fmt.Printf("[VectorDB] Milvus 初始化失败，降级到内存存储: %v\n", err)
-	}
-
-	// 其次使用 PostgreSQL + pgvector
+	// 使用 PostgreSQL + pgvector
 	if cfg.Host != "" && cfg.DBName != "" {
 		db, cleanup, err := newPgVectorDB(ctx, cfg, dimensions)
 		if err == nil {
@@ -612,45 +603,3 @@ func (db *PgVectorDB) Close() error {
 	return nil
 }
 
-// MilvusVectorDB Milvus 实现（未完成）
-//
-// TODO: 实现 Milvus 支持。需要:
-//   - 引入 go.milvus.io/milvus-sdk-go/v2 依赖
-//   - 在 newMilvusVectorDB 中建立 gRPC 连接并创建 Collection
-//   - 实现 Upsert（InsertRows + Flush）、Search（Search with ANN）
-//   - 实现 Delete/DeleteByKnowledgeID/DeleteByKnowledgeBaseID（Delete by expr）
-//
-// 当前 newMilvusVectorDB 始终返回错误，系统会自动降级到 pgvector。
-// 若不打算支持 Milvus，可删除此文件中整个 MilvusVectorDB 结构体及其方法。
-type MilvusVectorDB struct {
-	dimensions int
-}
-
-func newMilvusVectorDB(ctx context.Context, cfg *config.DatabaseConfig, dimensions int) (*MilvusVectorDB, CleanupFunc, error) {
-	// TODO: 实现 Milvus 连接
-	return nil, nil, fmt.Errorf("Milvus 暂未实现，请使用内存存储")
-}
-
-func (db *MilvusVectorDB) Upsert(ctx context.Context, docs []*Document) error {
-	return fmt.Errorf("未实现")
-}
-
-func (db *MilvusVectorDB) Search(ctx context.Context, vector []float32, topK int) ([]*Document, error) {
-	return nil, fmt.Errorf("未实现")
-}
-
-func (db *MilvusVectorDB) Delete(ctx context.Context, ids []string) error {
-	return fmt.Errorf("未实现")
-}
-
-func (db *MilvusVectorDB) DeleteByKnowledgeID(ctx context.Context, knowledgeID string) error {
-	return fmt.Errorf("未实现")
-}
-
-func (db *MilvusVectorDB) DeleteByKnowledgeBaseID(ctx context.Context, kbID string) error {
-	return fmt.Errorf("未实现")
-}
-
-func (db *MilvusVectorDB) Close() error {
-	return nil
-}
