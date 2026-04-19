@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"regexp"
 	"strings"
@@ -341,6 +342,13 @@ func Load(path string) (*Config, error) {
 	// 设置默认值
 	setDefaults(&cfg)
 
+	// 安全校验
+	if warnings := cfg.Validate(); len(warnings) > 0 {
+		for _, w := range warnings {
+			log.Printf("[Config] ⚠️  %s", w)
+		}
+	}
+
 	return &cfg, nil
 }
 
@@ -360,6 +368,53 @@ func Save(path string, cfg *Config) error {
 	}
 
 	return nil
+}
+
+// weakPasswords 常见弱密码集合
+var weakPasswords = map[string]bool{
+	"":              true,
+	"admin":         true,
+	"admin123":      true,
+	"password":      true,
+	"123456":        true,
+	"user123":       true,
+	"change-me":     true,
+	"change_me":     true,
+	"changeme":      true,
+	"test":          true,
+	"test123":       true,
+}
+
+// Validate 校验配置安全性，返回警告列表
+func (cfg *Config) Validate() []string {
+	var warnings []string
+
+	if cfg.Auth.Enabled {
+		if cfg.Auth.JWTSecret == "change-me-in-production" || len(cfg.Auth.JWTSecret) < 16 {
+			warnings = append(warnings, "JWT secret 过短或为默认值，请设置至少 16 字符的随机密钥")
+		}
+		if cfg.Auth.AdminPassword == "" {
+			warnings = append(warnings, "auth.admin_password 未配置，认证登录将失败。请在配置文件或 ADMIN_PASSWORD 环境变量中设置")
+		} else if weakPasswords[cfg.Auth.AdminPassword] {
+			warnings = append(warnings, "auth.admin_password 使用了弱密码，请设置更强的密码")
+		}
+		if cfg.Auth.UserPassword == "" {
+			warnings = append(warnings, "auth.user_password 未配置。请在配置文件或 USER_PASSWORD 环境变量中设置")
+		} else if weakPasswords[cfg.Auth.UserPassword] {
+			warnings = append(warnings, "auth.user_password 使用了弱密码，请设置更强的密码")
+		}
+	}
+
+	if cfg.Server.Mode == "release" {
+		if cfg.Auth.JWTSecret == "change-me-in-production" {
+			warnings = append(warnings, "[FATAL] Release 模式下禁止使用默认 JWT 密钥")
+		}
+		if !cfg.Auth.Enabled {
+			warnings = append(warnings, "Release 模式建议启用认证（auth.enabled: true）")
+		}
+	}
+
+	return warnings
 }
 
 // setDefaults 设置默认值
@@ -383,20 +438,15 @@ func setDefaults(cfg *Config) {
 	if cfg.Auth.AdminTenantID == 0 {
 		cfg.Auth.AdminTenantID = 1
 	}
+	// 不再提供默认密码：auth.enabled=true 时必须显式配置
 	if cfg.Auth.AdminUsername == "" {
 		cfg.Auth.AdminUsername = "admin"
-	}
-	if cfg.Auth.AdminPassword == "" {
-		cfg.Auth.AdminPassword = "admin123"
 	}
 	if cfg.Auth.UserTenantID == 0 {
 		cfg.Auth.UserTenantID = cfg.Auth.AdminTenantID
 	}
 	if cfg.Auth.UserUsername == "" {
 		cfg.Auth.UserUsername = "user"
-	}
-	if cfg.Auth.UserPassword == "" {
-		cfg.Auth.UserPassword = "user123"
 	}
 
 	if cfg.LLM.Temperature == 0 {

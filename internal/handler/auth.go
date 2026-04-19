@@ -48,10 +48,10 @@ func (h *Handler) Login(c *gin.Context) {
 
 	role := ""
 	tenantID := 0
-	if req.Username == h.cfg.Auth.AdminUsername && req.Password == h.cfg.Auth.AdminPassword {
+	if h.cfg.Auth.AdminPassword != "" && req.Username == h.cfg.Auth.AdminUsername && req.Password == h.cfg.Auth.AdminPassword {
 		role = "admin"
 		tenantID = h.cfg.Auth.AdminTenantID
-	} else if req.Username == h.cfg.Auth.UserUsername && req.Password == h.cfg.Auth.UserPassword {
+	} else if h.cfg.Auth.UserPassword != "" && req.Username == h.cfg.Auth.UserUsername && req.Password == h.cfg.Auth.UserPassword {
 		role = "user"
 		tenantID = h.cfg.Auth.UserTenantID
 	}

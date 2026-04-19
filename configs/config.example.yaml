@@ -4,14 +4,14 @@ server:
     mode: release
 auth:
     enabled: false
-    jwt_secret: change-me-in-production
+    jwt_secret: ${JWT_SECRET:-}  # 必须设置至少 16 字符随机密钥
     access_token_expire_minutes: 120
     admin_tenant_id: 1
     admin_username: admin
-    admin_password: change-me
+    admin_password: ${ADMIN_PASSWORD:-}  # auth.enabled=true 时必须配置
     user_tenant_id: 1
     user_username: user
-    user_password: change-me
+    user_password: ${USER_PASSWORD:-}  # auth.enabled=true 时必须配置
 llm:
     provider: openai
     base_url: https://api.siliconflow.cn/v1

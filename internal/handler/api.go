@@ -169,7 +169,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		// 鉴权
 		auth := v1.Group("/auth")
 		{
-			auth.POST("/login", h.Login)
+			auth.POST("/login", AuthRateLimitMiddleware(), h.Login)
 			auth.GET("/me", h.AuthRequired(), h.Me)
 		}
 

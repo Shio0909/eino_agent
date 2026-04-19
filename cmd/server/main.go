@@ -72,6 +72,9 @@ func main() {
 	if cfg.Auth.Enabled && cfg.Auth.JWTSecret == "change-me-in-production" && cfg.Server.Mode == "release" {
 		log.Fatal("[Config] JWT 密钥未配置！请在配置文件中设置 auth.jwt_secret")
 	}
+	if cfg.Auth.Enabled && cfg.Auth.AdminPassword == "" && cfg.Server.Mode == "release" {
+		log.Fatal("[Config] 管理员密码未配置！请设置 auth.admin_password 或 ADMIN_PASSWORD 环境变量")
+	}
 
 	log.Println("========================================")
 	log.Println("    Eino RAG Service - 知识库问答系统    ")
@@ -459,6 +462,7 @@ func main() {
 	r.Use(handler.TraceIDMiddleware())
 	r.Use(handler.RequestLogger())
 	r.Use(metrics.PrometheusMiddleware())
+	r.Use(handler.RateLimitMiddleware(handler.DefaultRateLimiterConfig()))
 
 	// CORS 配置
 	corsOrigins := cfg.Server.CORSOrigins
