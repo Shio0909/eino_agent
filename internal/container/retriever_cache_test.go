@@ -35,6 +35,8 @@ type fakeVectorDB struct {
 func (f *fakeVectorDB) Upsert(context.Context, []*Document) error { return nil }
 func (f *fakeVectorDB) Delete(context.Context, []string) error    { return nil }
 func (f *fakeVectorDB) Close() error                              { return nil }
+func (f *fakeVectorDB) DeleteByKnowledgeID(context.Context, string) error     { return nil }
+func (f *fakeVectorDB) DeleteByKnowledgeBaseID(context.Context, string) error { return nil }
 
 func (f *fakeVectorDB) Search(context.Context, []float32, int) ([]*Document, error) {
 	f.searchCalls++

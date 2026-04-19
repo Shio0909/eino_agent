@@ -3,6 +3,8 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -198,6 +200,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			kb.GET("/:id/documents/:docId/status", h.GetDocumentImportStatus)
 			kb.GET("/:id/documents/:docId/chunks", h.GetDocumentChunks)
 			kb.POST("/:id/documents/:docId/reindex", h.ReindexDocument)
+			kb.POST("/:id/documents/:docId/sync", h.SyncDocument)
 			kb.DELETE("/:id/documents/:docId", h.DeleteDocument)
 		}
 
@@ -1398,6 +1401,12 @@ func (h *Handler) uploadWikiDocument(c *gin.Context, kb *repository.KnowledgeBas
 	})
 }
 
+// contentHash 计算内容的 SHA256 哈希
+func contentHash(content string) string {
+	h := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(h[:])
+}
+
 func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeID, filename string, content []byte) (int, error) {
 	rawDoc := &document.RawDocument{
 		ID:      knowledgeID,
@@ -1468,6 +1477,33 @@ func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeI
 
 	if err := h.vectorDB.Upsert(ctx, chunks); err != nil {
 		return len(chunks), fmt.Errorf("存储失败: %w", err)
+	}
+
+	// 双写：同步写入 PG chunks 表（供 chunk 预览 + 增量 diff）
+	if h.chunkRepo != nil {
+		pgChunks := make([]*repository.Chunk, len(chunks))
+		for i, ch := range chunks {
+			pgChunks[i] = &repository.Chunk{
+				ID:              ch.ID,
+				KnowledgeID:     knowledgeID,
+				KnowledgeBaseID: kbID,
+				ChunkIndex:      i,
+				Content:         ch.Content,
+				ContentLength:   len(ch.Content),
+				ContentHash:     contentHash(ch.Content),
+			}
+		}
+		if err := h.chunkRepo.BatchCreate(ctx, pgChunks); err != nil {
+			log.Printf("[DualWrite] PG chunks 写入失败（向量已存储）: knowledge=%s err=%v", knowledgeID, err)
+		}
+	}
+
+	// 更新文档级内容哈希
+	if h.knowledgeRepo != nil {
+		docHash := contentHash(string(content))
+		if err := h.knowledgeRepo.UpdateContentHash(ctx, knowledgeID, docHash); err != nil {
+			log.Printf("[DualWrite] 文档 content_hash 更新失败: knowledge=%s err=%v", knowledgeID, err)
+		}
 	}
 
 	return len(chunks), nil
@@ -1645,6 +1681,27 @@ func (h *Handler) processAndStoreChunks(ctx context.Context, kbID, knowledgeID, 
 	// 存储
 	if err := h.vectorDB.Upsert(ctx, docs); err != nil {
 		return err
+	}
+
+	// 双写：同步写入 PG chunks 表（供 chunk 预览 + 增量 diff）
+	if h.chunkRepo != nil {
+		pgChunks := make([]*repository.Chunk, len(docs))
+		for i, d := range docs {
+			pgChunks[i] = &repository.Chunk{
+				ID:              d.ID,
+				KnowledgeID:     knowledgeID,
+				KnowledgeBaseID: kbID,
+				ChunkIndex:      i,
+				Content:         d.Content,
+				ContentLength:   len(d.Content),
+				ContentHash:     contentHash(d.Content),
+				StartPos:        chunks[i].Start,
+				EndPos:          chunks[i].End,
+			}
+		}
+		if err := h.chunkRepo.BatchCreate(ctx, pgChunks); err != nil {
+			log.Printf("[DualWrite] PG chunks 写入失败（向量已存储）: knowledge=%s err=%v", knowledgeID, err)
+		}
 	}
 
 	// 异步构建 GraphRAG 图谱
@@ -1966,6 +2023,12 @@ func (h *Handler) ReindexDocument(c *gin.Context) {
 			log.Printf("[Reindex] 清除旧向量失败（继续）: doc=%s err=%v", docID, err)
 		}
 	}
+	// 清除 PG chunks 表旧数据
+	if h.chunkRepo != nil {
+		if err := h.chunkRepo.DeleteByKnowledgeID(c.Request.Context(), docID); err != nil {
+			log.Printf("[Reindex] 清除旧 PG chunks 失败（继续）: doc=%s err=%v", docID, err)
+		}
+	}
 
 	// 重置解析状态
 	if err := h.knowledgeRepo.UpdateParseStatus(c.Request.Context(), docID, "pending", "", 0); err != nil {
@@ -1988,6 +2051,305 @@ func (h *Handler) ReindexDocument(c *gin.Context) {
 			}
 		}()
 		c.JSON(http.StatusAccepted, gin.H{"message": "重新向量化已开始（后台处理）", "doc_id": docID})
+	}
+}
+
+// SyncDocument 增量同步文档：仅重新嵌入发生变化的 chunk
+// @Summary 增量同步文档
+// @Description 对比文档内容哈希，仅对变化的 chunk 重新向量化（跳过未变 chunk）
+// @Tags 知识库
+// @Produce json
+// @Param id path string true "知识库 ID"
+// @Param docId path string true "文档 ID"
+// @Success 200 {object} map[string]interface{}
+// @Router /knowledge-bases/{id}/documents/{docId}/sync [post]
+func (h *Handler) SyncDocument(c *gin.Context) {
+	kbID := c.Param("id")
+	docID := c.Param("docId")
+
+	if h.kbRepo != nil {
+		if _, ok := h.ensureKnowledgeBaseAccess(c, kbID); !ok {
+			return
+		}
+	}
+	if h.knowledgeRepo == nil || h.chunkRepo == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "数据库未连接"})
+		return
+	}
+
+	k, err := h.knowledgeRepo.GetByID(c.Request.Context(), docID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if k == nil || k.KnowledgeBaseID != kbID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "文档不存在"})
+		return
+	}
+	if k.ParseStatus == "processing" {
+		c.JSON(http.StatusConflict, gin.H{"error": "文档正在处理中，请稍后再试"})
+		return
+	}
+
+	// 获取最新内容
+	newContent, err := h.fetchDocumentContent(c.Request.Context(), k)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "获取文档内容失败: " + err.Error()})
+		return
+	}
+
+	// Layer 1: 文档级哈希比对
+	newDocHash := contentHash(string(newContent))
+	if k.ContentHash != "" && k.ContentHash == newDocHash {
+		c.JSON(http.StatusOK, gin.H{
+			"message":  "文档内容未变化，跳过同步",
+			"doc_id":   docID,
+			"skipped":  true,
+			"added":    0,
+			"removed":  0,
+			"retained": k.ChunkCount,
+		})
+		return
+	}
+
+	// 后台执行增量同步
+	go func() {
+		bgCtx := context.Background()
+		result, syncErr := h.incrementalSync(bgCtx, kbID, docID, k.FileName, newContent, newDocHash)
+		if syncErr != nil {
+			log.Printf("[Sync] 增量同步失败: doc=%s err=%v", docID, syncErr)
+			h.markKnowledgeFailed(bgCtx, docID, 0, syncErr)
+			return
+		}
+		log.Printf("[Sync] 增量同步完成: doc=%s added=%d removed=%d retained=%d",
+			docID, result.Added, result.Removed, result.Retained)
+		h.markKnowledgeCompleted(bgCtx, &repository.Knowledge{ID: docID, KnowledgeBaseID: kbID}, result.Added+result.Retained)
+	}()
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"message": "增量同步已开始（后台处理）",
+		"doc_id":  docID,
+	})
+}
+
+type syncResult struct {
+	Added    int
+	Removed  int
+	Retained int
+}
+
+// incrementalSync 执行 chunk 级增量同步
+func (h *Handler) incrementalSync(ctx context.Context, kbID, knowledgeID, filename string, content []byte, docHash string) (*syncResult, error) {
+	if err := h.knowledgeRepo.UpdateParseStatus(ctx, knowledgeID, "processing", "", 0); err != nil {
+		return nil, err
+	}
+
+	// 重新分块
+	rawDoc := &document.RawDocument{
+		ID:      knowledgeID,
+		Source:  filename,
+		Content: string(content),
+		Metadata: map[string]interface{}{
+			"filename":     filename,
+			"knowledge_id": knowledgeID,
+		},
+	}
+	var chunkerOpts []document.ChunkerOption
+	if (h.cfg.RAG.ChunkStrategy == "semantic" || h.cfg.RAG.ChunkStrategy == "auto") && h.embedding != nil {
+		chunkerOpts = append(chunkerOpts, document.WithEmbedder(h.embedding))
+		if h.cfg.RAG.SemanticSimilarityPct > 0 {
+			chunkerOpts = append(chunkerOpts, document.WithSimilarityPct(h.cfg.RAG.SemanticSimilarityPct))
+		}
+	}
+	chunker := document.NewChunker(h.cfg.RAG.ChunkStrategy, h.cfg.RAG.ChunkSize, h.cfg.RAG.ChunkOverlap, filename, chunkerOpts...)
+	newChunks, err := chunker.Chunk(ctx, rawDoc)
+	if err != nil {
+		return nil, fmt.Errorf("分块失败: %w", err)
+	}
+
+	// 计算新 chunk 哈希
+	newHashMap := make(map[string]int) // content_hash → index in newChunks
+	for i, ch := range newChunks {
+		newHashMap[contentHash(ch.Content)] = i
+	}
+
+	// Layer 2: 获取旧 chunk 哈希
+	oldHashMap, err := h.chunkRepo.GetHashesByKnowledgeID(ctx, knowledgeID)
+	if err != nil {
+		log.Printf("[Sync] 获取旧哈希失败，回退全量: %v", err)
+		return h.fullReindex(ctx, kbID, knowledgeID, filename, content, docHash)
+	}
+
+	// Diff: 分类为 keep / add / remove
+	var (
+		retainedIDs []string           // 旧 chunk 保留的 ID
+		removeIDs   []string           // 旧 chunk 需删除的 ID
+		addIndices  []int              // 新 chunk 需新增的索引
+	)
+
+	// 标记保留和删除
+	for oldHash, oldID := range oldHashMap {
+		if _, exists := newHashMap[oldHash]; exists {
+			retainedIDs = append(retainedIDs, oldID)
+			delete(newHashMap, oldHash) // 从待添加中移除
+		} else {
+			removeIDs = append(removeIDs, oldID)
+		}
+	}
+	// 剩下的 newHashMap 就是需要新增的
+	for _, idx := range newHashMap {
+		addIndices = append(addIndices, idx)
+	}
+
+	result := &syncResult{
+		Added:    len(addIndices),
+		Removed:  len(removeIDs),
+		Retained: len(retainedIDs),
+	}
+
+	// 删除过期 chunk（vectorDB + PG）
+	if len(removeIDs) > 0 {
+		if h.vectorDB != nil {
+			if err := h.vectorDB.Delete(ctx, removeIDs); err != nil {
+				log.Printf("[Sync] 删除旧向量失败: %v", err)
+			}
+		}
+		if err := h.chunkRepo.DeleteByIDs(ctx, removeIDs); err != nil {
+			log.Printf("[Sync] 删除旧 PG chunks 失败: %v", err)
+		}
+	}
+
+	// 嵌入并存储新 chunk
+	if len(addIndices) > 0 {
+		sort.Ints(addIndices)
+		addDocs := make([]*container.Document, len(addIndices))
+		addContents := make([]string, len(addIndices))
+		batchPrefix := time.Now().UnixNano()
+
+		for j, idx := range addIndices {
+			ch := newChunks[idx]
+			chunkID := fmt.Sprintf("%s_chunk_%d_%d", kbID, batchPrefix, idx)
+			addDocs[j] = &container.Document{
+				ID:      chunkID,
+				Content: ch.Content,
+				Metadata: map[string]interface{}{
+					"knowledge_base_id": kbID,
+					"knowledge_id":      knowledgeID,
+					"chunk_id":          chunkID,
+					"chunk_index":       idx,
+					"source_filename":   filename,
+					"uploaded_at":       time.Now().Format(time.RFC3339),
+				},
+			}
+			addContents[j] = ch.Content
+		}
+
+		// 批量向量化
+		const maxEmbedBatchSize = 64
+		vectors := make([][]float32, len(addContents))
+		for start := 0; start < len(addContents); start += maxEmbedBatchSize {
+			end := start + maxEmbedBatchSize
+			if end > len(addContents) {
+				end = len(addContents)
+			}
+			batchVectors, err := container.BatchEmbedFloat32(ctx, h.embedding, addContents[start:end])
+			if err != nil {
+				return nil, fmt.Errorf("向量化新 chunk 失败: %w", err)
+			}
+			copy(vectors[start:end], batchVectors)
+		}
+
+		for j, doc := range addDocs {
+			doc.Vector = vectors[j]
+		}
+
+		if err := h.vectorDB.Upsert(ctx, addDocs); err != nil {
+			return nil, fmt.Errorf("存储新向量失败: %w", err)
+		}
+
+		// 双写 PG
+		pgChunks := make([]*repository.Chunk, len(addDocs))
+		for j, d := range addDocs {
+			pgChunks[j] = &repository.Chunk{
+				ID:              d.ID,
+				KnowledgeID:     knowledgeID,
+				KnowledgeBaseID: kbID,
+				ChunkIndex:      addIndices[j],
+				Content:         d.Content,
+				ContentLength:   len(d.Content),
+				ContentHash:     contentHash(d.Content),
+			}
+		}
+		if err := h.chunkRepo.BatchCreate(ctx, pgChunks); err != nil {
+			log.Printf("[Sync] PG chunks 写入失败（向量已存储）: %v", err)
+		}
+	}
+
+	// 更新文档级哈希
+	if err := h.knowledgeRepo.UpdateContentHash(ctx, knowledgeID, docHash); err != nil {
+		log.Printf("[Sync] 更新文档 content_hash 失败: %v", err)
+	}
+
+	return result, nil
+}
+
+// fullReindex 全量重建回退（当旧哈希不可用时）
+func (h *Handler) fullReindex(ctx context.Context, kbID, knowledgeID, filename string, content []byte, docHash string) (*syncResult, error) {
+	// 清除所有旧数据
+	if h.vectorDB != nil {
+		_ = h.vectorDB.DeleteByKnowledgeID(ctx, knowledgeID)
+	}
+	if h.chunkRepo != nil {
+		_ = h.chunkRepo.DeleteByKnowledgeID(ctx, knowledgeID)
+	}
+
+	chunkCount, err := h.processPlainTextDocument(ctx, kbID, knowledgeID, filename, content)
+	if err != nil {
+		return nil, err
+	}
+	return &syncResult{Added: chunkCount, Removed: 0, Retained: 0}, nil
+}
+
+// fetchDocumentContent 获取文档最新内容
+func (h *Handler) fetchDocumentContent(ctx context.Context, k *repository.Knowledge) ([]byte, error) {
+	switch k.SourceType {
+	case "url":
+		sourceURL := ""
+		if k.Metadata != nil {
+			if u, ok := k.Metadata["source_url"].(string); ok {
+				sourceURL = u
+			}
+		}
+		if sourceURL == "" {
+			return nil, fmt.Errorf("无法获取原始 URL")
+		}
+		client := &http.Client{Timeout: 60 * time.Second}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; EinoAgent/1.0)")
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+		return io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+
+	case "file":
+		if k.FilePath == nil || *k.FilePath == "" {
+			return nil, fmt.Errorf("原始文件路径为空")
+		}
+		if _, err := os.Stat(*k.FilePath); err != nil {
+			return nil, fmt.Errorf("原始文件已清理，无法同步；请重新上传")
+		}
+		return os.ReadFile(*k.FilePath)
+
+	default:
+		return nil, fmt.Errorf("不支持的来源类型: %s", k.SourceType)
 	}
 }
 

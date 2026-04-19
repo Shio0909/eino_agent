@@ -52,6 +52,8 @@ func (m *mockKBRepo) List(_ context.Context, _ int, _, _ int) ([]*repository.Kno
 func (m *mockKBRepo) Update(_ context.Context, _ *repository.KnowledgeBase) error { return nil }
 func (m *mockKBRepo) Delete(_ context.Context, _ string) error                     { return nil }
 func (m *mockKBRepo) IncrementCounts(_ context.Context, _ string, _, _ int) error  { return nil }
+func (m *mockKBRepo) Count(_ context.Context, _ int) (int, error)                  { return 0, nil }
+func (m *mockKBRepo) UpdateEmbedFingerprint(_ context.Context, _, _ string) error  { return nil }
 
 type mockCodeSearchProvider struct {
 	result string

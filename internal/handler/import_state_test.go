@@ -62,6 +62,10 @@ func (r *fakeKnowledgeBaseRepo) IncrementCounts(_ context.Context, _ string, _ i
 	r.chunkDeltas = append(r.chunkDeltas, chunkDelta)
 	return nil
 }
+func (r *fakeKnowledgeBaseRepo) Count(context.Context, int) (int, error) { return 0, nil }
+func (r *fakeKnowledgeBaseRepo) UpdateEmbedFingerprint(context.Context, string, string) error {
+	return nil
+}
 
 type fakeKnowledgeRepo struct {
 	items         map[string]*repository.Knowledge
@@ -108,6 +112,8 @@ func (r *fakeKnowledgeRepo) UpdateParseStatus(_ context.Context, id, status, err
 	return nil
 }
 func (r *fakeKnowledgeRepo) Delete(context.Context, string) error { return nil }
+func (r *fakeKnowledgeRepo) CountByKnowledgeBase(context.Context, string) (int, error) { return 0, nil }
+func (r *fakeKnowledgeRepo) UpdateContentHash(context.Context, string, string) error { return nil }
 
 func TestMarkKnowledgeCompletedUpdatesImportState(t *testing.T) {
 	store := newMemoryImportStateStore()

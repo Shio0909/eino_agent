@@ -66,6 +66,7 @@ type Knowledge struct {
 	ParseStatus     string    `json:"parse_status"` // pending, processing, completed, failed
 	ParseError      *string   `json:"parse_error"`
 	ChunkCount      int       `json:"chunk_count"`
+	ContentHash     string    `json:"content_hash"` // SHA256 of raw document content
 	Metadata        JSON      `json:"metadata"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
@@ -79,6 +80,7 @@ type Chunk struct {
 	ChunkIndex      int       `json:"chunk_index"`
 	Content         string    `json:"content"`
 	ContentLength   int       `json:"content_length"`
+	ContentHash     string    `json:"content_hash"` // SHA256 of chunk content
 	ParentChunkID   *string   `json:"parent_chunk_id"`
 	StartPos        int       `json:"start_pos"`
 	EndPos          int       `json:"end_pos"`
@@ -175,6 +177,7 @@ type KnowledgeRepository interface {
 	ListByKnowledgeBase(ctx context.Context, kbID string, offset, limit int) ([]*Knowledge, error)
 	CountByKnowledgeBase(ctx context.Context, kbID string) (int, error)
 	UpdateParseStatus(ctx context.Context, id, status, errorMsg string, chunkCount int) error
+	UpdateContentHash(ctx context.Context, id, hash string) error
 	Delete(ctx context.Context, id string) error
 }
 
@@ -182,6 +185,8 @@ type KnowledgeRepository interface {
 type ChunkRepository interface {
 	BatchCreate(ctx context.Context, chunks []*Chunk) error
 	GetByKnowledgeID(ctx context.Context, knowledgeID string) ([]*Chunk, error)
+	GetHashesByKnowledgeID(ctx context.Context, knowledgeID string) (map[string]string, error) // content_hash → chunk_id
+	DeleteByIDs(ctx context.Context, ids []string) error
 	DeleteByKnowledgeID(ctx context.Context, knowledgeID string) error
 }
 
@@ -360,11 +365,11 @@ func (r *pgKnowledgeRepo) GetByID(ctx context.Context, id string) (*Knowledge, e
 	var metadata []byte
 	err := r.db.QueryRow(ctx, `
 		SELECT id, knowledge_base_id, tag_id, name, source_type, file_name, file_type, file_size, file_path,
-		       parse_status, parse_error, chunk_count, metadata, created_at, updated_at
+		       parse_status, parse_error, chunk_count, content_hash, metadata, created_at, updated_at
 		FROM knowledges WHERE id = $1 AND deleted_at IS NULL
 	`, id).Scan(
 		&k.ID, &k.KnowledgeBaseID, &k.TagID, &k.Name, &k.SourceType, &k.FileName, &k.FileType, &k.FileSize, &k.FilePath,
-		&k.ParseStatus, &k.ParseError, &k.ChunkCount, &metadata, &k.CreatedAt, &k.UpdatedAt,
+		&k.ParseStatus, &k.ParseError, &k.ChunkCount, &k.ContentHash, &metadata, &k.CreatedAt, &k.UpdatedAt,
 	)
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -379,7 +384,7 @@ func (r *pgKnowledgeRepo) GetByID(ctx context.Context, id string) (*Knowledge, e
 func (r *pgKnowledgeRepo) ListByKnowledgeBase(ctx context.Context, kbID string, offset, limit int) ([]*Knowledge, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT id, knowledge_base_id, tag_id, name, source_type, file_name, file_type, file_size, file_path,
-		       parse_status, parse_error, chunk_count, metadata, created_at, updated_at
+		       parse_status, parse_error, chunk_count, content_hash, metadata, created_at, updated_at
 		FROM knowledges WHERE knowledge_base_id = $1 AND deleted_at IS NULL
 		ORDER BY created_at DESC LIMIT $2 OFFSET $3
 	`, kbID, limit, offset)
@@ -394,7 +399,7 @@ func (r *pgKnowledgeRepo) ListByKnowledgeBase(ctx context.Context, kbID string, 
 		var metadata []byte
 		if err := rows.Scan(
 			&k.ID, &k.KnowledgeBaseID, &k.TagID, &k.Name, &k.SourceType, &k.FileName, &k.FileType, &k.FileSize, &k.FilePath,
-			&k.ParseStatus, &k.ParseError, &k.ChunkCount, &metadata, &k.CreatedAt, &k.UpdatedAt,
+			&k.ParseStatus, &k.ParseError, &k.ChunkCount, &k.ContentHash, &metadata, &k.CreatedAt, &k.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -425,6 +430,13 @@ func (r *pgKnowledgeRepo) Delete(ctx context.Context, id string) error {
 	_, err := r.db.Pool().Exec(ctx, `
 		UPDATE knowledges SET deleted_at = CURRENT_TIMESTAMP WHERE id = $1
 	`, id)
+	return err
+}
+
+func (r *pgKnowledgeRepo) UpdateContentHash(ctx context.Context, id, hash string) error {
+	_, err := r.db.Pool().Exec(ctx, `
+		UPDATE knowledges SET content_hash = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1
+	`, id, hash)
 	return err
 }
 
@@ -614,11 +626,11 @@ func (r *pgChunkRepo) BatchCreate(ctx context.Context, chunks []*Chunk) error {
 		metadata, _ := json.Marshal(chunk.Metadata)
 
 		err := r.db.QueryRow(ctx, `
-			INSERT INTO chunks (knowledge_id, knowledge_base_id, chunk_index, content, content_length, metadata)
-			VALUES ($1, $2, $3, $4, $5, $6)
-			ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content, metadata = EXCLUDED.metadata
+			INSERT INTO chunks (knowledge_id, knowledge_base_id, chunk_index, content, content_length, content_hash, metadata)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, metadata = EXCLUDED.metadata
 			RETURNING id, created_at
-		`, chunk.KnowledgeID, chunk.KnowledgeBaseID, chunk.ChunkIndex, chunk.Content, len(chunk.Content), metadata).
+		`, chunk.KnowledgeID, chunk.KnowledgeBaseID, chunk.ChunkIndex, chunk.Content, len(chunk.Content), chunk.ContentHash, metadata).
 			Scan(&chunk.ID, &chunk.CreatedAt)
 		if err != nil {
 			return fmt.Errorf("插入 chunk %d 失败: %w", chunk.ChunkIndex, err)
@@ -629,7 +641,7 @@ func (r *pgChunkRepo) BatchCreate(ctx context.Context, chunks []*Chunk) error {
 
 func (r *pgChunkRepo) GetByKnowledgeID(ctx context.Context, knowledgeID string) ([]*Chunk, error) {
 	rows, err := r.db.Query(ctx, `
-		SELECT id, knowledge_id, knowledge_base_id, chunk_index, content, content_length, metadata, created_at
+		SELECT id, knowledge_id, knowledge_base_id, chunk_index, content, content_length, content_hash, metadata, created_at
 		FROM chunks WHERE knowledge_id = $1
 		ORDER BY chunk_index
 	`, knowledgeID)
@@ -642,7 +654,7 @@ func (r *pgChunkRepo) GetByKnowledgeID(ctx context.Context, knowledgeID string) 
 	for rows.Next() {
 		c := &Chunk{}
 		var metaRaw []byte
-		if err := rows.Scan(&c.ID, &c.KnowledgeID, &c.KnowledgeBaseID, &c.ChunkIndex, &c.Content, &c.ContentLength, &metaRaw, &c.CreatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.KnowledgeID, &c.KnowledgeBaseID, &c.ChunkIndex, &c.Content, &c.ContentLength, &c.ContentHash, &metaRaw, &c.CreatedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal(metaRaw, &c.Metadata)
@@ -653,6 +665,34 @@ func (r *pgChunkRepo) GetByKnowledgeID(ctx context.Context, knowledgeID string) 
 
 func (r *pgChunkRepo) DeleteByKnowledgeID(ctx context.Context, knowledgeID string) error {
 	_, err := r.db.Pool().Exec(ctx, `DELETE FROM chunks WHERE knowledge_id = $1`, knowledgeID)
+	return err
+}
+
+func (r *pgChunkRepo) GetHashesByKnowledgeID(ctx context.Context, knowledgeID string) (map[string]string, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT id, content_hash FROM chunks WHERE knowledge_id = $1 AND content_hash != ''
+	`, knowledgeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string]string) // content_hash → chunk_id
+	for rows.Next() {
+		var id, hash string
+		if err := rows.Scan(&id, &hash); err != nil {
+			return nil, err
+		}
+		result[hash] = id
+	}
+	return result, rows.Err()
+}
+
+func (r *pgChunkRepo) DeleteByIDs(ctx context.Context, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	_, err := r.db.Pool().Exec(ctx, `DELETE FROM chunks WHERE id = ANY($1)`, ids)
 	return err
 }
 
