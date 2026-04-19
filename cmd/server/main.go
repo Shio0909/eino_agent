@@ -311,11 +311,7 @@ func main() {
 		defer importQueue.Close()
 	}
 
-	// 注入 Eino 原生组件
-	if err := chatService.InitWithComponents(chatModel, einoRetriever); err != nil {
-		log.Fatalf("[Service] 注入组件失败: %v", err)
-	}
-	log.Println("[Service] 聊天服务初始化完成（Pipeline + Agent）")
+	// 注入 Eino 原生组件（使用统一检索器 — 延后到 UnifiedRetriever 创建之后）
 
 	// ========================================
 	// 初始化 GraphRAG（可选）
@@ -347,13 +343,36 @@ func main() {
 
 	// 注入 Wiki 检索器（Wiki 模式 KB 使用 LLM 编译 + wiki 页面检索）
 	var wikiCompiler *wiki.Compiler
+	var wikiRetriever *container.WikiRetriever
 	if db != nil {
 		wikiRepo := repository.NewWikiPageRepository(db)
+
+		// 创建 Wiki 检索器
+		wikiRetriever = container.NewWikiRetriever(wikiRepo, cfg.RAG.TopK)
+		log.Println("[WikiRetriever] Wiki 检索器已创建")
 
 		// 创建 Wiki 编译器（后续注入到 Handler）
 		wikiCompiler = wiki.NewCompiler(chatModel, wikiRepo)
 		log.Println("[WikiCompiler] Wiki 编译器已创建")
 	}
+
+	// 创建统一检索器（聚合 vector + wiki）
+	var compositeRetriever *container.CompositeRetriever
+	if cr, ok := einoRetriever.(*container.CompositeRetriever); ok {
+		compositeRetriever = cr
+	}
+	var kbRepo repository.KnowledgeBaseRepository
+	if db != nil {
+		kbRepo = repository.NewKnowledgeBaseRepository(db)
+	}
+	unifiedRetriever := container.NewUnifiedRetriever(compositeRetriever, wikiRetriever, kbRepo, cfg.RAG.TopK)
+	log.Println("[UnifiedRetriever] 统一检索器已创建（vector + wiki）")
+
+	// 注入 Eino 原生组件（使用统一检索器）
+	if err := chatService.InitWithComponents(chatModel, unifiedRetriever); err != nil {
+		log.Fatalf("[Service] 注入组件失败: %v", err)
+	}
+	log.Println("[Service] 聊天服务初始化完成（Pipeline + Agent）")
 
 	// 创建 HTTP 处理器
 	apiHandler := handler.NewHandler(cfg, *configPath, chatService, embedding, vectorDB, docReaderCli, db, importQueue)
