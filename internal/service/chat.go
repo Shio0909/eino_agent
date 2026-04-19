@@ -741,7 +741,9 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 		messages := []*schema.Message{
 			{Role: schema.User, Content: cc.messageWithInst},
 		}
-		respMsg, agentErr := runtimeAgent.Generate(ctx, messages)
+		llmCtx, llmCancel := context.WithTimeout(ctx, time.Duration(s.config.Agent.LLMTimeout)*time.Second)
+		defer llmCancel()
+		respMsg, agentErr := runtimeAgent.Generate(llmCtx, messages)
 		if agentErr != nil {
 			return nil, fmt.Errorf("agent chat: %w", agentErr)
 		}
@@ -899,7 +901,9 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			// not StreamableTool. The ReAct graph in streaming mode tries to stream-invoke
 			// tools, which fails. Generate runs the full ReAct loop correctly.
 			// Action/observation events still fire via eventSink during tool execution.
-			respMsg, agentErr := runtimeAgent.Generate(ctx, messages)
+			llmCtx, llmCancel := context.WithTimeout(ctx, time.Duration(s.config.Agent.LLMTimeout)*time.Second)
+			respMsg, agentErr := runtimeAgent.Generate(llmCtx, messages)
+			llmCancel()
 			if agentErr != nil {
 				trySend(StreamEvent{Type: "error", Error: agentErr.Error()})
 				return

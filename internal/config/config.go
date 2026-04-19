@@ -205,6 +205,9 @@ type AgentConfig struct {
 	TavilyAPIKey string `yaml:"tavily_api_key"`
 	SerpAPIKey   string `yaml:"serp_api_key"`
 
+	// 超时配置
+	LLMTimeout int `yaml:"llm_timeout"` // Agent LLM 调用超时（秒），0=使用默认值 180s
+
 	// Agentic RAG 配置
 	AgenticRAG AgenticRAGConfig `yaml:"agentic_rag"`
 }
@@ -487,6 +490,9 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Agent.MaxTotalContent == 0 {
 		cfg.Agent.MaxTotalContent = 15000
+	}
+	if cfg.Agent.LLMTimeout == 0 {
+		cfg.Agent.LLMTimeout = 180
 	}
 
 	if cfg.Security.PromptGuard.Enabled == nil {

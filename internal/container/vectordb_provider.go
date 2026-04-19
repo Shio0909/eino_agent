@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -304,18 +305,7 @@ func cosineSimilarity(a, b []float32) float64 {
 		return 0
 	}
 
-	return dotProduct / (sqrt(normA) * sqrt(normB))
-}
-
-func sqrt(x float64) float64 {
-	if x <= 0 {
-		return 0
-	}
-	z := x
-	for i := 0; i < 100; i++ {
-		z = (z + x/z) / 2
-	}
-	return z
+	return dotProduct / (math.Sqrt(normA) * math.Sqrt(normB))
 }
 
 // PgVectorDB PostgreSQL + pgvector 实现

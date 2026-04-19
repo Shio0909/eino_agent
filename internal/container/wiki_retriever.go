@@ -29,10 +29,9 @@ func NewWikiRetriever(wikiRepo repository.WikiPageRepository, topK int) *WikiRet
 	return &WikiRetriever{wikiRepo: wikiRepo, topK: topK}
 }
 
-// Retrieve 全局检索（不限定 KB）
+// Retrieve 全局检索（不限定 KB）— wiki 必须限定知识库范围，请使用 RetrieveScoped
 func (r *WikiRetriever) Retrieve(ctx context.Context, query string, opts ...retriever.Option) ([]*schema.Document, error) {
-	// wiki 检索必须有 KB 范围，全局检索不适用
-	return nil, nil
+	return nil, fmt.Errorf("WikiRetriever does not support global Retrieve, use RetrieveScoped with KB IDs")
 }
 
 // RetrieveScoped 按知识库范围检索 wiki 页面

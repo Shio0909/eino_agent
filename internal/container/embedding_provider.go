@@ -78,13 +78,17 @@ func EmbedFloat32(ctx context.Context, embedder einoembedding.Embedder, text str
 	return result, nil
 }
 
-// BatchEmbedFloat32 批量生成 float32 向量（自动分批，每批最多 batchSize 条）
-func BatchEmbedFloat32(ctx context.Context, embedder einoembedding.Embedder, texts []string) ([][]float32, error) {
-	const batchSize = 64
+// BatchEmbedFloat32 批量生成 float32 向量（自动分批）
+// batchSize 控制每批最大条数，传 0 使用默认值 64
+func BatchEmbedFloat32(ctx context.Context, embedder einoembedding.Embedder, texts []string, batchSize ...int) ([][]float32, error) {
+	bs := 64
+	if len(batchSize) > 0 && batchSize[0] > 0 {
+		bs = batchSize[0]
+	}
 
 	results := make([][]float32, 0, len(texts))
-	for start := 0; start < len(texts); start += batchSize {
-		end := start + batchSize
+	for start := 0; start < len(texts); start += bs {
+		end := start + bs
 		if end > len(texts) {
 			end = len(texts)
 		}
