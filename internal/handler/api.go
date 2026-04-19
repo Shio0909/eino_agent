@@ -196,6 +196,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			kb.POST("/:id/documents/url", h.UploadDocumentURL)
 			kb.GET("/:id/documents", h.ListDocuments)
 			kb.GET("/:id/documents/:docId/status", h.GetDocumentImportStatus)
+			kb.GET("/:id/documents/:docId/chunks", h.GetDocumentChunks)
+			kb.POST("/:id/documents/:docId/reindex", h.ReindexDocument)
 			kb.DELETE("/:id/documents/:docId", h.DeleteDocument)
 		}
 
@@ -688,10 +690,13 @@ func (h *Handler) ListKnowledgeBases(c *gin.Context) {
 		return
 	}
 
+	total, _ := h.kbRepo.Count(c.Request.Context(), tenantID)
+
 	c.JSON(http.StatusOK, gin.H{
 		"knowledge_bases": kbs,
 		"page":            page,
 		"page_size":       pageSize,
+		"total":           total,
 	})
 }
 
@@ -1704,6 +1709,7 @@ func (h *Handler) ListDocuments(c *gin.Context) {
 		"documents": docs,
 		"page":      page,
 		"page_size": pageSize,
+		"total":     func() int { n, _ := h.knowledgeRepo.CountByKnowledgeBase(c.Request.Context(), kbID); return n }(),
 	})
 }
 
@@ -1821,6 +1827,136 @@ func (h *Handler) DeleteDocument(c *gin.Context) {
 
 	h.audit(c, "doc.delete", docID, true, map[string]interface{}{"kb_id": kbID})
 	c.JSON(http.StatusOK, gin.H{"message": "删除成功"})
+}
+
+// GetDocumentChunks 获取文档的所有 chunk（用于预览分片效果）
+func (h *Handler) GetDocumentChunks(c *gin.Context) {
+	kbID := c.Param("id")
+	docID := c.Param("docId")
+
+	if h.kbRepo != nil {
+		if _, ok := h.ensureKnowledgeBaseAccess(c, kbID); !ok {
+			return
+		}
+	}
+	if h.chunkRepo == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "数据库未连接"})
+		return
+	}
+
+	chunks, err := h.chunkRepo.GetByKnowledgeID(c.Request.Context(), docID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	result := make([]gin.H, 0, len(chunks))
+	for _, ch := range chunks {
+		result = append(result, gin.H{
+			"id":          ch.ID,
+			"index":       ch.ChunkIndex,
+			"char_count":  ch.ContentLength,
+			"token_count": 0, // 暂未存储 token 数
+			"content":     ch.Content,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"chunks": result, "total": len(result)})
+}
+
+// ReindexDocument 重新向量化文档（仅支持 URL 来源或文件仍存在的情况）
+func (h *Handler) ReindexDocument(c *gin.Context) {
+	kbID := c.Param("id")
+	docID := c.Param("docId")
+
+	if h.kbRepo != nil {
+		if _, ok := h.ensureKnowledgeBaseAccess(c, kbID); !ok {
+			return
+		}
+	}
+	if h.knowledgeRepo == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "数据库未连接"})
+		return
+	}
+
+	k, err := h.knowledgeRepo.GetByID(c.Request.Context(), docID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if k == nil || k.KnowledgeBaseID != kbID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "文档不存在"})
+		return
+	}
+	if k.ParseStatus == "processing" {
+		c.JSON(http.StatusConflict, gin.H{"error": "文档正在处理中，请稍后再试"})
+		return
+	}
+
+	// 构建 Task（源文件路径/URL 必须仍然可用）
+	task := importqueue.Task{
+		KnowledgeID:     k.ID,
+		KnowledgeBaseID: k.KnowledgeBaseID,
+		SourceType:      k.SourceType,
+		FileName:        k.FileName,
+		FileType:        k.FileType,
+	}
+
+	switch k.SourceType {
+	case "url":
+		if k.Metadata != nil {
+			if u, ok := k.Metadata["source_url"].(string); ok {
+				task.SourceURL = u
+				task.Title = k.Name
+			}
+		}
+		if task.SourceURL == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "无法获取原始 URL，reindex 失败"})
+			return
+		}
+	case "file":
+		if k.FilePath == nil || *k.FilePath == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "原始文件已清理，无法 reindex；请重新上传"})
+			return
+		}
+		if _, statErr := os.Stat(*k.FilePath); statErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "原始文件已清理，无法 reindex；请重新上传"})
+			return
+		}
+		task.FilePath = *k.FilePath
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "不支持 reindex 该来源类型: " + k.SourceType})
+		return
+	}
+
+	// 清除旧向量
+	if h.vectorDB != nil {
+		if err := h.vectorDB.DeleteByKnowledgeID(c.Request.Context(), docID); err != nil {
+			log.Printf("[Reindex] 清除旧向量失败（继续）: doc=%s err=%v", docID, err)
+		}
+	}
+
+	// 重置解析状态
+	if err := h.knowledgeRepo.UpdateParseStatus(c.Request.Context(), docID, "pending", "", 0); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "重置状态失败: " + err.Error()})
+		return
+	}
+
+	// 入队或同步处理
+	if h.importQueue != nil {
+		if err := h.importQueue.Enqueue(c.Request.Context(), task); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "入队失败: " + err.Error()})
+			return
+		}
+		c.JSON(http.StatusAccepted, gin.H{"message": "已加入重新向量化队列", "doc_id": docID})
+	} else {
+		go func() {
+			bgCtx := context.Background()
+			if err := h.ProcessImportTask(bgCtx, task); err != nil {
+				log.Printf("[Reindex] 异步 reindex 失败: doc=%s err=%v", docID, err)
+			}
+		}()
+		c.JSON(http.StatusAccepted, gin.H{"message": "重新向量化已开始（后台处理）", "doc_id": docID})
+	}
 }
 
 func (h *Handler) getImportTaskState(ctx context.Context, taskID string) (*cachepkg.ImportTaskState, bool) {

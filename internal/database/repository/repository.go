@@ -160,6 +160,7 @@ type KnowledgeBaseRepository interface {
 	Create(ctx context.Context, kb *KnowledgeBase) error
 	GetByID(ctx context.Context, id string) (*KnowledgeBase, error)
 	List(ctx context.Context, tenantID int, offset, limit int) ([]*KnowledgeBase, error)
+	Count(ctx context.Context, tenantID int) (int, error)
 	Update(ctx context.Context, kb *KnowledgeBase) error
 	Delete(ctx context.Context, id string) error
 	IncrementCounts(ctx context.Context, id string, docDelta, chunkDelta int) error
@@ -170,6 +171,7 @@ type KnowledgeRepository interface {
 	Create(ctx context.Context, k *Knowledge) error
 	GetByID(ctx context.Context, id string) (*Knowledge, error)
 	ListByKnowledgeBase(ctx context.Context, kbID string, offset, limit int) ([]*Knowledge, error)
+	CountByKnowledgeBase(ctx context.Context, kbID string) (int, error)
 	UpdateParseStatus(ctx context.Context, id, status, errorMsg string, chunkCount int) error
 	Delete(ctx context.Context, id string) error
 }
@@ -288,6 +290,15 @@ func (r *pgKnowledgeBaseRepo) List(ctx context.Context, tenantID int, offset, li
 	return result, rows.Err()
 }
 
+func (r *pgKnowledgeBaseRepo) Count(ctx context.Context, tenantID int) (int, error) {
+	var count int
+	err := r.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM knowledge_bases WHERE tenant_id = $1 AND deleted_at IS NULL`,
+		tenantID,
+	).Scan(&count)
+	return count, err
+}
+
 func (r *pgKnowledgeBaseRepo) Update(ctx context.Context, kb *KnowledgeBase) error {
 	chunkingConfig, _ := json.Marshal(kb.ChunkingConfig)
 	extractConfig, _ := json.Marshal(kb.ExtractConfig)
@@ -381,6 +392,15 @@ func (r *pgKnowledgeRepo) ListByKnowledgeBase(ctx context.Context, kbID string, 
 		result = append(result, k)
 	}
 	return result, rows.Err()
+}
+
+func (r *pgKnowledgeRepo) CountByKnowledgeBase(ctx context.Context, kbID string) (int, error) {
+	var count int
+	err := r.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM knowledges WHERE knowledge_base_id = $1 AND deleted_at IS NULL`,
+		kbID,
+	).Scan(&count)
+	return count, err
 }
 
 func (r *pgKnowledgeRepo) UpdateParseStatus(ctx context.Context, id, status, errorMsg string, chunkCount int) error {
