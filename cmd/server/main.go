@@ -57,7 +57,8 @@ func main() {
 	migrateDB := flag.Bool("migrate", false, "运行数据库迁移")
 	flag.Parse()
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// 加载配置
 	cfg, err := config.Load(*configPath)
@@ -130,7 +131,6 @@ func main() {
 			db, err = postgres.New(ctx, dbCfg)
 			if err == nil {
 				log.Printf("[Database] 连接成功: %s:%d/%s", cfg.Database.Host, cfg.Database.Port, cfg.Database.DBName)
-				defer db.Close()
 				break
 			}
 			if attempt < 5 {
@@ -140,6 +140,9 @@ func main() {
 			} else {
 				log.Printf("[Database] 连接失败（将使用内存存储）: %v", err)
 			}
+		}
+		if db != nil {
+			defer db.Close()
 		}
 
 		// 运行迁移
@@ -514,8 +517,9 @@ func main() {
 		<-sigCh
 
 		log.Println("\n[Server] 正在关闭服务...")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
+		cancel() // 通知所有使用 ctx 的 goroutine（MCP Export 等）退出
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
 
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Printf("[Server] 服务关闭失败: %v", err)

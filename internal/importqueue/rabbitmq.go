@@ -142,7 +142,7 @@ func (q *RabbitMQQueue) StartConsumer(ctx context.Context, handler func(context.
 					continue
 				}
 
-				if err := handler(context.Background(), task); err != nil {
+				if err := handler(ctx, task); err != nil {
 					log.Printf("[ImportQueue] task failed: knowledge_id=%s err=%v", task.KnowledgeID, err)
 					_ = msg.Nack(false, false)
 					continue

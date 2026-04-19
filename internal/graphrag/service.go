@@ -22,7 +22,6 @@ type Service struct {
 	extractor  *Extractor
 	chatModel  model.ChatModel
 	config     *Config
-	mu         sync.Mutex
 }
 
 // NewService 创建 GraphRAG 服务
@@ -71,9 +70,6 @@ type BuildGraphResult struct {
 // 参考 WeKnora: service/graph.go BuildGraph
 // 流程：chunks → 并发 LLM 抽取实体/关系 → 存入 Neo4j
 func (s *Service) BuildGraph(ctx context.Context, req *BuildGraphRequest) (*BuildGraphResult, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	startTime := time.Now()
 
 	if len(req.Chunks) == 0 {
