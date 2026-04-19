@@ -54,6 +54,12 @@ func newOllamaEmbedding(ctx context.Context, cfg *config.EmbeddingConfig) (einoe
 	return newOpenAICompatibleEmbedding(ctx, ollamaCfg)
 }
 
+// EmbedFingerprint 生成 Embedding 配置指纹，格式 "provider:model_id:dimensions"
+// 用于检测知识库向量是否与当前 Embedding 模型兼容。
+func EmbedFingerprint(cfg *config.EmbeddingConfig) string {
+	return fmt.Sprintf("%s:%s:%d", cfg.Provider, cfg.ModelID, cfg.Dimensions)
+}
+
 // EmbedFloat32 使用 Eino Embedder 生成 float32 向量
 func EmbedFloat32(ctx context.Context, embedder einoembedding.Embedder, text string) ([]float32, error) {
 	vectors, err := embedder.EmbedStrings(ctx, []string{text})

@@ -691,9 +691,21 @@ func (h *Handler) ListKnowledgeBases(c *gin.Context) {
 	}
 
 	total, _ := h.kbRepo.Count(c.Request.Context(), tenantID)
+	currentFingerprint := container.EmbedFingerprint(&h.cfg.Embedding)
+
+	// Enrich each KB with embed_stale flag (never stale if KB was never indexed)
+	type kbWithStale struct {
+		*repository.KnowledgeBase
+		EmbedStale bool `json:"embed_stale"`
+	}
+	enriched := make([]kbWithStale, 0, len(kbs))
+	for _, kb := range kbs {
+		stale := kb.EmbedModelFingerprint != "" && kb.EmbedModelFingerprint != currentFingerprint
+		enriched = append(enriched, kbWithStale{kb, stale})
+	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"knowledge_bases": kbs,
+		"knowledge_bases": enriched,
 		"page":            page,
 		"page_size":       pageSize,
 		"total":           total,
@@ -786,7 +798,25 @@ func (h *Handler) GetKnowledgeBase(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, kb)
+	currentFingerprint := container.EmbedFingerprint(&h.cfg.Embedding)
+	stale := kb.EmbedModelFingerprint != "" && kb.EmbedModelFingerprint != currentFingerprint
+	c.JSON(http.StatusOK, gin.H{
+		"id":                     kb.ID,
+		"tenant_id":              kb.TenantID,
+		"name":                   kb.Name,
+		"description":            kb.Description,
+		"mode":                   kb.Mode,
+		"embedding_model_id":     kb.EmbeddingModelID,
+		"embedding_dimensions":   kb.EmbeddingDimensions,
+		"embed_model_fingerprint": kb.EmbedModelFingerprint,
+		"embed_stale":            stale,
+		"chunking_config":        kb.ChunkingConfig,
+		"extract_config":         kb.ExtractConfig,
+		"document_count":         kb.DocumentCount,
+		"chunk_count":            kb.ChunkCount,
+		"created_at":             kb.CreatedAt,
+		"updated_at":             kb.UpdatedAt,
+	})
 }
 
 // UpdateKnowledgeBase 更新知识库
@@ -1174,6 +1204,8 @@ func (h *Handler) markKnowledgeCompleted(ctx context.Context, knowledge *reposit
 	})
 	if h.kbRepo != nil {
 		_ = h.kbRepo.IncrementCounts(ctx, knowledge.KnowledgeBaseID, 0, chunkCount)
+		// 记录本次索引使用的 Embedding 指纹，用于后续失效检测
+		_ = h.kbRepo.UpdateEmbedFingerprint(ctx, knowledge.KnowledgeBaseID, container.EmbedFingerprint(&h.cfg.Embedding))
 	}
 	if h.retrievalCache != nil {
 		if err := h.retrievalCache.InvalidateKnowledgeBase(ctx, knowledge.KnowledgeBaseID); err != nil {

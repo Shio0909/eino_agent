@@ -31,19 +31,20 @@ type Tenant struct {
 
 // KnowledgeBase 知识库
 type KnowledgeBase struct {
-	ID                  string    `json:"id"`
-	TenantID            int       `json:"tenant_id"`
-	Name                string    `json:"name"`
-	Description         string    `json:"description"`
-	Mode                string    `json:"mode"` // "vector"(默认) 或 "wiki"(LLM编译的Wiki知识库)
-	EmbeddingModelID    *string   `json:"embedding_model_id"` // nullable FK → models(id)
-	EmbeddingDimensions int       `json:"embedding_dimensions"`
-	ChunkingConfig      JSON      `json:"chunking_config"`
-	ExtractConfig       JSON      `json:"extract_config"`
-	DocumentCount       int       `json:"document_count"`
-	ChunkCount          int       `json:"chunk_count"`
-	CreatedAt           time.Time `json:"created_at"`
-	UpdatedAt           time.Time `json:"updated_at"`
+	ID                   string    `json:"id"`
+	TenantID             int       `json:"tenant_id"`
+	Name                 string    `json:"name"`
+	Description          string    `json:"description"`
+	Mode                 string    `json:"mode"` // "vector"(默认) 或 "wiki"(LLM编译的Wiki知识库)
+	EmbeddingModelID     *string   `json:"embedding_model_id"` // nullable FK → models(id)
+	EmbeddingDimensions  int       `json:"embedding_dimensions"`
+	EmbedModelFingerprint string   `json:"embed_model_fingerprint"` // "provider:model_id:dimensions" at last index time
+	ChunkingConfig       JSON      `json:"chunking_config"`
+	ExtractConfig        JSON      `json:"extract_config"`
+	DocumentCount        int       `json:"document_count"`
+	ChunkCount           int       `json:"chunk_count"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
 }
 
 // IsWikiMode 是否为 Wiki (Karpathy) 模式
@@ -164,6 +165,7 @@ type KnowledgeBaseRepository interface {
 	Update(ctx context.Context, kb *KnowledgeBase) error
 	Delete(ctx context.Context, id string) error
 	IncrementCounts(ctx context.Context, id string, docDelta, chunkDelta int) error
+	UpdateEmbedFingerprint(ctx context.Context, id, fingerprint string) error
 }
 
 // KnowledgeRepository 知识文档仓储接口
@@ -230,10 +232,10 @@ func (r *pgKnowledgeBaseRepo) Create(ctx context.Context, kb *KnowledgeBase) err
 	}
 
 	return r.db.QueryRow(ctx, `
-		INSERT INTO knowledge_bases (tenant_id, name, description, mode, embedding_model_id, embedding_dimensions, chunking_config, extract_config)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		INSERT INTO knowledge_bases (tenant_id, name, description, mode, embedding_model_id, embedding_dimensions, embed_model_fingerprint, chunking_config, extract_config)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING id, created_at, updated_at
-	`, kb.TenantID, kb.Name, kb.Description, mode, kb.EmbeddingModelID, kb.EmbeddingDimensions, chunkingConfig, extractConfig).
+	`, kb.TenantID, kb.Name, kb.Description, mode, kb.EmbeddingModelID, kb.EmbeddingDimensions, kb.EmbedModelFingerprint, chunkingConfig, extractConfig).
 		Scan(&kb.ID, &kb.CreatedAt, &kb.UpdatedAt)
 }
 
@@ -242,12 +244,12 @@ func (r *pgKnowledgeBaseRepo) GetByID(ctx context.Context, id string) (*Knowledg
 	var chunkingConfig, extractConfig []byte
 
 	err := r.db.QueryRow(ctx, `
-		SELECT id, tenant_id, name, description, mode, embedding_model_id, embedding_dimensions, 
-		       chunking_config, extract_config, document_count, chunk_count, created_at, updated_at
+		SELECT id, tenant_id, name, description, mode, embedding_model_id, embedding_dimensions,
+		       embed_model_fingerprint, chunking_config, extract_config, document_count, chunk_count, created_at, updated_at
 		FROM knowledge_bases WHERE id = $1 AND deleted_at IS NULL
 	`, id).Scan(
 		&kb.ID, &kb.TenantID, &kb.Name, &kb.Description, &kb.Mode, &kb.EmbeddingModelID, &kb.EmbeddingDimensions,
-		&chunkingConfig, &extractConfig, &kb.DocumentCount, &kb.ChunkCount, &kb.CreatedAt, &kb.UpdatedAt,
+		&kb.EmbedModelFingerprint, &chunkingConfig, &extractConfig, &kb.DocumentCount, &kb.ChunkCount, &kb.CreatedAt, &kb.UpdatedAt,
 	)
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -264,7 +266,7 @@ func (r *pgKnowledgeBaseRepo) GetByID(ctx context.Context, id string) (*Knowledg
 func (r *pgKnowledgeBaseRepo) List(ctx context.Context, tenantID int, offset, limit int) ([]*KnowledgeBase, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT id, tenant_id, name, description, mode, embedding_model_id, embedding_dimensions,
-		       chunking_config, extract_config, document_count, chunk_count, created_at, updated_at
+		       embed_model_fingerprint, chunking_config, extract_config, document_count, chunk_count, created_at, updated_at
 		FROM knowledge_bases WHERE tenant_id = $1 AND deleted_at IS NULL
 		ORDER BY created_at DESC LIMIT $2 OFFSET $3
 	`, tenantID, limit, offset)
@@ -279,7 +281,7 @@ func (r *pgKnowledgeBaseRepo) List(ctx context.Context, tenantID int, offset, li
 		var chunkingConfig, extractConfig []byte
 		if err := rows.Scan(
 			&kb.ID, &kb.TenantID, &kb.Name, &kb.Description, &kb.Mode, &kb.EmbeddingModelID, &kb.EmbeddingDimensions,
-			&chunkingConfig, &extractConfig, &kb.DocumentCount, &kb.ChunkCount, &kb.CreatedAt, &kb.UpdatedAt,
+			&kb.EmbedModelFingerprint, &chunkingConfig, &extractConfig, &kb.DocumentCount, &kb.ChunkCount, &kb.CreatedAt, &kb.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -322,6 +324,14 @@ func (r *pgKnowledgeBaseRepo) IncrementCounts(ctx context.Context, id string, do
 		UPDATE knowledge_bases SET document_count = document_count + $2, chunk_count = chunk_count + $3
 		WHERE id = $1
 	`, id, docDelta, chunkDelta)
+	return err
+}
+
+func (r *pgKnowledgeBaseRepo) UpdateEmbedFingerprint(ctx context.Context, id, fingerprint string) error {
+	_, err := r.db.Pool().Exec(ctx, `
+		UPDATE knowledge_bases SET embed_model_fingerprint = $2, updated_at = CURRENT_TIMESTAMP
+		WHERE id = $1 AND deleted_at IS NULL
+	`, id, fingerprint)
 	return err
 }
 
