@@ -211,6 +211,32 @@ func (db *MemoryVectorDB) Delete(ctx context.Context, ids []string) error {
 	return nil
 }
 
+// DeleteByKnowledgeID 删除指定文档的所有向量 chunk
+func (db *MemoryVectorDB) DeleteByKnowledgeID(ctx context.Context, knowledgeID string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	for id, doc := range db.docs {
+		if kid, ok := doc.Metadata["knowledge_id"].(string); ok && kid == knowledgeID {
+			delete(db.docs, id)
+		}
+	}
+	return nil
+}
+
+// DeleteByKnowledgeBaseID 删除指定知识库的所有向量 chunk
+func (db *MemoryVectorDB) DeleteByKnowledgeBaseID(ctx context.Context, kbID string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	for id, doc := range db.docs {
+		if kid, ok := doc.Metadata["knowledge_base_id"].(string); ok && kid == kbID {
+			delete(db.docs, id)
+		}
+	}
+	return nil
+}
+
 // Close 关闭数据库
 func (db *MemoryVectorDB) Close() error {
 	return db.saveToFile()
@@ -573,6 +599,22 @@ func (db *PgVectorDB) Delete(ctx context.Context, ids []string) error {
 	return nil
 }
 
+func (db *PgVectorDB) DeleteByKnowledgeID(ctx context.Context, knowledgeID string) error {
+	query := fmt.Sprintf(`DELETE FROM %s WHERE metadata->>'knowledge_id' = $1`, db.tableName)
+	if err := db.pg.Exec(ctx, query, knowledgeID); err != nil {
+		return fmt.Errorf("按文档ID删除向量失败: %w", err)
+	}
+	return nil
+}
+
+func (db *PgVectorDB) DeleteByKnowledgeBaseID(ctx context.Context, kbID string) error {
+	query := fmt.Sprintf(`DELETE FROM %s WHERE metadata->>'knowledge_base_id' = $1`, db.tableName)
+	if err := db.pg.Exec(ctx, query, kbID); err != nil {
+		return fmt.Errorf("按知识库ID删除向量失败: %w", err)
+	}
+	return nil
+}
+
 func (db *PgVectorDB) Close() error {
 	if db.pg != nil {
 		db.pg.Close()
@@ -600,6 +642,14 @@ func (db *MilvusVectorDB) Search(ctx context.Context, vector []float32, topK int
 }
 
 func (db *MilvusVectorDB) Delete(ctx context.Context, ids []string) error {
+	return fmt.Errorf("未实现")
+}
+
+func (db *MilvusVectorDB) DeleteByKnowledgeID(ctx context.Context, knowledgeID string) error {
+	return fmt.Errorf("未实现")
+}
+
+func (db *MilvusVectorDB) DeleteByKnowledgeBaseID(ctx context.Context, kbID string) error {
 	return fmt.Errorf("未实现")
 }
 

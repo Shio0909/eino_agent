@@ -843,6 +843,14 @@ func (h *Handler) DeleteKnowledgeBase(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+
+	// 清理向量数据库中该知识库的所有 chunk
+	if h.vectorDB != nil {
+		if err := h.vectorDB.DeleteByKnowledgeBaseID(c.Request.Context(), id); err != nil {
+			log.Printf("[VectorDB] 删除知识库向量失败（数据可能残留）: kb=%s err=%v", id, err)
+		}
+	}
+
 	if h.retrievalCache != nil {
 		if err := h.retrievalCache.InvalidateKnowledgeBase(c.Request.Context(), id); err != nil {
 			log.Printf("[Cache] 知识库删除后失效检索缓存失败: kb=%s err=%v", id, err)
@@ -1776,6 +1784,13 @@ func (h *Handler) DeleteDocument(c *gin.Context) {
 		return
 	}
 
+	// 清理向量数据库中该文档的所有 chunk
+	if h.vectorDB != nil {
+		if err := h.vectorDB.DeleteByKnowledgeID(c.Request.Context(), docID); err != nil {
+			log.Printf("[VectorDB] 删除文档向量失败（数据可能残留）: doc=%s err=%v", docID, err)
+		}
+	}
+
 	// 更新知识库计数
 	if h.kbRepo != nil {
 		_ = h.kbRepo.IncrementCounts(c.Request.Context(), kbID, -1, 0)
@@ -2404,6 +2419,27 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			}
 			h.cfg.LLM.MaxTokens = *req.LLM.MaxTokens
 			changed = append(changed, "llm.max_tokens")
+		}
+		// 如果 LLM 关键参数变更（非仅 temperature/max_tokens），重建 ChatModel 并重载 ChatService
+		llmCoreChanged := false
+		for _, c := range changed {
+			if c == "llm.provider" || c == "llm.model" || c == "llm.base_url" || c == "llm.api_key" {
+				llmCoreChanged = true
+				break
+			}
+		}
+		if llmCoreChanged && h.chatService != nil {
+			newModel, _, err := container.NewLLMProvider(c.Request.Context(), &h.cfg.LLM)
+			if err != nil {
+				log.Printf("[Settings] 重建 LLM 失败: %v", err)
+			} else {
+				h.chatService.SetChatModel(newModel)
+				if err := h.chatService.Reload(); err != nil {
+					log.Printf("[Settings] ChatService Reload 失败: %v", err)
+				} else {
+					log.Printf("[Settings] ChatModel 和 ChatService 已重建")
+				}
+			}
 		}
 	}
 

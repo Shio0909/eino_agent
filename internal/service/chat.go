@@ -4,7 +4,6 @@ package service
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"sort"
 	"strings"
@@ -45,7 +44,6 @@ type ChatService struct {
 	pipeline        *pipeline.RAGPipeline
 	agent           *react.Agent
 	knowledgeTool   *internalTool.KnowledgeTool  // Agent 模式的知识库工具引用
-	agenticRAG      *pipeline.AgenticRAGPipeline // Deprecated: 保留字段供渐进迁移，不再在调度中使用
 	graphRAGService *graphrag.Service            // GraphRAG 服务（可选，用于按需创建图谱检索器）
 	codeGraphRepo   codegraph.CodeGraphRepository // 代码知识图谱存储（可选）
 	codeIndexer     *codegraph.Indexer            // 代码索引器（可选）
@@ -107,6 +105,11 @@ func (s *ChatService) SetMCPTools(tools []tool.BaseTool) {
 // SetReranker 设置重排序器（在 InitWithComponents 之前调用）
 func (s *ChatService) SetReranker(r pipeline.Reranker) {
 	s.reranker = r
+}
+
+// SetChatModel 替换 ChatModel（用于运行时热重载）
+func (s *ChatService) SetChatModel(m model.ChatModel) {
+	s.chatModel = m
 }
 
 // Reload 重新初始化 Pipeline/Agent，使最新 MCP 工具配置生效
@@ -467,29 +470,6 @@ func (s *ChatService) buildRuntimePipeline(runtimeRetriever retriever.Retriever)
 	)
 }
 
-func (s *ChatService) buildRuntimeAgenticRAG(ctx context.Context, runtimeRetriever retriever.Retriever) (*pipeline.AgenticRAGPipeline, error) {
-	if runtimeRetriever == nil {
-		return nil, fmt.Errorf("retriever is nil")
-	}
-	agenticOpts := []pipeline.AgenticRAGOption{
-		pipeline.WithAgenticChatModel(s.chatModel),
-		pipeline.WithAgenticRetriever(runtimeRetriever),
-	}
-	if lm := s.config.Agent.AgenticRAG.LightLLM; lm != nil && lm.ModelID != "" {
-		lightModel, _, err := container.NewLLMProvider(ctx, lm)
-		if err != nil {
-			log.Printf("[AgenticRAG] runtime 轻量模型初始化失败，降级使用主模型: %v", err)
-		} else {
-			agenticOpts = append(agenticOpts, pipeline.WithAgenticLightModel(lightModel))
-		}
-	}
-	return pipeline.NewAgenticRAGPipeline(
-		ctx,
-		&s.config.Agent.AgenticRAG,
-		agenticOpts...,
-	)
-}
-
 func (s *ChatService) buildMemoryInstruction(ctx context.Context, req *ChatRequest, sessionID string) string {
 	if !s.config.Memory.Enabled || sessionID == "" || s.messageRepo == nil {
 		return ""
@@ -843,41 +823,28 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			messages := []*schema.Message{
 				{Role: schema.User, Content: cc.messageWithInst},
 			}
-			stream, err := runtimeAgent.Stream(ctx, messages)
-			if err != nil {
-				ch <- StreamEvent{Type: "error", Error: err.Error()}
+			// Use Generate (not Stream) because our tools only implement InvokableTool,
+			// not StreamableTool. The ReAct graph in streaming mode tries to stream-invoke
+			// tools, which fails. Generate runs the full ReAct loop correctly.
+			// Action/observation events still fire via eventSink during tool execution.
+			respMsg, agentErr := runtimeAgent.Generate(ctx, messages)
+			if agentErr != nil {
+				ch <- StreamEvent{Type: "error", Error: agentErr.Error()}
 				return
 			}
-			defer stream.Close()
 
-			for {
-				chunk, recvErr := stream.Recv()
-				if recvErr != nil {
-					if recvErr == io.EOF {
-						break
-					}
-					ch <- StreamEvent{Type: "error", Error: recvErr.Error()}
-					return
-				}
-
-				if chunk == nil || chunk.Content == "" {
-					continue
-				}
-
-				filtered := thinkFilter.Filter(chunk.Content)
-				if filtered != "" {
-					if !firstTokenLogged {
-						log.Printf("[Timing][ChatService] mode=agentic stage=first_token duration_ms=%d", time.Since(startTime).Milliseconds())
-						firstTokenLogged = true
-					}
-					fullResponse.WriteString(filtered)
-					ch <- StreamEvent{Type: "content", Content: filtered}
-				}
+			answer := ""
+			if respMsg != nil {
+				answer = respMsg.Content
 			}
-			// 刷新过滤器缓冲区
-			if remaining := thinkFilter.Flush(); remaining != "" {
-				fullResponse.WriteString(remaining)
-				ch <- StreamEvent{Type: "content", Content: remaining}
+			// Strip think-tag content, then fake-stream the final answer rune by rune.
+			answer = filter.StripThinkTags(answer)
+			if answer != "" {
+				log.Printf("[Timing][ChatService] mode=agentic stage=first_token duration_ms=%d", time.Since(startTime).Milliseconds())
+				for _, r := range []rune(answer) {
+					ch <- StreamEvent{Type: "content", Content: string(r)}
+				}
+				fullResponse.WriteString(answer)
 			}
 			ch <- StreamEvent{Type: "done"}
 

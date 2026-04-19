@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"os/exec"
@@ -100,6 +101,11 @@ func (h *Handler) MCPDeleteKB(ctx context.Context, kbID string) error {
 	if err := h.kbRepo.Delete(ctx, kbID); err != nil {
 		return fmt.Errorf("删除知识库失败: %w", err)
 	}
+	if h.vectorDB != nil {
+		if err := h.vectorDB.DeleteByKnowledgeBaseID(ctx, kbID); err != nil {
+			log.Printf("[VectorDB] MCP删除知识库向量失败（数据可能残留）: kb=%s err=%v", kbID, err)
+		}
+	}
 	if h.retrievalCache != nil {
 		_ = h.retrievalCache.InvalidateKnowledgeBase(ctx, kbID)
 	}
@@ -150,6 +156,11 @@ func (h *Handler) MCPDeleteDocument(ctx context.Context, kbID, docID string) err
 	}
 	if err := h.knowledgeRepo.Delete(ctx, docID); err != nil {
 		return fmt.Errorf("删除文档失败: %w", err)
+	}
+	if h.vectorDB != nil {
+		if err := h.vectorDB.DeleteByKnowledgeID(ctx, docID); err != nil {
+			log.Printf("[VectorDB] MCP删除文档向量失败（数据可能残留）: doc=%s err=%v", docID, err)
+		}
 	}
 	_ = h.kbRepo.IncrementCounts(ctx, kbID, -1, 0)
 	h.deleteImportTaskState(ctx, docID)

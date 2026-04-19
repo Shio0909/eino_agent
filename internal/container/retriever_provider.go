@@ -547,6 +547,14 @@ func (db *knowledgeBaseScopedVectorDB) Delete(ctx context.Context, ids []string)
 	return db.base.Delete(ctx, ids)
 }
 
+func (db *knowledgeBaseScopedVectorDB) DeleteByKnowledgeID(ctx context.Context, knowledgeID string) error {
+	return db.base.DeleteByKnowledgeID(ctx, knowledgeID)
+}
+
+func (db *knowledgeBaseScopedVectorDB) DeleteByKnowledgeBaseID(ctx context.Context, kbID string) error {
+	return db.base.DeleteByKnowledgeBaseID(ctx, kbID)
+}
+
 func (db *knowledgeBaseScopedVectorDB) Close() error {
 	return db.base.Close()
 }

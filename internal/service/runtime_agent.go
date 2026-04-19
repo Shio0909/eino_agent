@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/cloudwego/eino/adk"
@@ -16,6 +17,27 @@ import (
 
 	internalTool "eino_agent/internal/tool"
 )
+
+// allChunksStreamToolCallChecker reads all chunks before deciding whether the model
+// issued a tool call. Models like MiniMax M2.7 emit text content BEFORE the tool_call
+// object, so the default Eino checker (which bails on the first non-empty text chunk)
+// would incorrectly route to END. This checker drains the full stream and returns true
+// if any chunk carries a ToolCall.
+func allChunksStreamToolCallChecker(_ context.Context, sr *schema.StreamReader[*schema.Message]) (bool, error) {
+	defer sr.Close()
+	for {
+		msg, err := sr.Recv()
+		if err == io.EOF {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if msg != nil && len(msg.ToolCalls) > 0 {
+			return true, nil
+		}
+	}
+}
 
 type selectedSkillBackend struct {
 	base    skill.Backend
@@ -128,9 +150,10 @@ func (s *ChatService) buildRuntimeAgentForRequest(
 
 	systemInstruction := s.buildAgentInstructionForRequest(req, runtimeSkill)
 	agent, err := react.NewAgent(ctx, &react.AgentConfig{
-		ToolsConfig:      compose.ToolsNodeConfig{Tools: tools},
-		MaxStep:          s.config.Agent.MaxSteps,
-		ToolCallingModel: toolCallingModel,
+		ToolsConfig:          compose.ToolsNodeConfig{Tools: tools},
+		MaxStep:              s.config.Agent.MaxSteps,
+		ToolCallingModel:     toolCallingModel,
+		StreamToolCallChecker: allChunksStreamToolCallChecker,
 		MessageModifier: func(ctx context.Context, input []*schema.Message) []*schema.Message {
 			if len(input) == 0 {
 				return []*schema.Message{{Role: schema.System, Content: systemInstruction}}
