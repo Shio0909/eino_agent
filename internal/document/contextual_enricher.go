@@ -6,6 +6,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -75,7 +76,6 @@ func (e *ContextualEnricher) Enrich(ctx context.Context, docContent string, chun
 	taskCh := make(chan enrichTask, len(chunks))
 	var wg sync.WaitGroup
 	var successCount int32
-	var mu sync.Mutex
 
 	start := time.Now()
 
@@ -108,9 +108,7 @@ func (e *ContextualEnricher) Enrich(ctx context.Context, docContent string, chun
 				newChunk.Metadata["enriched"] = true
 				enriched[task.index] = newChunk
 
-				mu.Lock()
-				successCount++
-				mu.Unlock()
+				atomic.AddInt32(&successCount, 1)
 			}
 		}(w)
 	}

@@ -1174,7 +1174,7 @@ func (h *Handler) newURLKnowledge(kbID, title, sourceURL, status string) *reposi
 		ParseStatus:     status,
 		ChunkCount:      0,
 		Metadata: repository.JSON{
-			"url": sourceURL,
+			"source_url": sourceURL,
 		},
 	}
 }
@@ -1198,7 +1198,9 @@ func (h *Handler) markKnowledgeCompleted(ctx context.Context, knowledge *reposit
 	if knowledge == nil || h.knowledgeRepo == nil {
 		return
 	}
-	_ = h.knowledgeRepo.UpdateParseStatus(ctx, knowledge.ID, "completed", "", chunkCount)
+	if err := h.knowledgeRepo.UpdateParseStatus(ctx, knowledge.ID, "completed", "", chunkCount); err != nil {
+		log.Printf("[Handler] 更新文档完成状态失败: id=%s err=%v", knowledge.ID, err)
+	}
 	h.writeImportTaskState(ctx, knowledge.ID, func(state *cachepkg.ImportTaskState) {
 		state.Status = "completed"
 		state.Stage = "completed"
@@ -1206,9 +1208,13 @@ func (h *Handler) markKnowledgeCompleted(ctx context.Context, knowledge *reposit
 		state.Error = ""
 	})
 	if h.kbRepo != nil {
-		_ = h.kbRepo.IncrementCounts(ctx, knowledge.KnowledgeBaseID, 0, chunkCount)
+		if err := h.kbRepo.IncrementCounts(ctx, knowledge.KnowledgeBaseID, 0, chunkCount); err != nil {
+			log.Printf("[Handler] 更新知识库 chunk 计数失败: kb=%s err=%v", knowledge.KnowledgeBaseID, err)
+		}
 		// 记录本次索引使用的 Embedding 指纹，用于后续失效检测
-		_ = h.kbRepo.UpdateEmbedFingerprint(ctx, knowledge.KnowledgeBaseID, container.EmbedFingerprint(&h.cfg.Embedding))
+		if err := h.kbRepo.UpdateEmbedFingerprint(ctx, knowledge.KnowledgeBaseID, container.EmbedFingerprint(&h.cfg.Embedding)); err != nil {
+			log.Printf("[Handler] 更新 embed 指纹失败: kb=%s err=%v", knowledge.KnowledgeBaseID, err)
+		}
 	}
 	if h.retrievalCache != nil {
 		if err := h.retrievalCache.InvalidateKnowledgeBase(ctx, knowledge.KnowledgeBaseID); err != nil {
@@ -1221,7 +1227,9 @@ func (h *Handler) markKnowledgeFailed(ctx context.Context, knowledgeID string, c
 	if knowledgeID == "" || h.knowledgeRepo == nil || err == nil {
 		return
 	}
-	_ = h.knowledgeRepo.UpdateParseStatus(ctx, knowledgeID, "failed", err.Error(), chunkCount)
+	if err := h.knowledgeRepo.UpdateParseStatus(ctx, knowledgeID, "failed", err.Error(), chunkCount); err != nil {
+		log.Printf("[Handler] 标记文档失败状态失败: id=%s err=%v", knowledgeID, err)
+	}
 	h.writeImportTaskState(ctx, knowledgeID, func(state *cachepkg.ImportTaskState) {
 		state.Status = "failed"
 		state.Stage = "failed"
@@ -1494,7 +1502,7 @@ func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeI
 			}
 		}
 		if err := h.chunkRepo.BatchCreate(ctx, pgChunks); err != nil {
-			log.Printf("[DualWrite] PG chunks 写入失败（向量已存储）: knowledge=%s err=%v", knowledgeID, err)
+			log.Printf("[DualWrite][WARN] PG chunks 写入失败（向量已存储，chunk预览/增量同步将不可用）: knowledge=%s err=%v", knowledgeID, err)
 		}
 	}
 
@@ -1502,7 +1510,7 @@ func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeI
 	if h.knowledgeRepo != nil {
 		docHash := contentHash(string(content))
 		if err := h.knowledgeRepo.UpdateContentHash(ctx, knowledgeID, docHash); err != nil {
-			log.Printf("[DualWrite] 文档 content_hash 更新失败: knowledge=%s err=%v", knowledgeID, err)
+			log.Printf("[DualWrite][WARN] 文档 content_hash 更新失败: knowledge=%s err=%v", knowledgeID, err)
 		}
 	}
 
@@ -1700,7 +1708,7 @@ func (h *Handler) processAndStoreChunks(ctx context.Context, kbID, knowledgeID, 
 			}
 		}
 		if err := h.chunkRepo.BatchCreate(ctx, pgChunks); err != nil {
-			log.Printf("[DualWrite] PG chunks 写入失败（向量已存储）: knowledge=%s err=%v", knowledgeID, err)
+			log.Printf("[DualWrite][WARN] PG chunks 写入失败（向量已存储，chunk预览/增量同步将不可用）: knowledge=%s err=%v", knowledgeID, err)
 		}
 	}
 
@@ -1905,7 +1913,9 @@ func (h *Handler) DeleteDocument(c *gin.Context) {
 
 	// 更新知识库计数
 	if h.kbRepo != nil {
-		_ = h.kbRepo.IncrementCounts(c.Request.Context(), kbID, -1, 0)
+		if err := h.kbRepo.IncrementCounts(c.Request.Context(), kbID, -1, 0); err != nil {
+			log.Printf("[Handler] 删除文档后更新知识库计数失败: kb=%s err=%v", kbID, err)
+		}
 	}
 	h.deleteImportTaskState(c.Request.Context(), docID)
 	if h.retrievalCache != nil {
@@ -2297,10 +2307,14 @@ func (h *Handler) incrementalSync(ctx context.Context, kbID, knowledgeID, filena
 func (h *Handler) fullReindex(ctx context.Context, kbID, knowledgeID, filename string, content []byte, docHash string) (*syncResult, error) {
 	// 清除所有旧数据
 	if h.vectorDB != nil {
-		_ = h.vectorDB.DeleteByKnowledgeID(ctx, knowledgeID)
+		if err := h.vectorDB.DeleteByKnowledgeID(ctx, knowledgeID); err != nil {
+			log.Printf("[Reindex] 清除向量旧数据失败: knowledge=%s err=%v", knowledgeID, err)
+		}
 	}
 	if h.chunkRepo != nil {
-		_ = h.chunkRepo.DeleteByKnowledgeID(ctx, knowledgeID)
+		if err := h.chunkRepo.DeleteByKnowledgeID(ctx, knowledgeID); err != nil {
+			log.Printf("[Reindex] 清除 PG chunks 旧数据失败: knowledge=%s err=%v", knowledgeID, err)
+		}
 	}
 
 	chunkCount, err := h.processPlainTextDocument(ctx, kbID, knowledgeID, filename, content)
@@ -3005,10 +3019,22 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			changed = append(changed, "rag.enable_rerank")
 		}
 		if req.RAG.ChunkSize != nil {
+			if *req.RAG.ChunkSize < 50 || *req.RAG.ChunkSize > 10000 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "chunk_size 必须在 50-10000 之间"})
+				return
+			}
 			h.cfg.RAG.ChunkSize = *req.RAG.ChunkSize
 			changed = append(changed, "rag.chunk_size")
 		}
 		if req.RAG.ChunkOverlap != nil {
+			if *req.RAG.ChunkOverlap < 0 || *req.RAG.ChunkOverlap > 5000 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "chunk_overlap 必须在 0-5000 之间"})
+				return
+			}
+			if req.RAG.ChunkSize != nil && *req.RAG.ChunkOverlap >= *req.RAG.ChunkSize {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "chunk_overlap 必须小于 chunk_size"})
+				return
+			}
 			h.cfg.RAG.ChunkOverlap = *req.RAG.ChunkOverlap
 			changed = append(changed, "rag.chunk_overlap")
 		}

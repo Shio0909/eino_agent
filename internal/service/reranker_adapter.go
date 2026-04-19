@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"sort"
 
 	"eino_agent/internal/container"
@@ -21,7 +22,7 @@ func (a *rerankerAdapter) Rerank(ctx context.Context, query string, passages []s
 	// Convert passages to container.Document slice
 	docs := make([]*container.Document, len(passages))
 	for i, p := range passages {
-		docs[i] = &container.Document{ID: string(rune(i)), Content: p}
+		docs[i] = &container.Document{ID: fmt.Sprintf("%d", i), Content: p}
 	}
 
 	// Call the underlying provider (returns top docs sorted by score)

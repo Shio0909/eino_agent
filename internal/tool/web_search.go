@@ -164,7 +164,7 @@ func (t *WebSearchTool) searchTavily(ctx context.Context, query string) (string,
 	return string(jsonBytes), err
 }
 
-// searchSerp 使用 SerpAPI 搜索（简化实现）
+// searchSerp 使用 SerpAPI 搜索
 func (t *WebSearchTool) searchSerp(ctx context.Context, query string) (string, error) {
 	u := fmt.Sprintf("https://serpapi.com/search?api_key=%s&q=%s&num=%d",
 		t.config.SerpAPIKey,
@@ -183,14 +183,35 @@ func (t *WebSearchTool) searchSerp(ctx context.Context, query string) (string, e
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("serp error: %s - %s", resp.Status, string(body))
 	}
 
-	// 简化处理，直接返回原始响应
-	// 实际应该解析并格式化
-	return string(body), nil
+	var serpResp struct {
+		OrganicResults []struct {
+			Title   string `json:"title"`
+			Link    string `json:"link"`
+			Snippet string `json:"snippet"`
+		} `json:"organic_results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&serpResp); err != nil {
+		return "", fmt.Errorf("serp decode: %w", err)
+	}
+
+	output := WebSearchOutput{
+		Results: make([]WebSearchResult, len(serpResp.OrganicResults)),
+	}
+	for i, r := range serpResp.OrganicResults {
+		output.Results[i] = WebSearchResult{
+			Title:   r.Title,
+			URL:     r.Link,
+			Content: r.Snippet,
+		}
+	}
+
+	jsonBytes, err := json.Marshal(output)
+	return string(jsonBytes), err
 }
 
 // Ensure interface implementation

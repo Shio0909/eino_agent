@@ -858,6 +858,16 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 	ch := make(chan StreamEvent, 100)
 	cc := s.prepareChatContext(ctx, req)
 
+	// trySend 向 channel 发送事件，如果 ctx 已取消则放弃，防止 goroutine 泄露
+	trySend := func(ev StreamEvent) bool {
+		select {
+		case ch <- ev:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+
 	// 发送 session_id 事件（首个事件）
 	if cc.sessionID != "" {
 		ch <- StreamEvent{Type: "session_id", SessionID: cc.sessionID}
@@ -875,10 +885,10 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 
 		// Agentic 模式（统一 agent / agentic / agentic_rag）
 		if req.UseAgent && s.config.Agent.Enabled {
-			eventSink := func(ev StreamEvent) { ch <- ev }
+			eventSink := func(ev StreamEvent) { trySend(ev) }
 			runtimeAgent, _, createErr := s.buildRuntimeAgentForRequest(ctx, cc.runtimeRetriever, req, eventSink)
 			if createErr != nil {
-				ch <- StreamEvent{Type: "error", Error: createErr.Error()}
+				trySend(StreamEvent{Type: "error", Error: createErr.Error()})
 				return
 			}
 
@@ -891,7 +901,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			// Action/observation events still fire via eventSink during tool execution.
 			respMsg, agentErr := runtimeAgent.Generate(ctx, messages)
 			if agentErr != nil {
-				ch <- StreamEvent{Type: "error", Error: agentErr.Error()}
+				trySend(StreamEvent{Type: "error", Error: agentErr.Error()})
 				return
 			}
 
@@ -904,11 +914,34 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			if answer != "" {
 				log.Printf("[Timing][ChatService] mode=agentic stage=first_token duration_ms=%d", time.Since(startTime).Milliseconds())
 				for _, r := range []rune(answer) {
-					ch <- StreamEvent{Type: "content", Content: string(r)}
+					if !trySend(StreamEvent{Type: "content", Content: string(r)}) {
+						return
+					}
 				}
 				fullResponse.WriteString(answer)
 			}
-			ch <- StreamEvent{Type: "done"}
+			trySend(StreamEvent{Type: "done"})
+
+			// 记录流式 agentic 模式的指标和审计日志
+			duration := time.Since(startTime)
+			var promptTokens, completionTokens int
+			if respMsg != nil && respMsg.ResponseMeta != nil && respMsg.ResponseMeta.Usage != nil {
+				promptTokens = respMsg.ResponseMeta.Usage.PromptTokens
+				completionTokens = respMsg.ResponseMeta.Usage.CompletionTokens
+			}
+			metrics.RecordLLMCall(s.config.LLM.Provider, s.config.LLM.ModelID, "agentic", duration, promptTokens, completionTokens)
+			s.recordLLMAudit(ctx, &repository.LLMAuditLog{
+				TraceID:          logger.TraceIDFrom(ctx),
+				UserID:           req.UserID,
+				SessionID:        cc.sessionID,
+				Provider:         s.config.LLM.Provider,
+				Model:            s.config.LLM.ModelID,
+				Mode:             "agentic",
+				PromptTokens:     promptTokens,
+				CompletionTokens: completionTokens,
+				TotalTokens:      promptTokens + completionTokens,
+				LatencyMs:        int(duration.Milliseconds()),
+			})
 
 			latencyMs := time.Since(startTime).Milliseconds()
 			s.saveAssistantMessage(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs)
@@ -928,7 +961,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 				GenerationInstruction: cc.runtimeInstruction,
 			})
 			if err != nil {
-				ch <- StreamEvent{Type: "error", Error: err.Error()}
+				trySend(StreamEvent{Type: "error", Error: err.Error()})
 				return
 			}
 
@@ -941,24 +974,28 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 							firstTokenLogged = true
 						}
 						fullResponse.WriteString(filtered)
-						ch <- StreamEvent{
+						if !trySend(StreamEvent{
 							Type:    string(chunk.Type),
 							Content: filtered,
 							DocID:   chunk.DocID,
+						}) {
+							return
 						}
 					}
 				} else {
-					ch <- StreamEvent{
+					if !trySend(StreamEvent{
 						Type:    string(chunk.Type),
 						Content: chunk.Content,
 						DocID:   chunk.DocID,
+					}) {
+						return
 					}
 				}
 			}
 			// 刷新过滤器缓冲区
 			if remaining := thinkFilter.Flush(); remaining != "" {
 				fullResponse.WriteString(remaining)
-				ch <- StreamEvent{Type: "content", Content: remaining}
+				trySend(StreamEvent{Type: "content", Content: remaining})
 			}
 
 			latencyMs := time.Since(startTime).Milliseconds()
@@ -966,7 +1003,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			return
 		}
 
-		ch <- StreamEvent{Type: "error", Error: "no handler available"}
+		trySend(StreamEvent{Type: "error", Error: "no handler available"})
 	}()
 
 	return ch, nil
