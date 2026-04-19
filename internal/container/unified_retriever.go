@@ -132,8 +132,6 @@ func (s *scopedUnifiedRetriever) Retrieve(ctx context.Context, query string, opt
 		allDocs = allDocs[:s.topK]
 	}
 
-	log.Printf("[UnifiedRetriever] 检索完成: vector_kbs=%d wiki_kbs=%d total_docs=%d",
-		len(s.vectorKBIDs), len(s.wikiKBIDs), len(allDocs))
 	return allDocs, nil
 }
 
