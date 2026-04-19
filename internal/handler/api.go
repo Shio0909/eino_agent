@@ -665,9 +665,11 @@ type KnowledgeBaseRequest struct {
 
 // ListKnowledgeBases 获取知识库列表
 // @Summary 知识库列表
-// @Description 获取当前租户下所有知识库
+// @Description 获取当前租户下所有知识库，支持分页
 // @Tags 知识库
 // @Produce json
+// @Param page query int false "页码（从1开始，默认1）"
+// @Param page_size query int false "每页数量（默认20，最大100）"
 // @Success 200 {object} map[string]interface{}
 // @Router /knowledge-bases [get]
 func (h *Handler) ListKnowledgeBases(c *gin.Context) {
@@ -676,15 +678,21 @@ func (h *Handler) ListKnowledgeBases(c *gin.Context) {
 		return
 	}
 
+	page, pageSize := parsePagination(c, 20, 100)
+	offset := (page - 1) * pageSize
 	tenantID := h.getTenantID(c)
 
-	kbs, err := h.kbRepo.List(c.Request.Context(), tenantID, 0, 100)
+	kbs, err := h.kbRepo.List(c.Request.Context(), tenantID, offset, pageSize)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"knowledge_bases": kbs})
+	c.JSON(http.StatusOK, gin.H{
+		"knowledge_bases": kbs,
+		"page":            page,
+		"page_size":       pageSize,
+	})
 }
 
 // CreateKnowledgeBase 创建知识库
@@ -1624,10 +1632,12 @@ func (h *Handler) processAndStoreChunks(ctx context.Context, kbID, knowledgeID, 
 
 // ListDocuments 获取知识库文档列表
 // @Summary 文档列表
-// @Description 获取知识库下的文档列表
+// @Description 获取知识库下的文档列表，支持分页
 // @Tags 知识库
 // @Produce json
 // @Param id path string true "知识库 ID"
+// @Param page query int false "页码（从1开始，默认1）"
+// @Param page_size query int false "每页数量（默认50，最大200）"
 // @Success 200 {object} map[string]interface{}
 // @Router /knowledge-bases/{id}/documents [get]
 func (h *Handler) ListDocuments(c *gin.Context) {
@@ -1643,7 +1653,10 @@ func (h *Handler) ListDocuments(c *gin.Context) {
 		return
 	}
 
-	knowledges, err := h.knowledgeRepo.ListByKnowledgeBase(c.Request.Context(), kbID, 0, 1000)
+	page, pageSize := parsePagination(c, 50, 200)
+	offset := (page - 1) * pageSize
+
+	knowledges, err := h.knowledgeRepo.ListByKnowledgeBase(c.Request.Context(), kbID, offset, pageSize)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1687,7 +1700,11 @@ func (h *Handler) ListDocuments(c *gin.Context) {
 		})
 	}
 
-	c.JSON(http.StatusOK, gin.H{"documents": docs})
+	c.JSON(http.StatusOK, gin.H{
+		"documents": docs,
+		"page":      page,
+		"page_size": pageSize,
+	})
 }
 
 // GetDocumentImportStatus 获取单个导入任务的实时状态。

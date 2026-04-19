@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -155,6 +156,23 @@ func (h *Handler) getTenantID(c *gin.Context) int {
 		}
 	}
 	return 1
+}
+
+// parsePagination extracts page/page_size from query params.
+// defaultSize: default page size; maxSize: upper cap on page size.
+func parsePagination(c *gin.Context, defaultSize, maxSize int) (page, pageSize int) {
+	page = 1
+	pageSize = defaultSize
+	if v, err := strconv.Atoi(c.Query("page")); err == nil && v >= 1 {
+		page = v
+	}
+	if v, err := strconv.Atoi(c.Query("page_size")); err == nil && v >= 1 {
+		if v > maxSize {
+			v = maxSize
+		}
+		pageSize = v
+	}
+	return
 }
 
 func (h *Handler) getUserRole(c *gin.Context) string {
