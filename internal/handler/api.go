@@ -2087,9 +2087,12 @@ func (h *Handler) ListModels(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"models": models})
 }
 
-// CreateModel 创建模型配置
+// CreateModel 创建/更新模型配置
 // @Summary 创建模型
-// @Description 添加新的模型配置
+// @Description 添加或更新模型配置（llm / embedding / reranker）。由于系统每种类型只有一个槽位，
+//
+//	实际效果等同于更新对应配置并热重载 Provider。
+//
 // @Tags 模型
 // @Accept json
 // @Produce json
@@ -2097,19 +2100,133 @@ func (h *Handler) ListModels(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Router /models [post]
 func (h *Handler) CreateModel(c *gin.Context) {
-	// TODO: 持久化到数据库
-	c.JSON(http.StatusOK, gin.H{"message": "模型管理功能开发中，当前通过配置文件管理"})
+	var req struct {
+		Type        string  `json:"type" binding:"required"`   // "llm" | "embedding" | "reranker"
+		Provider    string  `json:"provider" binding:"required"`
+		Model       string  `json:"model" binding:"required"`
+		BaseURL     string  `json:"base_url"`
+		APIKey      string  `json:"api_key"`
+		Temperature float64 `json:"temperature"`
+		Dimensions  int     `json:"dimensions"`
+		TopK        int     `json:"top_k"`
+		Threshold   float64 `json:"threshold"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	ctx := c.Request.Context()
+	var newID string
+
+	switch req.Type {
+	case "llm":
+		h.cfg.LLM.Provider = req.Provider
+		h.cfg.LLM.ModelID = req.Model
+		if req.BaseURL != "" {
+			h.cfg.LLM.BaseURL = req.BaseURL
+		}
+		if req.APIKey != "" && !strings.Contains(req.APIKey, "****") {
+			h.cfg.LLM.APIKey = req.APIKey
+		}
+		if req.Temperature > 0 {
+			h.cfg.LLM.Temperature = req.Temperature
+		}
+		// 重建 LLM Provider
+		newModel, _, err := container.NewLLMProvider(ctx, &h.cfg.LLM)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("LLM 初始化失败: %v", err)})
+			return
+		}
+		if h.chatService != nil {
+			h.chatService.SetChatModel(newModel)
+			if err := h.chatService.Reload(); err != nil {
+				log.Printf("[Model] ChatService Reload 失败: %v", err)
+			}
+		}
+		newID = "llm-default"
+
+	case "embedding":
+		h.cfg.Embedding.Provider = req.Provider
+		h.cfg.Embedding.ModelID = req.Model
+		if req.BaseURL != "" {
+			h.cfg.Embedding.BaseURL = req.BaseURL
+		}
+		if req.APIKey != "" && !strings.Contains(req.APIKey, "****") {
+			h.cfg.Embedding.APIKey = req.APIKey
+		}
+		if req.Dimensions > 0 {
+			h.cfg.Embedding.Dimensions = req.Dimensions
+		}
+		// 重建 Embedding Provider
+		newEmb, _, err := container.NewEmbeddingProvider(ctx, &h.cfg.Embedding)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Embedding 初始化失败: %v", err)})
+			return
+		}
+		h.embedding = newEmb
+		newID = "embedding-default"
+
+	case "reranker":
+		h.cfg.Reranker.Provider = req.Provider
+		h.cfg.Reranker.ModelID = req.Model
+		h.cfg.Reranker.Enabled = true
+		if req.BaseURL != "" {
+			h.cfg.Reranker.BaseURL = req.BaseURL
+		}
+		if req.APIKey != "" && !strings.Contains(req.APIKey, "****") {
+			h.cfg.Reranker.APIKey = req.APIKey
+		}
+		if req.TopK > 0 {
+			h.cfg.Reranker.TopK = req.TopK
+		}
+		if req.Threshold > 0 {
+			h.cfg.Reranker.Threshold = req.Threshold
+		}
+		newID = "reranker-default"
+
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "type 必须为 llm / embedding / reranker"})
+		return
+	}
+
+	if err := config.Save(h.configPath, h.cfg); err != nil {
+		log.Printf("[Model] 持久化配置失败: %v", err)
+	}
+	h.audit(c, "model.create", newID, true, map[string]interface{}{"type": req.Type, "provider": req.Provider, "model": req.Model})
+	c.JSON(http.StatusCreated, gin.H{
+		"message": fmt.Sprintf("%s 模型配置已更新", req.Type),
+		"id":      newID,
+	})
 }
 
 // DeleteModel 删除模型配置
 // @Summary 删除模型
-// @Description 删除指定模型配置
+// @Description 删除指定模型配置。llm-default 和 embedding-default 不可删除；
+//
+//	reranker-default 删除等同于禁用 Reranker。
+//
 // @Tags 模型
 // @Param id path string true "模型 ID"
 // @Success 200 {object} map[string]string
 // @Router /models/{id} [delete]
 func (h *Handler) DeleteModel(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"message": "模型管理功能开发中"})
+	id := c.Param("id")
+	switch id {
+	case "llm-default":
+		c.JSON(http.StatusBadRequest, gin.H{"error": "LLM 主模型不可删除，可通过 PUT /settings 更新配置"})
+	case "embedding-default":
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Embedding 模型不可删除，可通过 PUT /settings 更新配置"})
+	case "reranker-default":
+		h.cfg.Reranker.Enabled = false
+		if err := config.Save(h.configPath, h.cfg); err != nil {
+			log.Printf("[Model] 持久化配置失败: %v", err)
+		}
+		h.audit(c, "model.delete", id, true, nil)
+		c.JSON(http.StatusOK, gin.H{"message": "Reranker 已禁用"})
+	default:
+		c.JSON(http.StatusNotFound, gin.H{"error": "模型不存在"})
+	}
 }
 
 // ============================================================================
