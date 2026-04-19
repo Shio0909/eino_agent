@@ -25,6 +25,8 @@ import (
 	"eino_agent/internal/database/repository"
 	"eino_agent/internal/filter"
 	"eino_agent/internal/graphrag"
+	"eino_agent/internal/logger"
+	"eino_agent/internal/metrics"
 	"eino_agent/internal/pipeline"
 	promptmgr "eino_agent/internal/prompt"
 	internalTool "eino_agent/internal/tool"
@@ -56,6 +58,7 @@ type ChatService struct {
 	sessionRepo  repository.SessionRepository
 	messageRepo  repository.MessageRepository
 	sessionCache cachepkg.SessionCache
+	auditRepo    repository.LLMAuditRepository // LLM 调用审计日志（可选）
 }
 
 // NewChatService 创建聊天服务
@@ -124,6 +127,25 @@ func (s *ChatService) Reload() error {
 func (s *ChatService) SetRepositories(sessionRepo repository.SessionRepository, messageRepo repository.MessageRepository) {
 	s.sessionRepo = sessionRepo
 	s.messageRepo = messageRepo
+}
+
+// SetAuditRepo 设置 LLM 调用审计日志仓储（可选，nil 则不记录）
+func (s *ChatService) SetAuditRepo(repo repository.LLMAuditRepository) {
+	s.auditRepo = repo
+}
+
+// recordLLMAudit 异步写入 LLM 审计日志，不阻塞主流程。
+func (s *ChatService) recordLLMAudit(ctx context.Context, entry *repository.LLMAuditLog) {
+	if s.auditRepo == nil || entry == nil {
+		return
+	}
+	go func() {
+		writeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := s.auditRepo.Create(writeCtx, entry); err != nil {
+			log.Printf("[Audit] 写入 LLM 审计日志失败: %v", err)
+		}
+	}()
 }
 
 // SetGraphRAGService 设置 GraphRAG 服务（按需创建图谱检索器）
@@ -705,9 +727,11 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 	cc := s.prepareChatContext(ctx, req)
 
 	var resp *ChatResponse
+	mode := "pipeline"
 
 	// Agentic 模式（统一 agent / agentic / agentic_rag）
 	if req.UseAgent && s.config.Agent.Enabled {
+		mode = "agentic"
 		modeStart := time.Now()
 		runtimeAgent, kt, createErr := s.buildRuntimeAgentForRequest(ctx, cc.runtimeRetriever, req, nil)
 		if createErr != nil {
@@ -723,8 +747,13 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 		}
 
 		answer := ""
+		var promptTokens, completionTokens int
 		if respMsg != nil {
 			answer = respMsg.Content
+			if respMsg.ResponseMeta != nil && respMsg.ResponseMeta.Usage != nil {
+				promptTokens = respMsg.ResponseMeta.Usage.PromptTokens
+				completionTokens = respMsg.ResponseMeta.Usage.CompletionTokens
+			}
 		}
 		answer = filter.StripThinkTags(answer)
 
@@ -741,14 +770,34 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 				}
 			}
 		}
-		log.Printf("[Timing][ChatService] mode=agentic stage=source_from_cache sources=%d", len(sources))
+		logger.FromContext(ctx).Info("chat_agentic",
+			"sources", len(sources),
+			"duration_ms", time.Since(modeStart).Milliseconds(),
+			"prompt_tokens", promptTokens,
+			"completion_tokens", completionTokens,
+		)
 
 		resp = &ChatResponse{
 			Answer:    answer,
 			Sources:   sources,
 			SessionID: cc.sessionID,
 		}
-		log.Printf("[Timing][ChatService] mode=agentic stage=total duration_ms=%d", time.Since(modeStart).Milliseconds())
+
+		// 记录 Prometheus 指标 & 审计日志
+		duration := time.Since(modeStart)
+		metrics.RecordLLMCall(s.config.LLM.Provider, s.config.LLM.ModelID, mode, duration, promptTokens, completionTokens)
+		s.recordLLMAudit(ctx, &repository.LLMAuditLog{
+			TraceID:          logger.TraceIDFrom(ctx),
+			UserID:           req.UserID,
+			SessionID:        cc.sessionID,
+			Provider:         s.config.LLM.Provider,
+			Model:            s.config.LLM.ModelID,
+			Mode:             mode,
+			PromptTokens:     promptTokens,
+			CompletionTokens: completionTokens,
+			TotalTokens:      promptTokens + completionTokens,
+			LatencyMs:        int(duration.Milliseconds()),
+		})
 	} else if s.pipeline != nil {
 		// Pipeline 模式
 		runtimePipeline := s.pipeline
@@ -780,6 +829,19 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 			Sources:   sources,
 			SessionID: cc.sessionID,
 		}
+
+		// 记录 Prometheus 指标 & 审计日志（pipeline 无 token usage，记 0）
+		duration := time.Since(startTime)
+		metrics.RecordLLMCall(s.config.LLM.Provider, s.config.LLM.ModelID, mode, duration, 0, 0)
+		s.recordLLMAudit(ctx, &repository.LLMAuditLog{
+			TraceID:   logger.TraceIDFrom(ctx),
+			UserID:    req.UserID,
+			SessionID: cc.sessionID,
+			Provider:  s.config.LLM.Provider,
+			Model:     s.config.LLM.ModelID,
+			Mode:      mode,
+			LatencyMs: int(duration.Milliseconds()),
+		})
 	} else {
 		return nil, fmt.Errorf("no chat handler available")
 	}

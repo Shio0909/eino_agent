@@ -40,6 +40,8 @@ import (
 	"eino_agent/internal/graphrag"
 	"eino_agent/internal/handler"
 	"eino_agent/internal/importqueue"
+	"eino_agent/internal/logger"
+	"eino_agent/internal/metrics"
 	mcpmanager "eino_agent/internal/mcp"
 	"eino_agent/internal/rediscache"
 	"eino_agent/internal/service"
@@ -62,6 +64,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("加载配置失败: %v", err)
 	}
+
+	// 初始化结构化日志（slog）
+	logger.Init(cfg.Server.Mode)
 
 	// 安全校验：release 模式下禁止使用默认 JWT 密钥
 	if cfg.Auth.Enabled && cfg.Auth.JWTSecret == "change-me-in-production" && cfg.Server.Mode == "release" {
@@ -242,6 +247,12 @@ func main() {
 		sessionCache = rediscache.NewSessionCache(redisClient)
 		retrievalCache = rediscache.NewRetrievalCache(redisClient)
 		importStateStore = rediscache.NewImportStateStore(redisClient)
+	}
+
+	// 注入 LLM 审计日志仓储（需要 DB）
+	if db != nil {
+		chatService.SetAuditRepo(repository.NewLLMAuditRepository(db))
+		log.Println("[Audit] LLM 审计日志已启用")
 	}
 	c.SetRetrievalCache(retrievalCache)
 	log.Println("[Retriever] 初始化检索器...")
@@ -445,7 +456,9 @@ func main() {
 
 	// 中间件
 	r.Use(gin.Recovery())
-	r.Use(gin.Logger())
+	r.Use(handler.TraceIDMiddleware())
+	r.Use(handler.RequestLogger())
+	r.Use(metrics.PrometheusMiddleware())
 
 	// CORS 配置
 	corsOrigins := cfg.Server.CORSOrigins
@@ -470,6 +483,9 @@ func main() {
 
 	// 注册路由
 	apiHandler.RegisterRoutes(r)
+
+	// Prometheus metrics 端点（不经过认证中间件）
+	r.GET("/metrics", metrics.Handler())
 
 	// Swagger 文档路由
 	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))

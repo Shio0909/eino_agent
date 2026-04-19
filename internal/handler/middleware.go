@@ -2,26 +2,55 @@
 package handler
 
 import (
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+
+	"eino_agent/internal/logger"
 )
 
-// RequestLogger 请求日志中间件，记录每个请求的方法、路径、状态码和耗时
+const ginTraceIDKey = "trace_id"
+const ginUserIDKey = "user_id" // 由 JWTMiddleware 写入
+
+// TraceIDMiddleware 为每个请求生成唯一 trace_id，
+// 注入 gin.Context、context.Context 和响应头 X-Trace-ID。
+func TraceIDMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		traceID := c.GetHeader("X-Trace-ID")
+		if traceID == "" {
+			traceID = uuid.New().String()
+		}
+		c.Set(ginTraceIDKey, traceID)
+		c.Header("X-Trace-ID", traceID)
+
+		// 把 traceID 注入底层 context.Context，方便服务层使用 logger.FromContext
+		ctx := logger.WithTraceID(c.Request.Context(), traceID)
+		c.Request = c.Request.WithContext(ctx)
+
+		c.Next()
+	}
+}
+
+// RequestLogger 请求日志中间件（结构化日志，携带 trace_id、user_id）。
 func RequestLogger() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
-		path := c.Request.URL.Path
-		method := c.Request.Method
-
 		c.Next()
 
-		latency := time.Since(start)
-		status := c.Writer.Status()
+		traceID, _ := c.Get(ginTraceIDKey)
+		userID, _ := c.Get(ginUserIDKey)
 
-		log.Printf("[HTTP] %s %s → %d (%dms)",
-			method, path, status, latency.Milliseconds())
+		slog.Info("http_request",
+			"trace_id", traceID,
+			"user_id", userID,
+			"method", c.Request.Method,
+			"path", c.Request.URL.Path,
+			"status", c.Writer.Status(),
+			"latency_ms", time.Since(start).Milliseconds(),
+			"ip", c.ClientIP(),
+		)
 	}
 }
 
