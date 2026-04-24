@@ -1,4 +1,4 @@
-import type { StreamEvent } from '../types/api'
+import type { StreamEvent, WikiPage } from '../types/api'
 
 const BASE = '/api/v1'
 
@@ -73,7 +73,7 @@ export async function streamChat(
 
 // ---- Knowledge Bases ----
 export const getKnowledgeBases = () => fetchJSON<{ knowledge_bases: any[] }>('/knowledge-bases')
-export const createKnowledgeBase = (data: { name: string; description?: string }) =>
+export const createKnowledgeBase = (data: { name: string; description?: string; mode?: 'vector' | 'wiki' }) =>
   fetchJSON<any>('/knowledge-bases', { method: 'POST', body: JSON.stringify(data) })
 export const getKnowledgeBase = (id: string) => fetchJSON<any>(`/knowledge-bases/${id}`)
 export const deleteKnowledgeBase = (id: string) =>
@@ -95,11 +95,18 @@ export const getDocumentChunks = (kbId: string, docId: string) =>
   fetchJSON<{ chunks: any[] }>(`/knowledge-bases/${kbId}/documents/${docId}/chunks`)
 
 // ---- URL Upload ----
-export const uploadDocumentURL = (kbId: string, url: string, filename?: string) =>
+export const uploadDocumentURL = (kbId: string, url: string, title?: string) =>
   fetchJSON<any>(`/knowledge-bases/${kbId}/documents/url`, {
     method: 'POST',
-    body: JSON.stringify({ url, filename }),
+    body: JSON.stringify({ url, title }),
   })
+
+export const getWikiPages = (kbId: string) =>
+  fetchJSON<{ pages: WikiPage[] }>(`/knowledge-bases/${kbId}/wiki/pages`)
+export const getWikiPage = (kbId: string, path: string) =>
+  fetchJSON<{ page: WikiPage }>(`/knowledge-bases/${kbId}/wiki/page?path=${encodeURIComponent(path)}`)
+export const searchWikiPages = (kbId: string, query: string) =>
+  fetchJSON<{ pages: WikiPage[]; query: string }>(`/knowledge-bases/${kbId}/wiki/search?q=${encodeURIComponent(query)}`)
 
 // ---- Sessions ----
 export const getSessions = () => fetchJSON<{ sessions: any[] }>('/sessions')

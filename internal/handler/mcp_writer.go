@@ -157,6 +157,11 @@ func (h *Handler) MCPDeleteDocument(ctx context.Context, kbID, docID string) err
 	if err := h.knowledgeRepo.Delete(ctx, docID); err != nil {
 		return fmt.Errorf("删除文档失败: %w", err)
 	}
+	if h.wikiRepo != nil {
+		if err := h.wikiRepo.DeletePagesBySourceKnowledge(ctx, docID); err != nil {
+			log.Printf("[Wiki] MCP删除文档 wiki 页面失败（数据可能残留）: doc=%s err=%v", docID, err)
+		}
+	}
 	if h.vectorDB != nil {
 		if err := h.vectorDB.DeleteByKnowledgeID(ctx, docID); err != nil {
 			log.Printf("[VectorDB] MCP删除文档向量失败（数据可能残留）: doc=%s err=%v", docID, err)

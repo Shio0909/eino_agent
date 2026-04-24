@@ -11,7 +11,7 @@ interface KnowledgeState {
 
   loadKBs: () => Promise<void>
   selectKB: (id: string) => Promise<void>
-  createKB: (name: string, description?: string) => Promise<void>
+  createKB: (name: string, description?: string, mode?: 'vector' | 'wiki') => Promise<void>
   deleteKB: (id: string) => Promise<void>
   loadDocuments: (kbId: string) => Promise<void>
   uploadDoc: (kbId: string, file: File) => Promise<void>
@@ -42,8 +42,8 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
     if (id) await get().loadDocuments(id)
   },
 
-  createKB: async (name, description) => {
-    await api.createKnowledgeBase({ name, description })
+  createKB: async (name, description, mode = 'vector') => {
+    await api.createKnowledgeBase({ name, description, mode })
     await get().loadKBs()
   },
 

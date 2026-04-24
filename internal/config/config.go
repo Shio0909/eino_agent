@@ -184,8 +184,8 @@ type AgentConfig struct {
 	MaxSteps     int    `yaml:"max_steps"`
 
 	// 工具配置
-	EnableKnowledgeTool bool `yaml:"enable_knowledge_tool"`
-	EnableWebSearch     bool `yaml:"enable_web_search"`
+	EnableKnowledgeTool bool   `yaml:"enable_knowledge_tool"`
+	EnableWebSearch     bool   `yaml:"enable_web_search"`
 	EnableCodeSearch    bool   `yaml:"enable_code_search"`
 	EnableCodeGraph     bool   `yaml:"enable_code_graph"`
 	CodeSearchReposDir  string `yaml:"code_search_repos_dir"`
@@ -280,10 +280,11 @@ type MCPConfig struct {
 
 // MCPExportConfig MCP Server 导出配置（将项目能力暴露给外部 Agent）
 type MCPExportConfig struct {
-	Enabled   bool     `yaml:"enabled"`
-	Transport string   `yaml:"transport"` // sse / streamable_http / stdio
-	Address   string   `yaml:"address"`   // 监听地址，如 :19094
-	APIKeys   []string `yaml:"api_keys"`  // 可选：允许访问的 API Key 列表，为空则不验证
+	Enabled          bool     `yaml:"enabled"`
+	Transport        string   `yaml:"transport"`          // sse / streamable_http / stdio
+	Address          string   `yaml:"address"`            // 监听地址，如 :19094
+	APIKeys          []string `yaml:"api_keys"`           // 可选：允许访问的 API Key 列表，为空则不验证
+	EnableAdminTools bool     `yaml:"enable_admin_tools"` // 是否暴露创建、导入、删除、索引等写入/管理工具
 }
 
 // MCPServerConfig 单个 MCP 服务器配置
@@ -375,17 +376,17 @@ func Save(path string, cfg *Config) error {
 
 // weakPasswords 常见弱密码集合
 var weakPasswords = map[string]bool{
-	"":              true,
-	"admin":         true,
-	"admin123":      true,
-	"password":      true,
-	"123456":        true,
-	"user123":       true,
-	"change-me":     true,
-	"change_me":     true,
-	"changeme":      true,
-	"test":          true,
-	"test123":       true,
+	"":          true,
+	"admin":     true,
+	"admin123":  true,
+	"password":  true,
+	"123456":    true,
+	"user123":   true,
+	"change-me": true,
+	"change_me": true,
+	"changeme":  true,
+	"test":      true,
+	"test123":   true,
 }
 
 // Validate 校验配置安全性，返回警告列表

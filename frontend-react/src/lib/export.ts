@@ -37,8 +37,12 @@ export function messagesToMarkdown(messages: Message[], title?: string): string 
       lines.push(`**引用来源 (${msg.references.length})**`)
       lines.push('')
       for (const ref of msg.references) {
-        const score = (ref.score * 100).toFixed(1)
-        lines.push(`- **${ref.document_name}** (Chunk #${ref.chunk_index}, ${score}%)`)
+        const wikiTitle = typeof ref.metadata?.wiki_title === 'string' ? ref.metadata.wiki_title : ''
+        const wikiPath = typeof ref.metadata?.wiki_path === 'string' ? ref.metadata.wiki_path : ''
+        const title = wikiTitle || ref.document_name || ref.source || ref.document_id || ref.id || '未知来源'
+        const location = wikiPath || (ref.chunk_index != null ? `Chunk #${ref.chunk_index}` : '引用')
+        const score = ref.score != null ? `, ${(ref.score * 100).toFixed(1)}%` : ''
+        lines.push(`- **${title}** (${location}${score})`)
         lines.push(`  > ${ref.content.slice(0, 200)}${ref.content.length > 200 ? '...' : ''}`)
         lines.push('')
       }

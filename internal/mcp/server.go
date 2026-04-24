@@ -66,11 +66,11 @@ type Server struct {
 	config    *config.Config
 	chatSvc   chatProvider
 	kbRepo    repository.KnowledgeBaseRepository
-	kbWriter  kbWriteProvider                      // 可选：知识库写入（创建 KB、导入 URL）
-	codeTool  codeSearchProvider                   // 可选：代码搜索工具
-	graphRAG  graphRAGProvider                     // 可选：GraphRAG 服务
-	codeGraph codegraph.CodeGraphRepository        // 可选：代码知识图谱
-	apiKeySet map[string]struct{}                  // 已配置的 API Key 集合，为空则不验证
+	kbWriter  kbWriteProvider               // 可选：知识库写入（创建 KB、导入 URL）
+	codeTool  codeSearchProvider            // 可选：代码搜索工具
+	graphRAG  graphRAGProvider              // 可选：GraphRAG 服务
+	codeGraph codegraph.CodeGraphRepository // 可选：代码知识图谱
+	apiKeySet map[string]struct{}           // 已配置的 API Key 集合，为空则不验证
 }
 
 // NewServer 创建 MCP Server
@@ -278,6 +278,11 @@ func (s *Server) registerTools() {
 	}
 
 	// ── 写入工具（按 kbWriter 注入情况注册） ──
+
+	if s.kbWriter != nil && !s.config.MCPExport.EnableAdminTools {
+		log.Println("[MCP Server] 管理工具未启用: create/import/delete/clone/index 工具不会暴露")
+		return
+	}
 
 	// 8. create_knowledge_base — 创建知识库
 	if s.kbWriter != nil {
@@ -573,8 +578,8 @@ func (s *Server) handleGraphRAGQuery(ctx context.Context, req mcpProto.CallToolR
 
 	// 构造摘要 + 数据
 	type graphSummary struct {
-		NodeCount int               `json:"node_count"`
-		EdgeCount int               `json:"edge_count"`
+		NodeCount int                `json:"node_count"`
+		EdgeCount int                `json:"edge_count"`
 		Nodes     []graphrag.VisNode `json:"nodes"`
 		Edges     []graphrag.VisEdge `json:"edges"`
 	}

@@ -45,8 +45,8 @@ type ChatService struct {
 	reranker        pipeline.Reranker // 重排序器（注入到 Pipeline）
 	pipeline        *pipeline.RAGPipeline
 	agent           *react.Agent
-	knowledgeTool   *internalTool.KnowledgeTool  // Agent 模式的知识库工具引用
-	graphRAGService *graphrag.Service            // GraphRAG 服务（可选，用于按需创建图谱检索器）
+	knowledgeTool   *internalTool.KnowledgeTool   // Agent 模式的知识库工具引用
+	graphRAGService *graphrag.Service             // GraphRAG 服务（可选，用于按需创建图谱检索器）
 	codeGraphRepo   codegraph.CodeGraphRepository // 代码知识图谱存储（可选）
 	codeIndexer     *codegraph.Indexer            // 代码索引器（可选）
 	skillBackend    skill.Backend
@@ -634,8 +634,16 @@ func appendInstructionToMessage(message, instruction string) string {
 
 // Source 来源信息
 type Source struct {
-	Content string `json:"content"`
-	DocID   string `json:"doc_id"`
+	Content  string                 `json:"content"`
+	DocID    string                 `json:"doc_id"`
+	Metadata map[string]interface{} `json:"metadata,omitempty"`
+}
+
+func sourceFromDocument(doc *schema.Document) Source {
+	if doc == nil {
+		return Source{}
+	}
+	return Source{Content: doc.Content, DocID: doc.ID, Metadata: doc.MetaData}
 }
 
 func (s *ChatService) buildSourcesFromRetriever(ctx context.Context, runtimeRetriever retriever.Retriever, query string, maxN int) []Source {
@@ -666,7 +674,7 @@ func (s *ChatService) buildSourcesFromRetriever(ctx context.Context, runtimeRetr
 		if _, ok := seen[docID]; ok {
 			continue
 		}
-		sources = append(sources, Source{Content: doc.Content, DocID: docID})
+		sources = append(sources, sourceFromDocument(doc))
 		seen[docID] = struct{}{}
 		if len(sources) >= maxN {
 			break
@@ -766,7 +774,7 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 				if doc == nil || strings.TrimSpace(doc.ID) == "" {
 					continue
 				}
-				sources = append(sources, Source{Content: doc.Content, DocID: doc.ID})
+				sources = append(sources, sourceFromDocument(doc))
 				if len(sources) >= s.config.RAG.TopK {
 					break
 				}
@@ -821,8 +829,9 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 		sources := make([]Source, len(pipeResp.Sources))
 		for i, src := range pipeResp.Sources {
 			sources[i] = Source{
-				Content: src.Content,
-				DocID:   src.DocID,
+				Content:  src.Content,
+				DocID:    src.DocID,
+				Metadata: src.Metadata,
 			}
 		}
 

@@ -134,9 +134,10 @@ type RAGResponse struct {
 
 // Source 来源信息
 type Source struct {
-	Content string  // 内容片段
-	DocID   string  // 文档 ID
-	Score   float64 // 相关性分数
+	Content  string                 // 内容片段
+	DocID    string                 // 文档 ID
+	Score    float64                // 相关性分数
+	Metadata map[string]interface{} // 检索元数据
 }
 
 // Run 执行 RAG 流水线
@@ -203,11 +204,13 @@ func (p *RAGPipeline) Run(ctx context.Context, req *RAGRequest) (*RAGResponse, e
 	for i := 0; i < topK; i++ {
 		idx := rerankedIdx[i]
 		if idx < len(docs) {
-			contextBuilder += fmt.Sprintf("[来源%d] %s\n\n", i+1, docs[idx].Content)
+			doc := docs[idx]
+			contextBuilder += fmt.Sprintf("[来源%d] %s\n\n", i+1, doc.Content)
 			resp.Sources = append(resp.Sources, Source{
-				Content: docs[idx].Content,
-				DocID:   docs[idx].ID,
-				Score:   float64(topK - i), // 简单的位置分数
+				Content:  doc.Content,
+				DocID:    doc.ID,
+				Score:    float64(topK - i), // 简单的位置分数
+				Metadata: doc.MetaData,
 			})
 		}
 	}

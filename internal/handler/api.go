@@ -193,6 +193,12 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			kb.PUT("/:id", h.UpdateKnowledgeBase)
 			kb.DELETE("/:id", h.DeleteKnowledgeBase)
 
+			// Wiki pages
+			kb.GET("/:id/wiki/pages", h.ListWikiPages)
+			kb.GET("/:id/wiki/page", h.GetWikiPage)
+			kb.GET("/:id/wiki/page/links", h.GetWikiPageLinks)
+			kb.GET("/:id/wiki/search", h.SearchWikiPages)
+
 			// 知识文档
 			kb.POST("/:id/documents", h.UploadDocument)
 			kb.POST("/:id/documents/url", h.UploadDocumentURL)
@@ -620,9 +626,10 @@ func (h *Handler) toReferences(sources []service.Source) []ReferenceDocument {
 	refs := make([]ReferenceDocument, 0, len(sources))
 	for _, src := range sources {
 		refs = append(refs, ReferenceDocument{
-			ID:      src.DocID,
-			Source:  src.DocID,
-			Content: src.Content,
+			ID:       src.DocID,
+			Source:   src.DocID,
+			Content:  src.Content,
+			Metadata: src.Metadata,
 		})
 	}
 	return refs
@@ -804,21 +811,21 @@ func (h *Handler) GetKnowledgeBase(c *gin.Context) {
 	currentFingerprint := container.EmbedFingerprint(&h.cfg.Embedding)
 	stale := kb.EmbedModelFingerprint != "" && kb.EmbedModelFingerprint != currentFingerprint
 	c.JSON(http.StatusOK, gin.H{
-		"id":                     kb.ID,
-		"tenant_id":              kb.TenantID,
-		"name":                   kb.Name,
-		"description":            kb.Description,
-		"mode":                   kb.Mode,
-		"embedding_model_id":     kb.EmbeddingModelID,
-		"embedding_dimensions":   kb.EmbeddingDimensions,
+		"id":                      kb.ID,
+		"tenant_id":               kb.TenantID,
+		"name":                    kb.Name,
+		"description":             kb.Description,
+		"mode":                    kb.Mode,
+		"embedding_model_id":      kb.EmbeddingModelID,
+		"embedding_dimensions":    kb.EmbeddingDimensions,
 		"embed_model_fingerprint": kb.EmbedModelFingerprint,
-		"embed_stale":            stale,
-		"chunking_config":        kb.ChunkingConfig,
-		"extract_config":         kb.ExtractConfig,
-		"document_count":         kb.DocumentCount,
-		"chunk_count":            kb.ChunkCount,
-		"created_at":             kb.CreatedAt,
-		"updated_at":             kb.UpdatedAt,
+		"embed_stale":             stale,
+		"chunking_config":         kb.ChunkingConfig,
+		"extract_config":          kb.ExtractConfig,
+		"document_count":          kb.DocumentCount,
+		"chunk_count":             kb.ChunkCount,
+		"created_at":              kb.CreatedAt,
+		"updated_at":              kb.UpdatedAt,
 	})
 }
 
@@ -905,6 +912,99 @@ func (h *Handler) DeleteKnowledgeBase(c *gin.Context) {
 	h.audit(c, "kb.delete", id, true, nil)
 
 	c.JSON(http.StatusOK, gin.H{"message": "删除成功"})
+}
+
+func (h *Handler) ensureWikiAccess(c *gin.Context) (*repository.KnowledgeBase, bool) {
+	if h.kbRepo == nil || h.wikiRepo == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Wiki 存储未初始化"})
+		return nil, false
+	}
+	kb, ok := h.ensureKnowledgeBaseAccess(c, c.Param("id"))
+	if !ok {
+		return nil, false
+	}
+	if !kb.IsWikiMode() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "该知识库不是 wiki 模式"})
+		return nil, false
+	}
+	return kb, true
+}
+
+// ListWikiPages lists all generated wiki pages in a wiki-mode knowledge base.
+func (h *Handler) ListWikiPages(c *gin.Context) {
+	kb, ok := h.ensureWikiAccess(c)
+	if !ok {
+		return
+	}
+	pages, err := h.wikiRepo.ListPages(c.Request.Context(), kb.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"pages": pages})
+}
+
+// GetWikiPage returns one generated wiki page by its path query parameter.
+func (h *Handler) GetWikiPage(c *gin.Context) {
+	kb, ok := h.ensureWikiAccess(c)
+	if !ok {
+		return
+	}
+	path := strings.TrimSpace(c.Query("path"))
+	if path == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少 path 参数"})
+		return
+	}
+	page, err := h.wikiRepo.GetPageByPath(c.Request.Context(), kb.ID, path)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Wiki 页面不存在"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"page": page})
+}
+
+// SearchWikiPages searches generated wiki pages with PostgreSQL FTS/ILIKE.
+func (h *Handler) SearchWikiPages(c *gin.Context) {
+	kb, ok := h.ensureWikiAccess(c)
+	if !ok {
+		return
+	}
+	query := strings.TrimSpace(c.Query("q"))
+	if query == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少 q 参数"})
+		return
+	}
+	_, limit := parsePagination(c, 20, 100)
+	pages, err := h.wikiRepo.SearchPages(c.Request.Context(), kb.ID, query, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"pages": pages, "query": query})
+}
+
+// GetWikiPageLinks returns pages linked from the requested wiki page.
+func (h *Handler) GetWikiPageLinks(c *gin.Context) {
+	kb, ok := h.ensureWikiAccess(c)
+	if !ok {
+		return
+	}
+	path := strings.TrimSpace(c.Query("path"))
+	if path == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少 path 参数"})
+		return
+	}
+	page, err := h.wikiRepo.GetPageByPath(c.Request.Context(), kb.ID, path)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Wiki 页面不存在"})
+		return
+	}
+	linked, err := h.wikiRepo.GetLinkedPages(c.Request.Context(), page.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"page": page, "linked_pages": linked})
 }
 
 // UploadDocument 上传文档
@@ -1057,8 +1157,11 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 // @Router /knowledge-bases/{id}/documents/url [post]
 func (h *Handler) UploadDocumentURL(c *gin.Context) {
 	kbID := c.Param("id")
+	var kb *repository.KnowledgeBase
 	if h.kbRepo != nil {
-		if _, ok := h.ensureKnowledgeBaseAccess(c, kbID); !ok {
+		var ok bool
+		kb, ok = h.ensureKnowledgeBaseAccess(c, kbID)
+		if !ok {
 			return
 		}
 	}
@@ -1084,6 +1187,11 @@ func (h *Handler) UploadDocumentURL(c *gin.Context) {
 	title := strings.TrimSpace(req.Title)
 	if title == "" {
 		title = parsedURL.String()
+	}
+
+	if kb != nil && kb.IsWikiMode() {
+		h.uploadWikiDocumentURL(c, kb, title, parsedURL.String(), req.EnableMultimodal)
+		return
 	}
 
 	if h.importQueue != nil {
@@ -1355,6 +1463,79 @@ func inferFileType(filename string) string {
 		return "unknown"
 	}
 	return ext
+}
+
+func (h *Handler) uploadWikiDocumentURL(c *gin.Context, kb *repository.KnowledgeBase, title, sourceURL string, enableMultimodal bool) {
+	kbID := kb.ID
+	ctx := c.Request.Context()
+
+	knowledge, err := h.createKnowledgeRecord(ctx, h.newURLKnowledge(kbID, title, sourceURL, "processing"))
+	if err != nil {
+		h.audit(c, "doc.upload_url", kbID, false, map[string]interface{}{"error": err.Error(), "url": sourceURL})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建文档记录失败: " + err.Error()})
+		return
+	}
+
+	if h.wikiCompiler == nil {
+		err := fmt.Errorf("wiki compiler 未初始化")
+		h.markKnowledgeFailed(ctx, knowledge.ID, 0, err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Wiki 编译器未初始化（需要 LLM 配置）"})
+		return
+	}
+
+	parseOpts := docreader.DefaultParseOptions()
+	parseOpts.EnableMultimodal = enableMultimodal
+	result, err := h.docReaderCli.ParseURL(ctx, sourceURL, title, parseOpts)
+	if err != nil {
+		h.markKnowledgeFailed(ctx, knowledge.ID, 0, err)
+		h.audit(c, "doc.upload_url", kbID, false, map[string]interface{}{"error": err.Error(), "url": sourceURL})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "网页解析失败: " + err.Error()})
+		return
+	}
+
+	var content strings.Builder
+	for _, chunk := range result.Chunks {
+		text := strings.TrimSpace(chunk.Content)
+		if text == "" {
+			continue
+		}
+		if content.Len() > 0 {
+			content.WriteString("\n\n")
+		}
+		content.WriteString(text)
+	}
+	if content.Len() == 0 {
+		err := fmt.Errorf("网页解析结果为空")
+		h.markKnowledgeFailed(ctx, knowledge.ID, 0, err)
+		h.audit(c, "doc.upload_url", kbID, false, map[string]interface{}{"error": err.Error(), "url": sourceURL})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	compileResult, err := h.wikiCompiler.Compile(ctx, kbID, knowledge.ID, title, content.String())
+	if err != nil {
+		h.markKnowledgeFailed(ctx, knowledge.ID, 0, err)
+		h.audit(c, "doc.upload_url", kbID, false, map[string]interface{}{"error": err.Error(), "url": sourceURL})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Wiki 编译失败: " + err.Error()})
+		return
+	}
+
+	pageCount := len(compileResult.Pages)
+	h.markKnowledgeCompleted(ctx, knowledge, pageCount)
+	h.audit(c, "doc.upload_url", kbID, true, map[string]interface{}{
+		"url":        sourceURL,
+		"page_count": pageCount,
+		"link_count": compileResult.LinkCount,
+		"mode":       "wiki",
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":      "网页上传成功（Wiki模式，LLM已编译为结构化知识页面）",
+		"page_count":   pageCount,
+		"link_count":   compileResult.LinkCount,
+		"knowledge_id": knowledge.ID,
+		"mode":         "wiki",
+	})
 }
 
 // uploadWikiDocument 处理 Wiki 模式的文档上传
@@ -1904,6 +2085,12 @@ func (h *Handler) DeleteDocument(c *gin.Context) {
 		return
 	}
 
+	if h.wikiRepo != nil {
+		if err := h.wikiRepo.DeletePagesBySourceKnowledge(c.Request.Context(), docID); err != nil {
+			log.Printf("[Wiki] 删除文档 wiki 页面失败（数据可能残留）: doc=%s err=%v", docID, err)
+		}
+	}
+
 	// 清理向量数据库中该文档的所有 chunk
 	if h.vectorDB != nil {
 		if err := h.vectorDB.DeleteByKnowledgeID(c.Request.Context(), docID); err != nil {
@@ -2192,9 +2379,9 @@ func (h *Handler) incrementalSync(ctx context.Context, kbID, knowledgeID, filena
 
 	// Diff: 分类为 keep / add / remove
 	var (
-		retainedIDs []string           // 旧 chunk 保留的 ID
-		removeIDs   []string           // 旧 chunk 需删除的 ID
-		addIndices  []int              // 新 chunk 需新增的索引
+		retainedIDs []string // 旧 chunk 保留的 ID
+		removeIDs   []string // 旧 chunk 需删除的 ID
+		addIndices  []int    // 新 chunk 需新增的索引
 	)
 
 	// 标记保留和删除
@@ -2662,7 +2849,7 @@ func (h *Handler) ListModels(c *gin.Context) {
 // @Router /models [post]
 func (h *Handler) CreateModel(c *gin.Context) {
 	var req struct {
-		Type        string  `json:"type" binding:"required"`   // "llm" | "embedding" | "reranker"
+		Type        string  `json:"type" binding:"required"` // "llm" | "embedding" | "reranker"
 		Provider    string  `json:"provider" binding:"required"`
 		Model       string  `json:"model" binding:"required"`
 		BaseURL     string  `json:"base_url"`
@@ -2826,18 +3013,18 @@ func (h *Handler) GetSettings(c *gin.Context) {
 
 	settings := gin.H{
 		"rag": gin.H{
-			"enabled":            true,
-			"top_k":              h.cfg.RAG.TopK,
-			"score_threshold":    0.5,
-			"enable_hybrid":      h.cfg.RAG.EnableHybrid,
-			"enable_rewrite":     h.cfg.RAG.EnableRewrite,
-			"enable_rerank":      h.cfg.RAG.EnableRerank,
+			"enabled":                      true,
+			"top_k":                        h.cfg.RAG.TopK,
+			"score_threshold":              0.5,
+			"enable_hybrid":                h.cfg.RAG.EnableHybrid,
+			"enable_rewrite":               h.cfg.RAG.EnableRewrite,
+			"enable_rerank":                h.cfg.RAG.EnableRerank,
 			"chunk_size":                   h.cfg.RAG.ChunkSize,
 			"chunk_overlap":                h.cfg.RAG.ChunkOverlap,
 			"chunk_strategy":               h.cfg.RAG.ChunkStrategy,
 			"enable_contextual_enrichment": h.cfg.RAG.EnableContextualEnrichment,
-			"embedding_model":    h.cfg.Embedding.ModelID,
-			"knowledge_base_ids": []string{},
+			"embedding_model":              h.cfg.Embedding.ModelID,
+			"knowledge_base_ids":           []string{},
 		},
 		"llm": gin.H{
 			"provider":    h.cfg.LLM.Provider,

@@ -49,17 +49,20 @@ export default function KBCard({ kb, selected, onSelect, onDelete }: Props) {
           <FileText size={12} /> {kb.document_count} docs
         </span>
         <span className="flex items-center gap-1">
-          <Layers size={12} /> {kb.chunk_count} chunks
+          <Layers size={12} /> {kb.chunk_count} {kb.mode === 'wiki' ? 'pages' : 'chunks'}
         </span>
       </div>
 
-      {kb.embedding_model && (
-        <div className="mt-2">
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        <span className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)]">
+          {kb.mode === 'wiki' ? 'wiki' : 'vector'}
+        </span>
+        {kb.embedding_model && (
           <span className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)]">
             {kb.embedding_model}
           </span>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   )
 }

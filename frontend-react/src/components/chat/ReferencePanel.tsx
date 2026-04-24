@@ -36,6 +36,11 @@ export default function ReferencePanel({ references }: Props) {
         <div className="px-3 pb-3 space-y-2">
           {references.map((ref, i) => {
             const isOpen = expandedItems.has(i)
+            const wikiTitle = typeof ref.metadata?.wiki_title === 'string' ? ref.metadata.wiki_title : ''
+            const wikiPath = typeof ref.metadata?.wiki_path === 'string' ? ref.metadata.wiki_path : ''
+            const title = wikiTitle || ref.document_name || ref.source || ref.document_id || ref.id || `来源 ${i + 1}`
+            const subtitle = wikiPath || (ref.chunk_index != null ? `Chunk #${ref.chunk_index}` : '')
+            const score = ref.score ?? 0
             return (
               <div
                 key={i}
@@ -50,18 +55,20 @@ export default function ReferencePanel({ references }: Props) {
                     {isOpen ? <ChevronDown size={12} className="shrink-0 text-[var(--color-text-muted)]" /> : <ChevronRight size={12} className="shrink-0 text-[var(--color-text-muted)]" />}
                     <FileText size={12} className="shrink-0 text-[var(--color-text-muted)]" />
                     <span className="text-xs font-medium text-[var(--color-text-primary)] truncate">
-                      {ref.document_name}
+                      {title}
                     </span>
-                    <span className="text-xs text-[var(--color-text-muted)] shrink-0">
-                      Chunk #{ref.chunk_index}
-                    </span>
+                    {subtitle && (
+                      <span className="text-xs text-[var(--color-text-muted)] shrink-0">
+                        {subtitle}
+                      </span>
+                    )}
                   </div>
                   <div className="flex items-center gap-1.5 shrink-0 ml-2">
                     <BarChart3 size={12} className="text-[var(--color-text-muted)]" />
                     <span className={`text-xs font-medium ${
-                      ref.score >= 0.8 ? 'text-green-400' : ref.score >= 0.5 ? 'text-yellow-400' : 'text-red-400'
+                      score >= 0.8 ? 'text-green-400' : score >= 0.5 ? 'text-yellow-400' : 'text-[var(--color-text-muted)]'
                     }`}>
-                      {(ref.score * 100).toFixed(1)}%
+                      {score > 0 ? `${(score * 100).toFixed(1)}%` : '引用'}
                     </span>
                   </div>
                 </button>
@@ -81,9 +88,11 @@ export default function ReferencePanel({ references }: Props) {
                     <p className="text-xs text-[var(--color-text-secondary)] whitespace-pre-wrap mt-2.5 leading-relaxed bg-[var(--color-bg-secondary)] rounded-lg p-3 max-h-[400px] overflow-y-auto">
                       {ref.content}
                     </p>
-                    <p className="text-[10px] text-[var(--color-text-muted)] mt-1.5">
-                      KB: {ref.knowledge_base_name}
-                    </p>
+                    {(ref.knowledge_base_name || ref.knowledge_base_id) && (
+                      <p className="text-[10px] text-[var(--color-text-muted)] mt-1.5">
+                        KB: {ref.knowledge_base_name || ref.knowledge_base_id}
+                      </p>
+                    )}
                   </div>
                 )}
               </div>

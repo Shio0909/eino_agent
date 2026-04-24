@@ -1,10 +1,26 @@
+export type KnowledgeBaseMode = 'vector' | 'wiki'
+
 export interface KnowledgeBase {
   id: string
   name: string
   description: string
+  mode: KnowledgeBaseMode
   document_count: number
   chunk_count: number
   embedding_model: string
+  created_at: string
+  updated_at: string
+}
+
+export interface WikiPage {
+  id: string
+  knowledge_base_id: string
+  source_knowledge_id?: string | null
+  path: string
+  title: string
+  content: string
+  page_type: string
+  metadata?: Record<string, unknown>
   created_at: string
   updated_at: string
 }
@@ -57,13 +73,16 @@ export interface Message {
 }
 
 export interface Reference {
-  document_id: string
-  document_name: string
-  knowledge_base_id: string
-  knowledge_base_name: string
-  chunk_index: number
+  id?: string
+  document_id?: string
+  document_name?: string
+  source?: string
+  knowledge_base_id?: string
+  knowledge_base_name?: string
+  chunk_index?: number
   content: string
-  score: number
+  score?: number
+  metadata?: Record<string, unknown>
 }
 
 export interface AgentStep {
@@ -233,6 +252,7 @@ export interface ChatRequest {
 export interface CreateKBRequest {
   name: string
   description: string
+  mode?: KnowledgeBaseMode
   embedding_model?: string
 }
 

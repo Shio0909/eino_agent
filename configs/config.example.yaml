@@ -171,6 +171,7 @@ mcp_export:
     transport: streamable_http  # sse / streamable_http / stdio
     address: ":19094"
     api_keys: []  # 可选: 配置后需要 Authorization: Bearer <key> 或 X-API-Key: <key> 认证
+    enable_admin_tools: false  # 默认只暴露只读/问答工具；创建、导入、删除、索引等管理工具需显式开启
     # api_keys:
     #   - "sk-your-secret-key-1"
     #   - "sk-your-secret-key-2"
