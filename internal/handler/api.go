@@ -407,6 +407,79 @@ type ChatResponse struct {
 	SessionID  string              `json:"session_id,omitempty"`
 	TokensUsed int                 `json:"tokens_used,omitempty"`
 	LatencyMs  int64               `json:"latency_ms"`
+	Trace      []service.TraceStep `json:"trace,omitempty"`
+}
+
+type messageResponse struct {
+	*repository.Message
+	AgentSteps any                 `json:"agent_steps,omitempty"`
+	Trace      []service.TraceStep `json:"trace,omitempty"`
+}
+
+func (h *Handler) toMessageResponses(messages []*repository.Message) []messageResponse {
+	out := make([]messageResponse, 0, len(messages))
+	for _, msg := range messages {
+		item := messageResponse{Message: msg, AgentSteps: msg.AgentSteps}
+		if rawTrace, ok := msg.AgentSteps["trace"]; ok {
+			if steps, ok := rawTrace.([]any); ok {
+				item.Trace = make([]service.TraceStep, 0, len(steps))
+				for _, raw := range steps {
+					if m, ok := raw.(map[string]any); ok {
+						item.Trace = append(item.Trace, traceStepFromMap(m))
+					}
+				}
+				item.AgentSteps = item.Trace
+			}
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func traceStepFromMap(m map[string]any) service.TraceStep {
+	step := service.TraceStep{
+		Type:      stringValue(m["type"]),
+		Stage:     stringValue(m["stage"]),
+		Content:   stringValue(m["content"]),
+		ToolName:  stringValue(m["tool_name"]),
+		ToolInput: stringValue(m["tool_input"]),
+		DocID:     stringValue(m["doc_id"]),
+		Metadata:  mapValue(m["metadata"]),
+	}
+	step.LatencyMs = int64Value(m["latency_ms"])
+	step.TokenCount = intValue(m["token_count"])
+	return step
+}
+
+func stringValue(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+func int64Value(v any) int64 {
+	switch n := v.(type) {
+	case float64:
+		return int64(n)
+	case int64:
+		return n
+	case int:
+		return int64(n)
+	default:
+		return 0
+	}
+}
+
+func intValue(v any) int {
+	return int(int64Value(v))
+}
+
+func mapValue(v any) map[string]any {
+	if m, ok := v.(map[string]any); ok {
+		return m
+	}
+	return nil
 }
 
 // ReferenceDocument 引用文档
@@ -493,6 +566,7 @@ func (h *Handler) Chat(c *gin.Context) {
 		References: h.toReferences(resp.Sources),
 		SessionID:  resp.SessionID,
 		LatencyMs:  time.Since(startTime).Milliseconds(),
+		Trace:      resp.Trace,
 	})
 }
 
@@ -584,6 +658,24 @@ func (h *Handler) ChatStream(c *gin.Context) {
 			}
 			if event.DocID != "" {
 				data["doc_id"] = event.DocID
+			}
+			if event.ToolName != "" {
+				data["tool_name"] = event.ToolName
+			}
+			if event.ToolInput != "" {
+				data["tool_input"] = event.ToolInput
+			}
+			if event.LatencyMs > 0 {
+				data["latency_ms"] = event.LatencyMs
+			}
+			if event.SourceCount > 0 {
+				data["source_count"] = event.SourceCount
+			}
+			if event.RetryCount > 0 {
+				data["retry_count"] = event.RetryCount
+			}
+			if event.TraceStep != nil {
+				data["trace_step"] = event.TraceStep
 			}
 			c.SSEvent("message", data)
 			return true
@@ -2868,7 +2960,7 @@ func (h *Handler) GetSessionMessages(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"messages": messages})
+	c.JSON(http.StatusOK, gin.H{"messages": h.toMessageResponses(messages)})
 }
 
 // ============================================================================

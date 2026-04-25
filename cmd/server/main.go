@@ -424,7 +424,6 @@ func main() {
 	// 启动 MCP Export Server（将项目能力暴露给外部 Agent）
 	// ========================================
 	if cfg.MCPExport.Enabled {
-		kbRepo := repository.NewKnowledgeBaseRepository(db)
 		mcpExportServer := mcpmanager.NewServer(cfg, chatService, kbRepo)
 
 		// 注入可选依赖

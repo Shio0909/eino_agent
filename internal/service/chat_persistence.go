@@ -51,6 +51,10 @@ func (s *ChatService) saveUserMessage(ctx context.Context, sessionID, content st
 }
 
 func (s *ChatService) saveAssistantMessage(ctx context.Context, sessionID, content string, tokensUsed int, latencyMs int64) {
+	s.saveAssistantMessageWithTrace(ctx, sessionID, content, tokensUsed, latencyMs, nil)
+}
+
+func (s *ChatService) saveAssistantMessageWithTrace(ctx context.Context, sessionID, content string, tokensUsed int, latencyMs int64, trace []TraceStep) {
 	if s.messageRepo == nil || sessionID == "" {
 		return
 	}
@@ -61,6 +65,13 @@ func (s *ChatService) saveAssistantMessage(ctx context.Context, sessionID, conte
 		Content:    content,
 		TokensUsed: tokensUsed,
 		LatencyMs:  int(latencyMs),
+	}
+	if len(trace) > 0 {
+		steps := make([]any, 0, len(trace))
+		for _, step := range trace {
+			steps = append(steps, step)
+		}
+		msg.AgentSteps = repository.JSON{"trace": steps}
 	}
 	if err := s.messageRepo.Create(ctx, msg); err != nil {
 		log.Printf("[ChatService] save assistant message failed: %v", err)
