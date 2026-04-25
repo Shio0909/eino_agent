@@ -329,14 +329,16 @@ func (s *ChatService) buildRuntimeInstruction(ctx context.Context, req *ChatRequ
 }
 
 type retrievalScope struct {
-	kbSet  map[string]struct{}
-	docSet map[string]struct{}
+	kbSet      map[string]struct{}
+	docSet     map[string]struct{}
+	restricted bool
 }
 
 func (s *ChatService) buildRetrievalScope(req *ChatRequest) retrievalScope {
 	scope := retrievalScope{
-		kbSet:  make(map[string]struct{}),
-		docSet: make(map[string]struct{}),
+		kbSet:      make(map[string]struct{}),
+		docSet:     make(map[string]struct{}),
+		restricted: req.RestrictRetrieval,
 	}
 	for _, kbID := range req.KnowledgeBaseIDs {
 		id := strings.TrimSpace(kbID)
@@ -354,7 +356,7 @@ func (s *ChatService) buildRetrievalScope(req *ChatRequest) retrievalScope {
 }
 
 func (s retrievalScope) isEmpty() bool {
-	return len(s.kbSet) == 0 && len(s.docSet) == 0
+	return !s.restricted && len(s.kbSet) == 0 && len(s.docSet) == 0
 }
 
 type scopedRetriever struct {
@@ -390,6 +392,9 @@ func (r *scopedRetriever) Retrieve(ctx context.Context, query string, opts ...re
 }
 
 func (r *scopedRetriever) matchDoc(doc *schema.Document) bool {
+	if r.scope.restricted && len(r.scope.kbSet) == 0 && len(r.scope.docSet) == 0 {
+		return false
+	}
 	if len(r.scope.kbSet) > 0 {
 		kbID := strings.TrimSpace(toString(metaValue(doc.MetaData, "knowledge_base_id")))
 		if kbID == "" {

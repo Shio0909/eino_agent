@@ -60,6 +60,7 @@ type Handler struct {
 
 	// Repositories
 	kbRepo        repository.KnowledgeBaseRepository
+	accessRepo    repository.AccessControlRepository
 	knowledgeRepo repository.KnowledgeRepository
 	chunkRepo     repository.ChunkRepository
 	wikiRepo      repository.WikiPageRepository
@@ -146,6 +147,7 @@ func NewHandler(
 	// 初始化 repositories (如果有数据库连接)
 	if db != nil {
 		h.kbRepo = repository.NewKnowledgeBaseRepository(db)
+		h.accessRepo = repository.NewAccessControlRepository(db)
 		h.knowledgeRepo = repository.NewKnowledgeRepository(db)
 		h.chunkRepo = repository.NewChunkRepository(db)
 		h.wikiRepo = repository.NewWikiPageRepository(db)
@@ -463,17 +465,22 @@ func (h *Handler) Chat(c *gin.Context) {
 			req.Mode = "pipeline"
 		}
 	}
+	allowedKBIDs, ok := h.resolveAuthorizedKnowledgeBaseIDs(c, req.KnowledgeBaseIDs)
+	if !ok {
+		return
+	}
 	serviceReq := &service.ChatRequest{
-		Message:          msg,
-		SessionID:        req.SessionID,
-		UseAgent:         useAgent,
-		Mode:             req.Mode,
-		TenantID:         h.getTenantID(c),
-		UserID:           h.getUserID(c),
-		ForceCitation:    req.ForceCitation || decision.ForceCitation,
-		KnowledgeBaseIDs: req.KnowledgeBaseIDs,
-		DocumentIDs:      req.DocumentIDs,
-		EnableLongTerm:   req.EnableLongTerm,
+		Message:           msg,
+		SessionID:         req.SessionID,
+		UseAgent:          useAgent,
+		Mode:              req.Mode,
+		TenantID:          h.getTenantID(c),
+		UserID:            h.getUserID(c),
+		ForceCitation:     req.ForceCitation || decision.ForceCitation,
+		KnowledgeBaseIDs:  allowedKBIDs,
+		DocumentIDs:       req.DocumentIDs,
+		RestrictRetrieval: true,
+		EnableLongTerm:    req.EnableLongTerm,
 	}
 	resp, err := h.chatService.Chat(c.Request.Context(), serviceReq)
 	if err != nil {
@@ -540,17 +547,22 @@ func (h *Handler) ChatStream(c *gin.Context) {
 			req.Mode = "pipeline"
 		}
 	}
+	allowedKBIDs, ok := h.resolveAuthorizedKnowledgeBaseIDs(c, req.KnowledgeBaseIDs)
+	if !ok {
+		return
+	}
 	serviceReq := &service.ChatRequest{
-		Message:          msg,
-		SessionID:        req.SessionID,
-		UseAgent:         useAgent,
-		Mode:             req.Mode,
-		TenantID:         h.getTenantID(c),
-		UserID:           h.getUserID(c),
-		ForceCitation:    req.ForceCitation || decision.ForceCitation,
-		KnowledgeBaseIDs: req.KnowledgeBaseIDs,
-		DocumentIDs:      req.DocumentIDs,
-		EnableLongTerm:   req.EnableLongTerm,
+		Message:           msg,
+		SessionID:         req.SessionID,
+		UseAgent:          useAgent,
+		Mode:              req.Mode,
+		TenantID:          h.getTenantID(c),
+		UserID:            h.getUserID(c),
+		ForceCitation:     req.ForceCitation || decision.ForceCitation,
+		KnowledgeBaseIDs:  allowedKBIDs,
+		DocumentIDs:       req.DocumentIDs,
+		RestrictRetrieval: true,
+		EnableLongTerm:    req.EnableLongTerm,
 	}
 	ch, err := h.chatService.ChatStream(c.Request.Context(), serviceReq)
 	if err != nil {
@@ -582,6 +594,18 @@ func (h *Handler) ChatStream(c *gin.Context) {
 }
 
 func (h *Handler) ensureKnowledgeBaseAccess(c *gin.Context, id string) (*repository.KnowledgeBase, bool) {
+	return h.ensureKnowledgeBaseRole(c, id, repository.AccessRoleViewer)
+}
+
+func (h *Handler) ensureKnowledgeBaseWriteAccess(c *gin.Context, id string) (*repository.KnowledgeBase, bool) {
+	return h.ensureKnowledgeBaseRole(c, id, repository.AccessRoleEditor)
+}
+
+func (h *Handler) ensureKnowledgeBaseAdminAccess(c *gin.Context, id string) (*repository.KnowledgeBase, bool) {
+	return h.ensureKnowledgeBaseRole(c, id, repository.AccessRoleAdmin)
+}
+
+func (h *Handler) ensureKnowledgeBaseRole(c *gin.Context, id string, required repository.AccessRole) (*repository.KnowledgeBase, bool) {
 	kb, err := h.kbRepo.GetByID(c.Request.Context(), id)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -591,11 +615,69 @@ func (h *Handler) ensureKnowledgeBaseAccess(c *gin.Context, id string) (*reposit
 		c.JSON(http.StatusNotFound, gin.H{"error": "知识库不存在"})
 		return nil, false
 	}
-	if kb.TenantID != h.getTenantID(c) {
+	role := repository.AccessRole("")
+	if h.accessRepo != nil {
+		role, err = h.accessRepo.GetKnowledgeBaseRole(c.Request.Context(), h.getTenantID(c), h.getUserID(c), id)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return nil, false
+		}
+	} else if kb.TenantID == h.getTenantID(c) {
+		role = repository.AccessRoleAdmin
+	}
+	if !role.Allows(required) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "无权访问该知识库"})
 		return nil, false
 	}
 	return kb, true
+}
+
+func (h *Handler) resolveAuthorizedKnowledgeBaseIDs(c *gin.Context, requested []string) ([]string, bool) {
+	if h.kbRepo == nil {
+		return requested, true
+	}
+
+	seen := make(map[string]struct{}, len(requested))
+	ids := make([]string, 0, len(requested))
+	for _, rawID := range requested {
+		id := strings.TrimSpace(rawID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+
+	if len(ids) == 0 {
+		if h.accessRepo != nil {
+			allowed, err := h.accessRepo.ListAccessibleKnowledgeBaseIDs(c.Request.Context(), h.getTenantID(c), h.getUserID(c))
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return nil, false
+			}
+			return allowed, true
+		}
+		kbs, err := h.kbRepo.List(c.Request.Context(), h.getTenantID(c), 0, 1000)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return nil, false
+		}
+		allowed := make([]string, 0, len(kbs))
+		for _, kb := range kbs {
+			allowed = append(allowed, kb.ID)
+		}
+		return allowed, true
+	}
+
+	for _, id := range ids {
+		if _, ok := h.ensureKnowledgeBaseAccess(c, id); !ok {
+			return nil, false
+		}
+	}
+	return ids, true
 }
 
 func (h *Handler) ensureSessionAccess(c *gin.Context, id string) (*repository.Session, bool) {
@@ -694,13 +776,24 @@ func (h *Handler) ListKnowledgeBases(c *gin.Context) {
 	offset := (page - 1) * pageSize
 	tenantID := h.getTenantID(c)
 
-	kbs, err := h.kbRepo.List(c.Request.Context(), tenantID, offset, pageSize)
+	var kbs []*repository.KnowledgeBase
+	var err error
+	if h.accessRepo != nil {
+		kbs, err = h.kbRepo.ListAccessible(c.Request.Context(), tenantID, h.getUserID(c), offset, pageSize)
+	} else {
+		kbs, err = h.kbRepo.List(c.Request.Context(), tenantID, offset, pageSize)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	total, _ := h.kbRepo.Count(c.Request.Context(), tenantID)
+	var total int
+	if h.accessRepo != nil {
+		total, _ = h.kbRepo.CountAccessible(c.Request.Context(), tenantID, h.getUserID(c))
+	} else {
+		total, _ = h.kbRepo.Count(c.Request.Context(), tenantID)
+	}
 	currentFingerprint := container.EmbedFingerprint(&h.cfg.Embedding)
 
 	// Enrich each KB with embed_stale flag (never stale if KB was never indexed)
@@ -846,7 +939,7 @@ func (h *Handler) UpdateKnowledgeBase(c *gin.Context) {
 	}
 
 	id := c.Param("id")
-	if _, ok := h.ensureKnowledgeBaseAccess(c, id); !ok {
+	if _, ok := h.ensureKnowledgeBaseWriteAccess(c, id); !ok {
 		return
 	}
 	var req KnowledgeBaseRequest
@@ -887,7 +980,7 @@ func (h *Handler) DeleteKnowledgeBase(c *gin.Context) {
 	}
 
 	id := c.Param("id")
-	if _, ok := h.ensureKnowledgeBaseAccess(c, id); !ok {
+	if _, ok := h.ensureKnowledgeBaseAdminAccess(c, id); !ok {
 		return
 	}
 	h.clearKnowledgeBaseImportStates(c.Request.Context(), id)
@@ -1023,7 +1116,7 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 	var kb *repository.KnowledgeBase
 	if h.kbRepo != nil {
 		var ok bool
-		kb, ok = h.ensureKnowledgeBaseAccess(c, kbID)
+		kb, ok = h.ensureKnowledgeBaseWriteAccess(c, kbID)
 		if !ok {
 			return
 		}
@@ -1160,7 +1253,7 @@ func (h *Handler) UploadDocumentURL(c *gin.Context) {
 	var kb *repository.KnowledgeBase
 	if h.kbRepo != nil {
 		var ok bool
-		kb, ok = h.ensureKnowledgeBaseAccess(c, kbID)
+		kb, ok = h.ensureKnowledgeBaseWriteAccess(c, kbID)
 		if !ok {
 			return
 		}
@@ -2059,7 +2152,7 @@ func (h *Handler) DeleteDocument(c *gin.Context) {
 	docID := c.Param("docId")
 
 	if h.kbRepo != nil {
-		if _, ok := h.ensureKnowledgeBaseAccess(c, kbID); !ok {
+		if _, ok := h.ensureKnowledgeBaseWriteAccess(c, kbID); !ok {
 			return
 		}
 	}
@@ -2155,7 +2248,7 @@ func (h *Handler) ReindexDocument(c *gin.Context) {
 	docID := c.Param("docId")
 
 	if h.kbRepo != nil {
-		if _, ok := h.ensureKnowledgeBaseAccess(c, kbID); !ok {
+		if _, ok := h.ensureKnowledgeBaseWriteAccess(c, kbID); !ok {
 			return
 		}
 	}
@@ -2265,7 +2358,7 @@ func (h *Handler) SyncDocument(c *gin.Context) {
 	docID := c.Param("docId")
 
 	if h.kbRepo != nil {
-		if _, ok := h.ensureKnowledgeBaseAccess(c, kbID); !ok {
+		if _, ok := h.ensureKnowledgeBaseWriteAccess(c, kbID); !ok {
 			return
 		}
 	}

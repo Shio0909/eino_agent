@@ -31,20 +31,20 @@ type Tenant struct {
 
 // KnowledgeBase 知识库
 type KnowledgeBase struct {
-	ID                   string    `json:"id"`
-	TenantID             int       `json:"tenant_id"`
-	Name                 string    `json:"name"`
-	Description          string    `json:"description"`
-	Mode                 string    `json:"mode"` // "vector"(默认) 或 "wiki"(LLM编译的Wiki知识库)
-	EmbeddingModelID     *string   `json:"embedding_model_id"` // nullable FK → models(id)
-	EmbeddingDimensions  int       `json:"embedding_dimensions"`
-	EmbedModelFingerprint string   `json:"embed_model_fingerprint"` // "provider:model_id:dimensions" at last index time
-	ChunkingConfig       JSON      `json:"chunking_config"`
-	ExtractConfig        JSON      `json:"extract_config"`
-	DocumentCount        int       `json:"document_count"`
-	ChunkCount           int       `json:"chunk_count"`
-	CreatedAt            time.Time `json:"created_at"`
-	UpdatedAt            time.Time `json:"updated_at"`
+	ID                    string    `json:"id"`
+	TenantID              int       `json:"tenant_id"`
+	Name                  string    `json:"name"`
+	Description           string    `json:"description"`
+	Mode                  string    `json:"mode"`               // "vector"(默认) 或 "wiki"(LLM编译的Wiki知识库)
+	EmbeddingModelID      *string   `json:"embedding_model_id"` // nullable FK → models(id)
+	EmbeddingDimensions   int       `json:"embedding_dimensions"`
+	EmbedModelFingerprint string    `json:"embed_model_fingerprint"` // "provider:model_id:dimensions" at last index time
+	ChunkingConfig        JSON      `json:"chunking_config"`
+	ExtractConfig         JSON      `json:"extract_config"`
+	DocumentCount         int       `json:"document_count"`
+	ChunkCount            int       `json:"chunk_count"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
 }
 
 // IsWikiMode 是否为 Wiki (Karpathy) 模式
@@ -100,6 +100,73 @@ type Embedding struct {
 	Content         string          `json:"content"`
 	Vector          pgvector.Vector `json:"-"`
 	CreatedAt       time.Time       `json:"created_at"`
+}
+
+// AccessRole 知识库/空间访问角色。
+type AccessRole string
+
+const (
+	AccessRoleViewer AccessRole = "viewer"
+	AccessRoleEditor AccessRole = "editor"
+	AccessRoleAdmin  AccessRole = "admin"
+)
+
+func (r AccessRole) Rank() int {
+	switch r {
+	case AccessRoleAdmin:
+		return 3
+	case AccessRoleEditor:
+		return 2
+	case AccessRoleViewer:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func (r AccessRole) Allows(required AccessRole) bool {
+	return r.Rank() >= required.Rank()
+}
+
+func MinAccessRole(a, b AccessRole) AccessRole {
+	if a.Rank() <= b.Rank() {
+		return a
+	}
+	return b
+}
+
+// Organization 组织/空间。
+type Organization struct {
+	ID          string    `json:"id"`
+	TenantID    int       `json:"tenant_id"`
+	Name        string    `json:"name"`
+	Description string    `json:"description"`
+	OwnerUserID string    `json:"owner_user_id"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// OrganizationMember 组织成员。
+type OrganizationMember struct {
+	ID             string     `json:"id"`
+	OrganizationID string     `json:"organization_id"`
+	TenantID       int        `json:"tenant_id"`
+	UserID         string     `json:"user_id"`
+	Role           AccessRole `json:"role"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+}
+
+// KnowledgeBaseShare 知识库分享授权。
+type KnowledgeBaseShare struct {
+	ID              string     `json:"id"`
+	KnowledgeBaseID string     `json:"knowledge_base_id"`
+	OrganizationID  string     `json:"organization_id"`
+	SourceTenantID  int        `json:"source_tenant_id"`
+	SharedByUserID  string     `json:"shared_by_user_id"`
+	Permission      AccessRole `json:"permission"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 // Session 会话
@@ -163,11 +230,22 @@ type KnowledgeBaseRepository interface {
 	Create(ctx context.Context, kb *KnowledgeBase) error
 	GetByID(ctx context.Context, id string) (*KnowledgeBase, error)
 	List(ctx context.Context, tenantID int, offset, limit int) ([]*KnowledgeBase, error)
+	ListAccessible(ctx context.Context, tenantID int, userID string, offset, limit int) ([]*KnowledgeBase, error)
 	Count(ctx context.Context, tenantID int) (int, error)
+	CountAccessible(ctx context.Context, tenantID int, userID string) (int, error)
 	Update(ctx context.Context, kb *KnowledgeBase) error
 	Delete(ctx context.Context, id string) error
 	IncrementCounts(ctx context.Context, id string, docDelta, chunkDelta int) error
 	UpdateEmbedFingerprint(ctx context.Context, id, fingerprint string) error
+}
+
+// AccessControlRepository 管理组织成员与知识库分享权限。
+type AccessControlRepository interface {
+	CreateOrganization(ctx context.Context, org *Organization) error
+	AddOrganizationMember(ctx context.Context, member *OrganizationMember) error
+	ShareKnowledgeBase(ctx context.Context, share *KnowledgeBaseShare) error
+	GetKnowledgeBaseRole(ctx context.Context, tenantID int, userID, kbID string) (AccessRole, error)
+	ListAccessibleKnowledgeBaseIDs(ctx context.Context, tenantID int, userID string) ([]string, error)
 }
 
 // KnowledgeRepository 知识文档仓储接口
@@ -269,12 +347,39 @@ func (r *pgKnowledgeBaseRepo) GetByID(ctx context.Context, id string) (*Knowledg
 }
 
 func (r *pgKnowledgeBaseRepo) List(ctx context.Context, tenantID int, offset, limit int) ([]*KnowledgeBase, error) {
-	rows, err := r.db.Query(ctx, `
+	query := `
 		SELECT id, tenant_id, name, description, mode, embedding_model_id, embedding_dimensions,
 		       embed_model_fingerprint, chunking_config, extract_config, document_count, chunk_count, created_at, updated_at
-		FROM knowledge_bases WHERE tenant_id = $1 AND deleted_at IS NULL
-		ORDER BY created_at DESC LIMIT $2 OFFSET $3
-	`, tenantID, limit, offset)
+		FROM knowledge_bases WHERE deleted_at IS NULL`
+	args := []any{limit, offset}
+	if tenantID > 0 {
+		query += ` AND tenant_id = $3`
+		args = append(args, tenantID)
+	}
+	query += ` ORDER BY created_at DESC LIMIT $1 OFFSET $2`
+
+	return scanKnowledgeBases(ctx, r.db, query, args...)
+}
+
+func (r *pgKnowledgeBaseRepo) ListAccessible(ctx context.Context, tenantID int, userID string, offset, limit int) ([]*KnowledgeBase, error) {
+	if tenantID <= 0 {
+		return r.List(ctx, tenantID, offset, limit)
+	}
+	query := `
+		SELECT DISTINCT kb.id, kb.tenant_id, kb.name, kb.description, kb.mode, kb.embedding_model_id, kb.embedding_dimensions,
+		       kb.embed_model_fingerprint, kb.chunking_config, kb.extract_config, kb.document_count, kb.chunk_count, kb.created_at, kb.updated_at
+		FROM knowledge_bases kb
+		LEFT JOIN knowledge_base_shares s ON s.knowledge_base_id = kb.id
+		LEFT JOIN organization_members m ON m.organization_id = s.organization_id AND m.tenant_id = $1 AND m.user_id = $2
+		WHERE kb.deleted_at IS NULL
+		  AND (kb.tenant_id = $1 OR m.id IS NOT NULL)
+		ORDER BY kb.created_at DESC
+		LIMIT $3 OFFSET $4`
+	return scanKnowledgeBases(ctx, r.db, query, tenantID, userID, limit, offset)
+}
+
+func scanKnowledgeBases(ctx context.Context, db *postgres.DB, query string, args ...any) ([]*KnowledgeBase, error) {
+	rows, err := db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -299,10 +404,29 @@ func (r *pgKnowledgeBaseRepo) List(ctx context.Context, tenantID int, offset, li
 
 func (r *pgKnowledgeBaseRepo) Count(ctx context.Context, tenantID int) (int, error) {
 	var count int
-	err := r.db.QueryRow(ctx,
-		`SELECT COUNT(*) FROM knowledge_bases WHERE tenant_id = $1 AND deleted_at IS NULL`,
-		tenantID,
-	).Scan(&count)
+	query := `SELECT COUNT(*) FROM knowledge_bases WHERE deleted_at IS NULL`
+	args := []any{}
+	if tenantID > 0 {
+		query += ` AND tenant_id = $1`
+		args = append(args, tenantID)
+	}
+	err := r.db.QueryRow(ctx, query, args...).Scan(&count)
+	return count, err
+}
+
+func (r *pgKnowledgeBaseRepo) CountAccessible(ctx context.Context, tenantID int, userID string) (int, error) {
+	if tenantID <= 0 {
+		return r.Count(ctx, tenantID)
+	}
+	var count int
+	err := r.db.QueryRow(ctx, `
+		SELECT COUNT(DISTINCT kb.id)
+		FROM knowledge_bases kb
+		LEFT JOIN knowledge_base_shares s ON s.knowledge_base_id = kb.id
+		LEFT JOIN organization_members m ON m.organization_id = s.organization_id AND m.tenant_id = $1 AND m.user_id = $2
+		WHERE kb.deleted_at IS NULL
+		  AND (kb.tenant_id = $1 OR m.id IS NOT NULL)
+	`, tenantID, userID).Scan(&count)
 	return count, err
 }
 

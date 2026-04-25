@@ -171,10 +171,17 @@ mcp_export:
     transport: streamable_http  # sse / streamable_http / stdio
     address: ":19094"
     api_keys: []  # 可选: 配置后需要 Authorization: Bearer <key> 或 X-API-Key: <key> 认证
+    api_key_scopes: []  # 推荐: 为外部 Agent 的 API Key 绑定 tenant/user/kb scope
+    default_tenant_id: 0  # 未配置 API Key 时的默认租户范围；0 表示不限制
+    default_user_id: ""
+    default_knowledge_base_ids: []  # 未配置 API Key 时允许访问的 KB；为空表示不限制
     enable_admin_tools: false  # 默认只暴露只读/问答工具；创建、导入、删除、索引等管理工具需显式开启
-    # api_keys:
-    #   - "sk-your-secret-key-1"
-    #   - "sk-your-secret-key-2"
+    # api_key_scopes:
+    #   - api_key: "sk-your-secret-key-1"
+    #     tenant_id: 1
+    #     user_id: "feishu-bot"
+    #     knowledge_base_ids: ["kb-id-1"]
+    #     allow_admin_tools: false
 graphrag:
     enabled: false
     neo4j_uri: bolt://localhost:7687

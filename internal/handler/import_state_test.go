@@ -57,6 +57,9 @@ func (r *fakeKnowledgeBaseRepo) GetByID(_ context.Context, id string) (*reposito
 func (r *fakeKnowledgeBaseRepo) List(context.Context, int, int, int) ([]*repository.KnowledgeBase, error) {
 	return nil, nil
 }
+func (r *fakeKnowledgeBaseRepo) ListAccessible(context.Context, int, string, int, int) ([]*repository.KnowledgeBase, error) {
+	return nil, nil
+}
 func (r *fakeKnowledgeBaseRepo) Update(context.Context, *repository.KnowledgeBase) error { return nil }
 func (r *fakeKnowledgeBaseRepo) Delete(context.Context, string) error                    { return nil }
 func (r *fakeKnowledgeBaseRepo) IncrementCounts(_ context.Context, _ string, _ int, chunkDelta int) error {
@@ -64,6 +67,9 @@ func (r *fakeKnowledgeBaseRepo) IncrementCounts(_ context.Context, _ string, _ i
 	return nil
 }
 func (r *fakeKnowledgeBaseRepo) Count(context.Context, int) (int, error) { return 0, nil }
+func (r *fakeKnowledgeBaseRepo) CountAccessible(context.Context, int, string) (int, error) {
+	return 0, nil
+}
 func (r *fakeKnowledgeBaseRepo) UpdateEmbedFingerprint(context.Context, string, string) error {
 	return nil
 }
