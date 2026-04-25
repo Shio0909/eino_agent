@@ -1,179 +1,154 @@
-import type { StreamEvent, WikiPage } from '../types/api'
+import type { StreamEvent } from '../types/api';
 
-const BASE = '/api/v1'
+type Fetcher = typeof fetch;
 
-async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(BASE + url, {
-    headers: { 'Content-Type': 'application/json' },
-    ...init,
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw new Error(err.error || res.statusText)
-  }
-  return res.json()
+interface ApiClientOptions {
+  baseUrl?: string;
+  getToken?: () => string | null | undefined;
+  fetcher?: Fetcher;
 }
 
-// ---- Chat ----
-export async function streamChat(
-  query: string,
-  sessionId: string,
-  mode: string,
-  options: { forceCitation?: boolean; enableSkills?: boolean; selectedSkills?: string[]; knowledgeBaseIds?: string[] } | undefined,
-  onEvent: (evt: StreamEvent & { error?: string }) => void,
-  signal?: AbortSignal,
-) {
-  const res = await fetch(BASE + '/chat/stream', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      query,
-      session_id: sessionId,
-      mode,
-      force_citation: options?.forceCitation,
-      enable_skills: options?.enableSkills,
-      selected_skills: options?.selectedSkills,
-      knowledge_base_ids: options?.knowledgeBaseIds,
-    }),
-    signal,
-  })
-  if (!res.ok || !res.body) {
-    throw new Error('Stream failed')
+interface RequestOptions extends Omit<RequestInit, 'body'> {
+  body?: unknown;
+}
+
+export class ApiClient {
+  private readonly baseUrl: string;
+  private readonly getToken?: () => string | null | undefined;
+  private readonly fetcher: Fetcher;
+
+  constructor(options: ApiClientOptions = {}) {
+    this.baseUrl = (options.baseUrl ?? '/api/v1').replace(/\/$/, '');
+    this.getToken = options.getToken;
+    this.fetcher = options.fetcher ?? fetch;
   }
-  const reader = res.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
+  get<T = unknown>(path: string, options?: RequestOptions) {
+    return this.request<T>(path, { ...options, method: 'GET' });
+  }
 
-    const lines = buffer.split('\n')
-    buffer = lines.pop() || ''
+  post<T = unknown>(path: string, body?: unknown, options?: RequestOptions) {
+    return this.request<T>(path, { ...options, method: 'POST', body });
+  }
 
-    for (const line of lines) {
-      // Gin SSE uses 'data:' without space, also handle 'data: ' format
-      let raw = ''
-      if (line.startsWith('data: ')) {
-        raw = line.slice(6).trim()
-      } else if (line.startsWith('data:')) {
-        raw = line.slice(5).trim()
-      } else {
-        continue
-      }
-      if (!raw || raw === '[DONE]') continue
-      try {
-        const data = JSON.parse(raw) as StreamEvent & { error?: string }
-        onEvent(data)
-      } catch { /* skip malformed */ }
+  put<T = unknown>(path: string, body?: unknown, options?: RequestOptions) {
+    return this.request<T>(path, { ...options, method: 'PUT', body });
+  }
+
+  delete<T = unknown>(path: string, options?: RequestOptions) {
+    return this.request<T>(path, { ...options, method: 'DELETE' });
+  }
+
+  async request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+    const headers = this.buildHeaders(options.headers, !(options.body instanceof FormData));
+    const response = await this.fetcher(this.url(path), {
+      ...options,
+      headers,
+      body: this.serializeBody(options.body),
+    });
+
+    if (!response.ok) {
+      throw new Error(await this.errorMessage(response));
+    }
+
+    if (response.status === 204) {
+      return undefined as T;
+    }
+
+    const contentType = response.headers.get('content-type') ?? '';
+    if (contentType.includes('application/json')) {
+      return response.json() as Promise<T>;
+    }
+    return response.text() as Promise<T>;
+  }
+
+  async upload<T = unknown>(path: string, file: File, fields: Record<string, string> = {}) {
+    const body = new FormData();
+    body.append('file', file);
+    Object.entries(fields).forEach(([key, value]) => body.append(key, value));
+    return this.post<T>(path, body);
+  }
+
+  async stream(path: string, body: unknown, onEvent: (event: StreamEvent) => void, signal?: AbortSignal) {
+    const response = await this.fetcher(this.url(path), {
+      method: 'POST',
+      headers: this.buildHeaders(undefined, true),
+      body: JSON.stringify(body),
+      signal,
+    });
+    if (!response.ok) {
+      throw new Error(await this.errorMessage(response));
+    }
+    if (!response.body) {
+      throw new Error('当前浏览器不支持流式响应');
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const frames = buffer.split('\n\n');
+      buffer = frames.pop() ?? '';
+      frames.forEach((frame) => this.emitFrame(frame, onEvent));
+    }
+    if (buffer.trim()) {
+      this.emitFrame(buffer, onEvent);
     }
   }
-}
 
-// ---- Knowledge Bases ----
-export const getKnowledgeBases = () => fetchJSON<{ knowledge_bases: any[] }>('/knowledge-bases')
-export const createKnowledgeBase = (data: { name: string; description?: string; mode?: 'vector' | 'wiki' }) =>
-  fetchJSON<any>('/knowledge-bases', { method: 'POST', body: JSON.stringify(data) })
-export const getKnowledgeBase = (id: string) => fetchJSON<any>(`/knowledge-bases/${id}`)
-export const deleteKnowledgeBase = (id: string) =>
-  fetchJSON<any>(`/knowledge-bases/${id}`, { method: 'DELETE' })
-
-// ---- Documents ----
-export async function uploadDocument(kbId: string, file: File) {
-  const form = new FormData()
-  form.append('file', file)
-  const res = await fetch(`${BASE}/knowledge-bases/${kbId}/documents`, { method: 'POST', body: form })
-  if (!res.ok) throw new Error('Upload failed')
-  return res.json()
-}
-export const getDocuments = (kbId: string) =>
-  fetchJSON<{ documents: any[] }>(`/knowledge-bases/${kbId}/documents`)
-export const deleteDocument = (kbId: string, docId: string) =>
-  fetchJSON<any>(`/knowledge-bases/${kbId}/documents/${docId}`, { method: 'DELETE' })
-export const getDocumentChunks = (kbId: string, docId: string) =>
-  fetchJSON<{ chunks: any[] }>(`/knowledge-bases/${kbId}/documents/${docId}/chunks`)
-
-// ---- URL Upload ----
-export const uploadDocumentURL = (kbId: string, url: string, title?: string) =>
-  fetchJSON<any>(`/knowledge-bases/${kbId}/documents/url`, {
-    method: 'POST',
-    body: JSON.stringify({ url, title }),
-  })
-
-export const getWikiPages = (kbId: string) =>
-  fetchJSON<{ pages: WikiPage[] }>(`/knowledge-bases/${kbId}/wiki/pages`)
-export const getWikiPage = (kbId: string, path: string) =>
-  fetchJSON<{ page: WikiPage }>(`/knowledge-bases/${kbId}/wiki/page?path=${encodeURIComponent(path)}`)
-export const searchWikiPages = (kbId: string, query: string) =>
-  fetchJSON<{ pages: WikiPage[]; query: string }>(`/knowledge-bases/${kbId}/wiki/search?q=${encodeURIComponent(query)}`)
-
-// ---- Sessions ----
-export const getSessions = () => fetchJSON<{ sessions: any[] }>('/sessions')
-export const createSession = (title: string) =>
-  fetchJSON<any>('/sessions', { method: 'POST', body: JSON.stringify({ title }) })
-export const deleteSession = (id: string) => fetchJSON<any>(`/sessions/${id}`, { method: 'DELETE' })
-export const getSessionMessages = (id: string) =>
-  fetchJSON<{ messages: any[] }>(`/sessions/${id}/messages`)
-
-// ---- Settings ----
-export const getSettings = () => fetchJSON<{ settings: any }>('/settings')
-export const updateSettings = (data: any) =>
-  fetchJSON<any>('/settings', { method: 'PUT', body: JSON.stringify(data) })
-
-// ---- System ----
-export const getSystemInfo = () => fetchJSON<any>('/system/info')
-export const getModels = () => fetchJSON<{ models: any[] }>('/models')
-
-// ---- MCP ----
-export const getMCPStatus = () => fetchJSON<{
-  mcp: {
-    enabled: boolean
-    server_count: number
-    tool_count: number
-    servers: any[]
+  private buildHeaders(init: HeadersInit | undefined, includeJson: boolean) {
+    const headers: Record<string, string> = {};
+    if (includeJson) headers['Content-Type'] = 'application/json';
+    new Headers(init).forEach((value, key) => {
+      headers[key] = value;
+    });
+    const token = this.getToken?.();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    return headers;
   }
-}>('/mcp')
 
-export const importMCPServer = (data: {
-  provider: 'tavily' | 'custom'
-  name?: string
-  endpoint?: string
-  transport?: string
-  api_key?: string
-  use_key_in_url?: boolean
-}) => fetchJSON<any>('/mcp/import', { method: 'POST', body: JSON.stringify(data) })
+  private serializeBody(body: unknown) {
+    if (body == null) return undefined;
+    if (body instanceof FormData) return body;
+    if (typeof body === 'string') return body;
+    return JSON.stringify(body);
+  }
 
-// ---- Eval ----
-export const getEvalReports = () => fetchJSON<{ reports: Array<{ name: string; size: number; modified_at: string }> }>('/eval/reports')
+  private url(path: string) {
+    if (/^https?:\/\//.test(path)) return path;
+    return `${this.baseUrl}${path.startsWith('/') ? path : `/${path}`}`;
+  }
 
-// ---- Code Repos ----
-export const getCodeRepos = () => fetchJSON<{ repos: any[] }>('/code-repos')
-export const cloneCodeRepo = (url: string, name?: string) =>
-  fetchJSON<any>('/code-repos/clone', { method: 'POST', body: JSON.stringify({ url, name: name || undefined }) })
-export const indexCodeRepo = (name: string) =>
-  fetchJSON<any>(`/code-repos/${encodeURIComponent(name)}/index`, { method: 'POST' })
-export const pullCodeRepo = (name: string) =>
-  fetchJSON<any>(`/code-repos/${encodeURIComponent(name)}/pull`, { method: 'POST' })
-export const deleteCodeRepo = (name: string) =>
-  fetchJSON<any>(`/code-repos/${encodeURIComponent(name)}`, { method: 'DELETE' })
+  private async errorMessage(response: Response) {
+    const contentType = response.headers.get('content-type') ?? '';
+    if (contentType.includes('application/json')) {
+      const data = await response.json().catch(() => undefined) as { error?: string; message?: string } | undefined;
+      return data?.error ?? data?.message ?? `请求失败 (${response.status})`;
+    }
+    const text = await response.text().catch(() => '');
+    return text || `请求失败 (${response.status})`;
+  }
 
-// ---- GraphRAG ----
-export interface VisNode {
-  id: string
-  label: string
-  degree: number
-  chunk_count: number
+  private emitFrame(frame: string, onEvent: (event: StreamEvent) => void) {
+    const dataLines = frame
+      .split('\n')
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice(5).trim());
+    if (dataLines.length === 0) return;
+    const payload = dataLines.join('\n');
+    if (payload === '[DONE]') {
+      onEvent({ type: 'done' });
+      return;
+    }
+    onEvent(JSON.parse(payload) as StreamEvent);
+  }
 }
-export interface VisEdge {
-  source: string
-  target: string
-  label: string
-}
-export interface VisGraph {
-  nodes: VisNode[]
-  edges: VisEdge[]
-}
-export const getGraphRAGStatus = () => fetchJSON<{ enabled: boolean; neo4j_uri: string; connected: boolean }>('/graphrag/status')
-export const getGraphVisualization = (kbId: string, limit = 200) =>
-  fetchJSON<VisGraph>(`/graphrag/graph/${kbId}?limit=${limit}`)
+
+export const api = new ApiClient({
+  baseUrl: import.meta.env.VITE_API_BASE_URL ?? '/api/v1',
+  getToken: () => localStorage.getItem('eino.access_token'),
+});

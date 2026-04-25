@@ -1,31 +1,20 @@
-import { cva, type VariantProps } from 'class-variance-authority'
-import { cn } from '../../lib/utils'
+import { clsx } from 'clsx';
+import type { PropsWithChildren } from 'react';
 
-const badgeVariants = cva(
-  'inline-flex items-center gap-1 rounded-full text-xs font-medium',
-  {
-    variants: {
-      variant: {
-        default: 'bg-[var(--color-bg-tertiary)] text-[var(--color-text-secondary)]',
-        success: 'bg-green-500/15 text-green-400',
-        warning: 'bg-yellow-500/15 text-yellow-400',
-        error: 'bg-red-500/15 text-red-400',
-        info: 'bg-blue-500/15 text-blue-400',
-        accent: 'bg-[var(--color-accent-light)] text-[var(--color-accent)]',
-        purple: 'bg-purple-500/15 text-purple-400',
-      },
-      size: {
-        sm: 'px-1.5 py-0.5 text-[10px]',
-        md: 'px-2 py-0.5 text-xs',
-        lg: 'px-2.5 py-1 text-xs',
-      },
-    },
-    defaultVariants: { variant: 'default', size: 'md' },
-  },
-)
+interface BadgeProps {
+  tone?: 'primary' | 'accent' | 'success' | 'warning' | 'error' | 'muted';
+  className?: string;
+}
 
-interface BadgeProps extends React.HTMLAttributes<HTMLSpanElement>, VariantProps<typeof badgeVariants> {}
+const tones = {
+  primary: 'bg-primary/12 text-primary ring-primary/20',
+  accent: 'bg-accent/12 text-accent ring-accent/20',
+  success: 'bg-success/12 text-success ring-success/20',
+  warning: 'bg-warning/12 text-warning ring-warning/20',
+  error: 'bg-error/12 text-error ring-error/20',
+  muted: 'bg-muted/10 text-muted ring-border/70',
+};
 
-export function Badge({ className, variant, size, ...props }: BadgeProps) {
-  return <span className={cn(badgeVariants({ variant, size, className }))} {...props} />
+export function Badge({ tone = 'muted', className, children }: PropsWithChildren<BadgeProps>) {
+  return <span className={clsx('inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ring-1', tones[tone], className)}>{children}</span>;
 }
