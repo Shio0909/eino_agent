@@ -3,12 +3,13 @@
 # 服务架构：app (Go) + postgres + redis + docreader + reranker + minio + jaeger + frontend
 #
 # 快速开始：
-#   1. cp .env.example .env && 编辑 .env 填入 API Key
-#   2. make up              (启动核心服务)
-#   3. make up-frontend     (启动核心 + 前端 UI)
-#   4. 访问 http://localhost
+#   1. cp .env.example .env && 编辑 .env 填入 API Key / 密码
+#   2. make check-env       (检查本地配置文件)
+#   3. make up              (启动核心服务)
+#   4. make up-frontend     (启动核心 + 前端 UI)
+#   5. 访问 http://localhost
 
-.PHONY: help up down build dev test
+.PHONY: help up down build dev test test-core frontend-build check-demo
 
 # 默认目标
 help:
@@ -146,6 +147,18 @@ dev:
 # 运行测试
 test:
 	go test -v ./...
+
+# CI/展示用核心测试（避开需要完整外部依赖的包）
+test-core:
+	go test ./internal/config ./internal/filter ./internal/security ./internal/wiki ./internal/handler ./internal/service ./internal/pipeline ./internal/mcp
+
+frontend-build:
+	npm --prefix frontend-react run build
+
+check-demo:
+	go test ./internal/config ./internal/wiki ./internal/handler ./internal/service ./internal/pipeline ./internal/mcp
+	go build ./cmd/server
+	npm --prefix frontend-react run build
 
 # 代码检查
 lint:

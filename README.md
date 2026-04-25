@@ -2,6 +2,18 @@
 
 基于字节跳动 [Eino](https://github.com/cloudwego/eino) 框架构建的多范式知识库问答平台，使用 Go 语言实现。
 
+项目定位是“企业知识中台 / RAG 能力服务”：后端提供向量检索、Wiki 知识库、GraphRAG、Code Search、MCP Export 等能力，前端提供知识库管理、聊天、引用和图谱浏览。
+
+## 设计目标
+
+> Demo 讲解稿见 `docs/SHOWCASE.md`。
+
+- **双知识库形态**：`vector` 模式负责语义召回，`wiki` 模式把文件/URL 编译成可浏览 Markdown 页面与交叉链接。
+- **多范式 RAG**：Pipeline RAG、Agentic ReAct 工具调用、GraphRAG、Code Search 可按场景组合。
+- **能力中台化**：HTTP API + MCP Export 对外暴露 `chat`、`knowledge_search`、KB 查询等高层能力，管理工具默认关闭。
+- **工程化导入链路**：本地/URL/异步队列/DocReader/MinerU 多解析路径，支持重排序、缓存和导入状态跟踪。
+- **安全与多租户**：JWT、租户隔离、Prompt Injection 检测、URL SSRF 防护和配置化 MCP API Key。
+
 ## 核心特性
 
 - **两种问答模式**：Pipeline（线性 RAG）和 Agentic（ReAct Agent + 工具调用，统一了 Agent 与 Agentic RAG）
@@ -95,6 +107,12 @@ eino_agent/
 ├── frontend-react/          # React 前端
 └── docker/                  # Docker 构建文件
 ```
+
+## 安全说明
+
+- `.env`、`configs/config.yaml`、`.tmp_*` 都是本地运行态/测试配置，不应提交。
+- 生产环境启用鉴权时必须配置强随机 `JWT_SECRET`、管理员密码和数据库密码。
+- 如果曾把真实 API Key 写入本地配置，请先轮换密钥，再公开仓库或截图。
 
 ## 快速开始
 

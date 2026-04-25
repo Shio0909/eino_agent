@@ -1,6 +1,7 @@
 # 环境配置
 .env
 .env.*
+!.env.example
 configs/config.yaml
 
 # AI 文档（面试材料、架构分析等）
