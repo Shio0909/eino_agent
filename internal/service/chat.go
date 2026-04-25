@@ -45,8 +45,8 @@ type ChatService struct {
 	reranker        pipeline.Reranker // 重排序器（注入到 Pipeline）
 	pipeline        *pipeline.RAGPipeline
 	agent           *react.Agent
-	knowledgeTool   *internalTool.KnowledgeTool  // Agent 模式的知识库工具引用
-	graphRAGService *graphrag.Service            // GraphRAG 服务（可选，用于按需创建图谱检索器）
+	knowledgeTool   *internalTool.KnowledgeTool   // Agent 模式的知识库工具引用
+	graphRAGService *graphrag.Service             // GraphRAG 服务（可选，用于按需创建图谱检索器）
 	codeGraphRepo   codegraph.CodeGraphRepository // 代码知识图谱存储（可选）
 	codeIndexer     *codegraph.Indexer            // 代码索引器（可选）
 	skillBackend    skill.Backend
@@ -329,14 +329,16 @@ func (s *ChatService) buildRuntimeInstruction(ctx context.Context, req *ChatRequ
 }
 
 type retrievalScope struct {
-	kbSet  map[string]struct{}
-	docSet map[string]struct{}
+	kbSet      map[string]struct{}
+	docSet     map[string]struct{}
+	restricted bool
 }
 
 func (s *ChatService) buildRetrievalScope(req *ChatRequest) retrievalScope {
 	scope := retrievalScope{
-		kbSet:  make(map[string]struct{}),
-		docSet: make(map[string]struct{}),
+		kbSet:      make(map[string]struct{}),
+		docSet:     make(map[string]struct{}),
+		restricted: req.RestrictRetrieval,
 	}
 	for _, kbID := range req.KnowledgeBaseIDs {
 		id := strings.TrimSpace(kbID)
@@ -354,7 +356,7 @@ func (s *ChatService) buildRetrievalScope(req *ChatRequest) retrievalScope {
 }
 
 func (s retrievalScope) isEmpty() bool {
-	return len(s.kbSet) == 0 && len(s.docSet) == 0
+	return !s.restricted && len(s.kbSet) == 0 && len(s.docSet) == 0
 }
 
 type scopedRetriever struct {
@@ -390,6 +392,9 @@ func (r *scopedRetriever) Retrieve(ctx context.Context, query string, opts ...re
 }
 
 func (r *scopedRetriever) matchDoc(doc *schema.Document) bool {
+	if r.scope.restricted && len(r.scope.kbSet) == 0 && len(r.scope.docSet) == 0 {
+		return false
+	}
 	if len(r.scope.kbSet) > 0 {
 		kbID := strings.TrimSpace(toString(metaValue(doc.MetaData, "knowledge_base_id")))
 		if kbID == "" {
@@ -634,8 +639,16 @@ func appendInstructionToMessage(message, instruction string) string {
 
 // Source 来源信息
 type Source struct {
-	Content string `json:"content"`
-	DocID   string `json:"doc_id"`
+	Content  string                 `json:"content"`
+	DocID    string                 `json:"doc_id"`
+	Metadata map[string]interface{} `json:"metadata,omitempty"`
+}
+
+func sourceFromDocument(doc *schema.Document) Source {
+	if doc == nil {
+		return Source{}
+	}
+	return Source{Content: doc.Content, DocID: doc.ID, Metadata: doc.MetaData}
 }
 
 func (s *ChatService) buildSourcesFromRetriever(ctx context.Context, runtimeRetriever retriever.Retriever, query string, maxN int) []Source {
@@ -666,7 +679,7 @@ func (s *ChatService) buildSourcesFromRetriever(ctx context.Context, runtimeRetr
 		if _, ok := seen[docID]; ok {
 			continue
 		}
-		sources = append(sources, Source{Content: doc.Content, DocID: docID})
+		sources = append(sources, sourceFromDocument(doc))
 		seen[docID] = struct{}{}
 		if len(sources) >= maxN {
 			break
@@ -724,7 +737,21 @@ func (s *ChatService) prepareChatContext(ctx context.Context, req *ChatRequest) 
 // Chat 执行聊天
 func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
 	startTime := time.Now()
+	trace := newTraceCollector()
+	trace.add(TraceStep{
+		Type:  "status",
+		Stage: "request",
+		Metadata: map[string]any{
+			"mode":                 req.Mode,
+			"use_agent":            req.UseAgent,
+			"knowledge_base_ids":   req.KnowledgeBaseIDs,
+			"document_ids":         req.DocumentIDs,
+			"restrict_retrieval":   req.RestrictRetrieval,
+			"enable_long_term_set": req.EnableLongTerm != nil,
+		},
+	})
 	cc := s.prepareChatContext(ctx, req)
+	cc.runtimeRetriever = newTracedRetriever(cc.runtimeRetriever, trace)
 
 	var resp *ChatResponse
 	mode := "pipeline"
@@ -733,7 +760,8 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 	if req.UseAgent && s.config.Agent.Enabled {
 		mode = "agentic"
 		modeStart := time.Now()
-		runtimeAgent, kt, createErr := s.buildRuntimeAgentForRequest(ctx, cc.runtimeRetriever, req, nil)
+		trace.add(TraceStep{Type: "status", Stage: "agent_start", Metadata: map[string]any{"max_steps": s.config.Agent.MaxSteps}})
+		runtimeAgent, kt, createErr := s.buildRuntimeAgentForRequest(ctx, cc.runtimeRetriever, req, trace.addEvent)
 		if createErr != nil {
 			return nil, fmt.Errorf("build runtime agent: %w", createErr)
 		}
@@ -758,6 +786,16 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 			}
 		}
 		answer = filter.StripThinkTags(answer)
+		trace.add(TraceStep{
+			Type:       "status",
+			Stage:      "agent_generate",
+			LatencyMs:  time.Since(modeStart).Milliseconds(),
+			TokenCount: promptTokens + completionTokens,
+			Metadata: map[string]any{
+				"prompt_tokens":     promptTokens,
+				"completion_tokens": completionTokens,
+			},
+		})
 
 		// 从 KnowledgeTool 缓存中提取 sources，避免冗余二次检索
 		var sources []Source
@@ -766,7 +804,7 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 				if doc == nil || strings.TrimSpace(doc.ID) == "" {
 					continue
 				}
-				sources = append(sources, Source{Content: doc.Content, DocID: doc.ID})
+				sources = append(sources, sourceFromDocument(doc))
 				if len(sources) >= s.config.RAG.TopK {
 					break
 				}
@@ -783,6 +821,7 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 			Answer:    answer,
 			Sources:   sources,
 			SessionID: cc.sessionID,
+			Trace:     trace.snapshot(),
 		}
 
 		// 记录 Prometheus 指标 & 审计日志
@@ -802,6 +841,8 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 		})
 	} else if s.pipeline != nil {
 		// Pipeline 模式
+		pipelineStart := time.Now()
+		trace.add(TraceStep{Type: "status", Stage: "pipeline_start"})
 		runtimePipeline := s.pipeline
 		if cc.runtimeRetriever != s.retriever {
 			runtimePipeline = s.buildRuntimePipeline(cc.runtimeRetriever)
@@ -816,20 +857,28 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 			return nil, fmt.Errorf("pipeline run: %w", pipeErr)
 		}
 
+		if pipeResp.RewriteQ != "" {
+			trace.add(TraceStep{Type: "rewrite", Stage: "rewrite", Content: pipeResp.RewriteQ})
+		}
+		trace.add(TraceStep{Type: "status", Stage: "pipeline_run", LatencyMs: time.Since(pipelineStart).Milliseconds(), Metadata: map[string]any{"source_count": len(pipeResp.Sources)}})
+
 		pipeResp.Answer = filter.StripThinkTags(pipeResp.Answer)
 
 		sources := make([]Source, len(pipeResp.Sources))
 		for i, src := range pipeResp.Sources {
 			sources[i] = Source{
-				Content: src.Content,
-				DocID:   src.DocID,
+				Content:  src.Content,
+				DocID:    src.DocID,
+				Metadata: src.Metadata,
 			}
+			trace.add(TraceStep{Type: "source", Stage: "source", Content: src.Content, DocID: src.DocID, Metadata: src.Metadata})
 		}
 
 		resp = &ChatResponse{
 			Answer:    pipeResp.Answer,
 			Sources:   sources,
 			SessionID: cc.sessionID,
+			Trace:     trace.snapshot(),
 		}
 
 		// 记录 Prometheus 指标 & 审计日志（pipeline 无 token usage，记 0）
@@ -850,7 +899,9 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 
 	// 保存助手消息
 	latencyMs := time.Since(startTime).Milliseconds()
-	s.saveAssistantMessage(ctx, cc.sessionID, resp.Answer, 0, latencyMs)
+	trace.add(TraceStep{Type: "status", Stage: "complete", LatencyMs: latencyMs, Metadata: map[string]any{"mode": mode, "source_count": len(resp.Sources)}})
+	resp.Trace = trace.snapshot()
+	s.saveAssistantMessageWithTrace(ctx, cc.sessionID, resp.Answer, 0, latencyMs, resp.Trace)
 
 	return resp, nil
 }
@@ -859,9 +910,30 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan StreamEvent, error) {
 	ch := make(chan StreamEvent, 100)
 	cc := s.prepareChatContext(ctx, req)
+	trace := newTraceCollector()
+	trace.add(TraceStep{
+		Type:  "status",
+		Stage: "request",
+		Metadata: map[string]any{
+			"mode":                 req.Mode,
+			"use_agent":            req.UseAgent,
+			"knowledge_base_ids":   req.KnowledgeBaseIDs,
+			"document_ids":         req.DocumentIDs,
+			"restrict_retrieval":   req.RestrictRetrieval,
+			"enable_long_term_set": req.EnableLongTerm != nil,
+		},
+	})
+	cc.runtimeRetriever = newTracedRetriever(cc.runtimeRetriever, trace)
 
 	// trySend 向 channel 发送事件，如果 ctx 已取消则放弃，防止 goroutine 泄露
 	trySend := func(ev StreamEvent) bool {
+		if ev.TraceStep == nil && (ev.Type == "status" || ev.Type == "rewrite" || ev.Type == "source" || ev.Type == "action" || ev.Type == "observation") {
+			step := TraceStep{Type: ev.Type, Stage: ev.Type, Content: ev.Content, ToolName: ev.ToolName, ToolInput: ev.ToolInput, DocID: ev.DocID, LatencyMs: ev.LatencyMs}
+			ev.TraceStep = &step
+		}
+		if ev.TraceStep != nil {
+			trace.add(*ev.TraceStep)
+		}
 		select {
 		case ch <- ev:
 			return true
@@ -887,6 +959,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 
 		// Agentic 模式（统一 agent / agentic / agentic_rag）
 		if req.UseAgent && s.config.Agent.Enabled {
+			trace.add(TraceStep{Type: "status", Stage: "agent_start", Metadata: map[string]any{"max_steps": s.config.Agent.MaxSteps}})
 			eventSink := func(ev StreamEvent) { trySend(ev) }
 			runtimeAgent, _, createErr := s.buildRuntimeAgentForRequest(ctx, cc.runtimeRetriever, req, eventSink)
 			if createErr != nil {
@@ -905,7 +978,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			respMsg, agentErr := runtimeAgent.Generate(llmCtx, messages)
 			llmCancel()
 			if agentErr != nil {
-				trySend(StreamEvent{Type: "error", Error: agentErr.Error()})
+				trySend(StreamEvent{Type: "error", Error: agentErr.Error(), TraceStep: &TraceStep{Type: "error", Stage: "agent_generate", Content: agentErr.Error(), LatencyMs: time.Since(startTime).Milliseconds()}})
 				return
 			}
 
@@ -915,6 +988,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			}
 			// Strip think-tag content, then fake-stream the final answer rune by rune.
 			answer = filter.StripThinkTags(answer)
+			trace.add(TraceStep{Type: "status", Stage: "agent_generate", LatencyMs: time.Since(startTime).Milliseconds()})
 			if answer != "" {
 				log.Printf("[Timing][ChatService] mode=agentic stage=first_token duration_ms=%d", time.Since(startTime).Milliseconds())
 				for _, r := range []rune(answer) {
@@ -948,12 +1022,14 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			})
 
 			latencyMs := time.Since(startTime).Milliseconds()
-			s.saveAssistantMessage(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs)
+			trace.add(TraceStep{Type: "status", Stage: "complete", LatencyMs: latencyMs, Metadata: map[string]any{"mode": "agentic"}})
+			s.saveAssistantMessageWithTrace(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs, trace.snapshot())
 			return
 		}
 
 		// Pipeline 模式
 		if s.pipeline != nil {
+			trace.add(TraceStep{Type: "status", Stage: "pipeline_start"})
 			runtimePipeline := s.pipeline
 			if cc.runtimeRetriever != s.retriever {
 				runtimePipeline = s.buildRuntimePipeline(cc.runtimeRetriever)
@@ -965,7 +1041,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 				GenerationInstruction: cc.runtimeInstruction,
 			})
 			if err != nil {
-				trySend(StreamEvent{Type: "error", Error: err.Error()})
+				trySend(StreamEvent{Type: "error", Error: err.Error(), TraceStep: &TraceStep{Type: "error", Stage: "pipeline_stream", Content: err.Error(), LatencyMs: time.Since(startTime).Milliseconds()}})
 				return
 			}
 
@@ -1003,11 +1079,14 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			}
 
 			latencyMs := time.Since(startTime).Milliseconds()
-			s.saveAssistantMessage(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs)
+			trace.add(TraceStep{Type: "status", Stage: "complete", LatencyMs: latencyMs, Metadata: map[string]any{"mode": "pipeline"}})
+			s.saveAssistantMessageWithTrace(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs, trace.snapshot())
 			return
 		}
 
-		trySend(StreamEvent{Type: "error", Error: "no handler available"})
+		if !trySend(StreamEvent{Type: "error", Error: "no handler available", TraceStep: &TraceStep{Type: "error", Stage: "handler", Content: "no handler available", LatencyMs: time.Since(startTime).Milliseconds()}}) {
+			return
+		}
 	}()
 
 	return ch, nil

@@ -32,7 +32,26 @@ import (
 // contextKey 用于在 context 中传递认证信息
 type contextKey string
 
-const ctxKeyAuthenticated contextKey = "mcp_authenticated"
+const (
+	ctxKeyAuthenticated contextKey = "mcp_authenticated"
+	ctxKeyScope         contextKey = "mcp_scope"
+)
+
+type accessLevel string
+
+const (
+	accessLevelRead  accessLevel = "read"
+	accessLevelWrite accessLevel = "write"
+	accessLevelAdmin accessLevel = "admin"
+)
+
+type mcpScope struct {
+	tenantID         int
+	userID           string
+	knowledgeBaseIDs []string
+	kbRestricted     bool
+	allowAdminTools  bool
+}
 
 // chatProvider 定义 MCP Server 需要的聊天能力（用于解耦和测试）
 type chatProvider interface {
@@ -66,11 +85,42 @@ type Server struct {
 	config    *config.Config
 	chatSvc   chatProvider
 	kbRepo    repository.KnowledgeBaseRepository
-	kbWriter  kbWriteProvider                      // 可选：知识库写入（创建 KB、导入 URL）
-	codeTool  codeSearchProvider                   // 可选：代码搜索工具
-	graphRAG  graphRAGProvider                     // 可选：GraphRAG 服务
-	codeGraph codegraph.CodeGraphRepository        // 可选：代码知识图谱
-	apiKeySet map[string]struct{}                  // 已配置的 API Key 集合，为空则不验证
+	kbWriter  kbWriteProvider               // 可选：知识库写入（创建 KB、导入 URL）
+	codeTool  codeSearchProvider            // 可选：代码搜索工具
+	graphRAG  graphRAGProvider              // 可选：GraphRAG 服务
+	codeGraph codegraph.CodeGraphRepository // 可选：代码知识图谱
+	apiKeySet map[string]struct{}           // 已配置的 API Key 集合，为空则不验证
+	scopes    map[string]mcpScope           // API Key 对应的访问范围
+}
+
+func buildAPIKeyScopes(cfg config.MCPExportConfig) (map[string]struct{}, map[string]mcpScope) {
+	keySet := make(map[string]struct{}, len(cfg.APIKeys)+len(cfg.APIKeyScopes))
+	scopes := make(map[string]mcpScope, len(cfg.APIKeyScopes))
+
+	for _, key := range cfg.APIKeys {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		keySet[key] = struct{}{}
+	}
+
+	for _, item := range cfg.APIKeyScopes {
+		key := strings.TrimSpace(item.APIKey)
+		if key == "" {
+			continue
+		}
+		keySet[key] = struct{}{}
+		scopes[key] = mcpScope{
+			tenantID:         item.TenantID,
+			userID:           strings.TrimSpace(item.UserID),
+			knowledgeBaseIDs: normalizeKnowledgeBaseIDs(item.KnowledgeBaseIDs),
+			kbRestricted:     true,
+			allowAdminTools:  item.AllowAdminTools,
+		}
+	}
+
+	return keySet, scopes
 }
 
 // NewServer 创建 MCP Server
@@ -86,11 +136,8 @@ func NewServer(cfg *config.Config, chatSvc *service.ChatService, kbRepo reposito
 	}
 
 	// 如果配置了 API Keys，添加认证中间件
-	if len(cfg.MCPExport.APIKeys) > 0 {
-		keySet := make(map[string]struct{}, len(cfg.MCPExport.APIKeys))
-		for _, k := range cfg.MCPExport.APIKeys {
-			keySet[k] = struct{}{}
-		}
+	if len(cfg.MCPExport.APIKeys) > 0 || len(cfg.MCPExport.APIKeyScopes) > 0 {
+		keySet, scopes := buildAPIKeyScopes(cfg.MCPExport)
 
 		opts = append(opts, mcpServer.WithToolHandlerMiddleware(
 			func(next mcpServer.ToolHandlerFunc) mcpServer.ToolHandlerFunc {
@@ -105,6 +152,7 @@ func NewServer(cfg *config.Config, chatSvc *service.ChatService, kbRepo reposito
 		))
 
 		s.apiKeySet = keySet
+		s.scopes = scopes
 	}
 
 	s.mcpSrv = mcpServer.NewMCPServer(
@@ -147,7 +195,7 @@ func (s *Server) registerTools() {
 				mcpProto.Description("检索查询文本"),
 			),
 			mcpProto.WithString("knowledge_base_ids",
-				mcpProto.Description("知识库 ID 列表，逗号分隔。留空则搜索所有知识库。"),
+				mcpProto.Description("知识库 ID 列表，逗号分隔。优先指定目标知识库，避免跨库混检；留空则搜索所有知识库。"),
 			),
 			mcpProto.WithNumber("top_k",
 				mcpProto.Description("返回结果数量，默认 5"),
@@ -167,6 +215,9 @@ func (s *Server) registerTools() {
 			),
 			mcpProto.WithString("session_id",
 				mcpProto.Description("会话 ID，用于多轮对话。留空则创建临时会话。"),
+			),
+			mcpProto.WithString("knowledge_base_ids",
+				mcpProto.Description("知识库 ID 列表，逗号分隔。指定后只基于这些知识库问答。"),
 			),
 			mcpProto.WithBoolean("use_agent",
 				mcpProto.Description("是否使用 Agentic 模式（ReAct Agent + 工具调用）。默认 false 使用 Pipeline 模式。"),
@@ -278,6 +329,11 @@ func (s *Server) registerTools() {
 	}
 
 	// ── 写入工具（按 kbWriter 注入情况注册） ──
+
+	if s.kbWriter != nil && !s.config.MCPExport.EnableAdminTools {
+		log.Println("[MCP Server] 管理工具未启用: create/import/delete/clone/index 工具不会暴露")
+		return
+	}
 
 	// 8. create_knowledge_base — 创建知识库
 	if s.kbWriter != nil {
@@ -400,6 +456,79 @@ func (s *Server) registerTools() {
 	}
 }
 
+func (s *Server) scopeFromContext(ctx context.Context) mcpScope {
+	if scope, ok := ctx.Value(ctxKeyScope).(mcpScope); ok {
+		return scope
+	}
+	if s.config == nil {
+		return mcpScope{}
+	}
+	return mcpScope{
+		tenantID:         s.config.MCPExport.DefaultTenantID,
+		userID:           strings.TrimSpace(s.config.MCPExport.DefaultUserID),
+		knowledgeBaseIDs: normalizeKnowledgeBaseIDs(s.config.MCPExport.DefaultKnowledgeBaseIDs),
+		kbRestricted:     len(s.config.MCPExport.DefaultKnowledgeBaseIDs) > 0,
+		allowAdminTools:  s.config.MCPExport.EnableAdminTools,
+	}
+}
+
+func (s *Server) resolveKnowledgeBaseIDs(ctx context.Context, requested []string, level accessLevel) ([]string, error) {
+	_ = level
+	requested = normalizeKnowledgeBaseIDs(requested)
+	scope := s.scopeFromContext(ctx)
+	if !scope.kbRestricted {
+		if len(requested) > 0 {
+			return requested, nil
+		}
+		if scope.tenantID > 0 && s.kbRepo != nil {
+			kbs, err := s.kbRepo.ListAccessible(ctx, scope.tenantID, scope.userID, 0, 1000)
+			if err != nil {
+				return nil, err
+			}
+			ids := make([]string, 0, len(kbs))
+			for _, kb := range kbs {
+				ids = append(ids, kb.ID)
+			}
+			return ids, nil
+		}
+		return nil, nil
+	}
+
+	allowed := make(map[string]struct{}, len(scope.knowledgeBaseIDs))
+	for _, id := range scope.knowledgeBaseIDs {
+		allowed[id] = struct{}{}
+	}
+
+	if len(requested) == 0 {
+		return append([]string(nil), scope.knowledgeBaseIDs...), nil
+	}
+
+	for _, id := range requested {
+		if _, ok := allowed[id]; !ok {
+			return nil, fmt.Errorf("知识库 %s 不在当前 MCP 凭据授权范围内", id)
+		}
+	}
+	return requested, nil
+}
+
+func (s *Server) authorizeKnowledgeBase(ctx context.Context, kbID string, level accessLevel) error {
+	ids, err := s.resolveKnowledgeBaseIDs(ctx, []string{kbID}, level)
+	if err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	return nil
+}
+
+func (s *Server) authorizeAdminTool(ctx context.Context) error {
+	if s.scopeFromContext(ctx).allowAdminTools {
+		return nil
+	}
+	return fmt.Errorf("当前 MCP 凭据无权调用管理工具")
+}
+
 // handleKnowledgeSearch 处理知识库检索请求
 func (s *Server) handleKnowledgeSearch(ctx context.Context, req mcpProto.CallToolRequest) (*mcpProto.CallToolResult, error) {
 	query, _ := req.RequireString("query")
@@ -409,22 +538,17 @@ func (s *Server) handleKnowledgeSearch(ctx context.Context, req mcpProto.CallToo
 
 	kbIDsStr := req.GetString("knowledge_base_ids", "")
 
-	// 解析知识库 ID
-	var kbIDs []string
-	if kbIDsStr != "" {
-		for _, id := range strings.Split(kbIDsStr, ",") {
-			id = strings.TrimSpace(id)
-			if id != "" {
-				kbIDs = append(kbIDs, id)
-			}
-		}
+	kbIDs, err := s.resolveKnowledgeBaseIDs(ctx, parseKnowledgeBaseIDs(kbIDsStr), accessLevelRead)
+	if err != nil {
+		return mcpProto.NewToolResultError(err.Error()), nil
 	}
 
 	// 使用 Pipeline 模式进行检索（通过 Chat 服务，只需要检索部分）
 	chatReq := &service.ChatRequest{
-		Message:          query,
-		KnowledgeBaseIDs: kbIDs,
-		ForceCitation:    true,
+		Message:           query,
+		KnowledgeBaseIDs:  kbIDs,
+		RestrictRetrieval: true,
+		ForceCitation:     true,
 	}
 
 	resp, err := s.chatSvc.Chat(ctx, chatReq)
@@ -435,13 +559,7 @@ func (s *Server) handleKnowledgeSearch(ctx context.Context, req mcpProto.CallToo
 	// 格式化结果：回答 + 来源
 	var sb strings.Builder
 	sb.WriteString(resp.Answer)
-
-	if len(resp.Sources) > 0 {
-		sb.WriteString("\n\n---\n引用来源：\n")
-		for i, src := range resp.Sources {
-			sb.WriteString(fmt.Sprintf("%d. [%s] %s\n", i+1, src.DocID, truncateContent(src.Content, 200)))
-		}
-	}
+	appendSources(&sb, resp.Sources)
 
 	return mcpProto.NewToolResultText(sb.String()), nil
 }
@@ -454,12 +572,20 @@ func (s *Server) handleChat(ctx context.Context, req mcpProto.CallToolRequest) (
 	}
 
 	sessionID := req.GetString("session_id", "")
+	kbIDsStr := req.GetString("knowledge_base_ids", "")
 	useAgent := req.GetBool("use_agent", false)
 
+	kbIDs, err := s.resolveKnowledgeBaseIDs(ctx, parseKnowledgeBaseIDs(kbIDsStr), accessLevelRead)
+	if err != nil {
+		return mcpProto.NewToolResultError(err.Error()), nil
+	}
+
 	chatReq := &service.ChatRequest{
-		Message:   message,
-		SessionID: sessionID,
-		UseAgent:  useAgent,
+		Message:           message,
+		SessionID:         sessionID,
+		KnowledgeBaseIDs:  kbIDs,
+		RestrictRetrieval: true,
+		UseAgent:          useAgent,
 	}
 
 	resp, err := s.chatSvc.Chat(ctx, chatReq)
@@ -469,23 +595,38 @@ func (s *Server) handleChat(ctx context.Context, req mcpProto.CallToolRequest) (
 
 	var sb strings.Builder
 	sb.WriteString(resp.Answer)
-
-	if len(resp.Sources) > 0 {
-		sb.WriteString("\n\n---\n引用来源：\n")
-		for i, src := range resp.Sources {
-			sb.WriteString(fmt.Sprintf("%d. [%s] %s\n", i+1, src.DocID, truncateContent(src.Content, 200)))
-		}
-	}
+	appendSources(&sb, resp.Sources)
 
 	return mcpProto.NewToolResultText(sb.String()), nil
 }
 
 // handleListKnowledgeBases 处理知识库列表请求
 func (s *Server) handleListKnowledgeBases(ctx context.Context, _ mcpProto.CallToolRequest) (*mcpProto.CallToolResult, error) {
-	// tenantID=0 表示全局查询，limit 设为 100 足够
-	kbs, err := s.kbRepo.List(ctx, 0, 0, 100)
+	if s.kbRepo == nil {
+		return mcpProto.NewToolResultError("知识库仓储未初始化：数据库不可用"), nil
+	}
+
+	ids, err := s.resolveKnowledgeBaseIDs(ctx, nil, accessLevelRead)
 	if err != nil {
-		return mcpProto.NewToolResultError(fmt.Sprintf("获取知识库列表失败: %v", err)), nil
+		return mcpProto.NewToolResultError(fmt.Sprintf("获取知识库授权范围失败: %v", err)), nil
+	}
+
+	var kbs []*repository.KnowledgeBase
+	if len(ids) > 0 {
+		for _, id := range ids {
+			kb, err := s.kbRepo.GetByID(ctx, id)
+			if err != nil {
+				return mcpProto.NewToolResultError(fmt.Sprintf("获取知识库 %s 失败: %v", id, err)), nil
+			}
+			if kb != nil {
+				kbs = append(kbs, kb)
+			}
+		}
+	} else {
+		kbs, err = s.kbRepo.List(ctx, 0, 0, 100)
+		if err != nil {
+			return mcpProto.NewToolResultError(fmt.Sprintf("获取知识库列表失败: %v", err)), nil
+		}
 	}
 
 	if len(kbs) == 0 {
@@ -517,9 +658,16 @@ func (s *Server) handleListKnowledgeBases(ctx context.Context, _ mcpProto.CallTo
 
 // handleGetKnowledgeBase 处理知识库详情请求
 func (s *Server) handleGetKnowledgeBase(ctx context.Context, req mcpProto.CallToolRequest) (*mcpProto.CallToolResult, error) {
+	if s.kbRepo == nil {
+		return mcpProto.NewToolResultError("知识库仓储未初始化：数据库不可用"), nil
+	}
+
 	id, _ := req.RequireString("id")
 	if strings.TrimSpace(id) == "" {
 		return mcpProto.NewToolResultError("id 参数不能为空"), nil
+	}
+	if err := s.authorizeKnowledgeBase(ctx, id, accessLevelRead); err != nil {
+		return mcpProto.NewToolResultError(err.Error()), nil
 	}
 
 	kb, err := s.kbRepo.GetByID(ctx, id)
@@ -565,6 +713,9 @@ func (s *Server) handleGraphRAGQuery(ctx context.Context, req mcpProto.CallToolR
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
+	if err := s.authorizeKnowledgeBase(ctx, kbID, accessLevelRead); err != nil {
+		return mcpProto.NewToolResultError(err.Error()), nil
+	}
 
 	graph, err := s.graphRAG.GetGraphForVis(ctx, kbID, limit)
 	if err != nil {
@@ -573,8 +724,8 @@ func (s *Server) handleGraphRAGQuery(ctx context.Context, req mcpProto.CallToolR
 
 	// 构造摘要 + 数据
 	type graphSummary struct {
-		NodeCount int               `json:"node_count"`
-		EdgeCount int               `json:"edge_count"`
+		NodeCount int                `json:"node_count"`
+		EdgeCount int                `json:"edge_count"`
 		Nodes     []graphrag.VisNode `json:"nodes"`
 		Edges     []graphrag.VisEdge `json:"edges"`
 	}
@@ -682,18 +833,118 @@ func marshalToolResult(v any) (*mcpProto.CallToolResult, error) {
 	return mcpProto.NewToolResultText(string(data)), nil
 }
 
+// parseKnowledgeBaseIDs 解析逗号分隔的知识库 ID
+func parseKnowledgeBaseIDs(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+
+	parts := strings.Split(value, ",")
+	ids := make([]string, 0, len(parts))
+	for _, part := range parts {
+		id := strings.TrimSpace(part)
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+func normalizeKnowledgeBaseIDs(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	ids := make([]string, 0, len(values))
+	for _, value := range values {
+		id := strings.TrimSpace(value)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// appendSources 追加可追溯的引用来源信息
+func appendSources(sb *strings.Builder, sources []service.Source) {
+	if len(sources) == 0 {
+		return
+	}
+
+	sb.WriteString("\n\n---\n引用来源：\n")
+	for i, src := range sources {
+		metadata := src.Metadata
+		wikiTitle := metadataString(metadata, "wiki_title")
+		wikiPath := metadataString(metadata, "wiki_path")
+		pageType := metadataString(metadata, "wiki_page_type")
+		matchType := metadataString(metadata, "match_type")
+		kbID := metadataString(metadata, "knowledge_base_id")
+
+		title := wikiTitle
+		if title == "" {
+			title = src.DocID
+		}
+		if title == "" {
+			title = fmt.Sprintf("来源 %d", i+1)
+		}
+
+		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, title))
+		if src.DocID != "" {
+			sb.WriteString(fmt.Sprintf("   - source_id: %s\n", src.DocID))
+		}
+		if kbID != "" {
+			sb.WriteString(fmt.Sprintf("   - knowledge_base_id: %s\n", kbID))
+		}
+		if wikiPath != "" {
+			sb.WriteString(fmt.Sprintf("   - wiki_path: %s\n", wikiPath))
+		}
+		if pageType != "" {
+			sb.WriteString(fmt.Sprintf("   - wiki_page_type: %s\n", pageType))
+		}
+		if matchType != "" {
+			sb.WriteString(fmt.Sprintf("   - match_type: %s\n", matchType))
+		}
+		if strings.TrimSpace(src.Content) != "" {
+			sb.WriteString(fmt.Sprintf("   - snippet: %s\n", truncateContent(strings.TrimSpace(src.Content), 240)))
+		}
+	}
+}
+
+func metadataString(metadata map[string]interface{}, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	value, ok := metadata[key]
+	if !ok || value == nil {
+		return ""
+	}
+	if s, ok := value.(string); ok {
+		return strings.TrimSpace(s)
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
+}
+
 // truncateContent 截断内容到指定长度
 func truncateContent(s string, maxLen int) string {
-	if len(s) <= maxLen {
+	if maxLen <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= maxLen {
 		return s
 	}
-	return s[:maxLen] + "..."
+	return string(runes[:maxLen]) + "..."
 }
 
 // ── MCP 写入工具处理函数 ──
 
 // handleCreateKnowledgeBase 处理 create_knowledge_base 工具调用
 func (s *Server) handleCreateKnowledgeBase(ctx context.Context, request mcpProto.CallToolRequest) (*mcpProto.CallToolResult, error) {
+	if err := s.authorizeAdminTool(ctx); err != nil {
+		return mcpProto.NewToolResultError(err.Error()), nil
+	}
 	name := request.GetString("name", "")
 	desc := request.GetString("description", "")
 	mode := request.GetString("mode", "")
@@ -725,6 +976,12 @@ func (s *Server) handleImportURL(ctx context.Context, request mcpProto.CallToolR
 	if rawURL == "" {
 		return mcpProto.NewToolResultError("url 不能为空"), nil
 	}
+	if err := s.authorizeAdminTool(ctx); err != nil {
+		return mcpProto.NewToolResultError(err.Error()), nil
+	}
+	if err := s.authorizeKnowledgeBase(ctx, kbID, accessLevelWrite); err != nil {
+		return mcpProto.NewToolResultError(err.Error()), nil
+	}
 
 	knowledgeID, chunkCount, err := s.kbWriter.MCPImportURL(ctx, kbID, rawURL, title)
 	if err != nil {
@@ -745,6 +1002,12 @@ func (s *Server) handleDeleteKnowledgeBase(ctx context.Context, request mcpProto
 	if kbID == "" {
 		return mcpProto.NewToolResultError("knowledge_base_id 不能为空"), nil
 	}
+	if err := s.authorizeAdminTool(ctx); err != nil {
+		return mcpProto.NewToolResultError(err.Error()), nil
+	}
+	if err := s.authorizeKnowledgeBase(ctx, kbID, accessLevelAdmin); err != nil {
+		return mcpProto.NewToolResultError(err.Error()), nil
+	}
 	if err := s.kbWriter.MCPDeleteKB(ctx, kbID); err != nil {
 		return mcpProto.NewToolResultError(fmt.Sprintf("删除知识库失败: %v", err)), nil
 	}
@@ -756,6 +1019,9 @@ func (s *Server) handleListDocuments(ctx context.Context, request mcpProto.CallT
 	kbID := request.GetString("knowledge_base_id", "")
 	if kbID == "" {
 		return mcpProto.NewToolResultError("knowledge_base_id 不能为空"), nil
+	}
+	if err := s.authorizeKnowledgeBase(ctx, kbID, accessLevelRead); err != nil {
+		return mcpProto.NewToolResultError(err.Error()), nil
 	}
 	docs, err := s.kbWriter.MCPListDocuments(ctx, kbID)
 	if err != nil {
@@ -775,6 +1041,12 @@ func (s *Server) handleDeleteDocument(ctx context.Context, request mcpProto.Call
 	if kbID == "" || docID == "" {
 		return mcpProto.NewToolResultError("knowledge_base_id 和 document_id 不能为空"), nil
 	}
+	if err := s.authorizeAdminTool(ctx); err != nil {
+		return mcpProto.NewToolResultError(err.Error()), nil
+	}
+	if err := s.authorizeKnowledgeBase(ctx, kbID, accessLevelWrite); err != nil {
+		return mcpProto.NewToolResultError(err.Error()), nil
+	}
 	if err := s.kbWriter.MCPDeleteDocument(ctx, kbID, docID); err != nil {
 		return mcpProto.NewToolResultError(fmt.Sprintf("删除文档失败: %v", err)), nil
 	}
@@ -783,6 +1055,9 @@ func (s *Server) handleDeleteDocument(ctx context.Context, request mcpProto.Call
 
 // handleCloneCodeRepo 处理 clone_code_repo 工具调用
 func (s *Server) handleCloneCodeRepo(ctx context.Context, request mcpProto.CallToolRequest) (*mcpProto.CallToolResult, error) {
+	if err := s.authorizeAdminTool(ctx); err != nil {
+		return mcpProto.NewToolResultError(err.Error()), nil
+	}
 	repoURL := request.GetString("url", "")
 	name := request.GetString("name", "")
 	if repoURL == "" {
@@ -800,6 +1075,9 @@ func (s *Server) handleCloneCodeRepo(ctx context.Context, request mcpProto.CallT
 
 // handleIndexCodeRepo 处理 index_code_repo 工具调用
 func (s *Server) handleIndexCodeRepo(ctx context.Context, request mcpProto.CallToolRequest) (*mcpProto.CallToolResult, error) {
+	if err := s.authorizeAdminTool(ctx); err != nil {
+		return mcpProto.NewToolResultError(err.Error()), nil
+	}
 	name := request.GetString("name", "")
 	if name == "" {
 		return mcpProto.NewToolResultError("name 不能为空"), nil
@@ -842,7 +1120,13 @@ func (s *Server) httpContextFunc() func(ctx context.Context, r *http.Request) co
 		}
 		key := s.extractAPIKey(r)
 		_, valid := s.apiKeySet[key]
-		return context.WithValue(ctx, ctxKeyAuthenticated, valid)
+		ctx = context.WithValue(ctx, ctxKeyAuthenticated, valid)
+		if valid {
+			if scope, ok := s.scopes[key]; ok {
+				ctx = context.WithValue(ctx, ctxKeyScope, scope)
+			}
+		}
+		return ctx
 	}
 }
 

@@ -44,8 +44,8 @@ type compiledPage struct {
 const compilePrompt = `你是一个知识库编辑。请将以下原始文档编译为结构化的 wiki 页面。
 
 规则：
-1. 从文档中提取关键主题和实体，每个主题生成一个独立的 wiki 页面
-2. 每个页面应包含：标题、摘要、要点、详细内容
+1. 提取 1-5 个最重要的主题或实体，每个主题生成一个独立 wiki 页面
+2. 每个页面内容控制在 800 字以内，包含：摘要、关键要点、必要细节
 3. 使用 [[页面路径]] 语法标注交叉引用（引用其他页面）
 4. 页面路径使用小写英文+连字符，如 "kubernetes-pods.md"、"database-indexing.md"
 5. 如果文档内容较少（只有一个主题），可以只生成一个页面
@@ -57,7 +57,11 @@ const compilePrompt = `你是一个知识库编辑。请将以下原始文档编
 - type: 页面类型（"topic" 或 "entity"）
 - links: 本页引用的其他页面路径数组
 
-只输出 JSON 数组，不要输出其他内容。
+输出要求：
+- 只输出合法 JSON 数组
+- 不要输出 markdown 代码块
+- 不要输出解释、前言、后记或 <think> 内容
+- 必须确保 JSON 完整闭合
 
 原始文档标题：%s
 原始文档内容：
@@ -77,6 +81,7 @@ func (c *Compiler) Compile(ctx context.Context, kbID, knowledgeID, filename stri
 	// 调用 LLM 编译
 	prompt := fmt.Sprintf(compilePrompt, filename, content)
 	messages := []*schema.Message{
+		{Role: schema.System, Content: "你是严格的 JSON API。只能输出合法 JSON 数组，不得输出思考、解释、Markdown 或任何额外文本。"},
 		{Role: schema.User, Content: prompt},
 	}
 
@@ -214,12 +219,7 @@ func (c *Compiler) updateIndex(ctx context.Context, kbID string) error {
 
 // parseCompiledPages 解析 LLM 输出的 JSON 页面
 func parseCompiledPages(raw string) ([]*compiledPage, error) {
-	// 去除可能的 markdown 代码块标记
-	raw = strings.TrimSpace(raw)
-	raw = strings.TrimPrefix(raw, "```json")
-	raw = strings.TrimPrefix(raw, "```")
-	raw = strings.TrimSuffix(raw, "```")
-	raw = strings.TrimSpace(raw)
+	raw = normalizeLLMJSONOutput(raw)
 
 	var pages []*compiledPage
 	if err := json.Unmarshal([]byte(raw), &pages); err != nil {
@@ -246,6 +246,80 @@ func parseCompiledPages(raw string) ([]*compiledPage, error) {
 }
 
 // sanitizePath 将文件名转为合法的 wiki 路径
+func normalizeLLMJSONOutput(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if strings.HasPrefix(raw, "```json") {
+		raw = strings.TrimPrefix(raw, "```json")
+		raw = strings.TrimSuffix(raw, "```")
+		return strings.TrimSpace(raw)
+	}
+	if strings.HasPrefix(raw, "```") {
+		raw = strings.TrimPrefix(raw, "```")
+		raw = strings.TrimSuffix(raw, "```")
+		return strings.TrimSpace(raw)
+	}
+	if extracted, ok := extractBalancedJSONArray(raw); ok {
+		return extracted
+	}
+	return raw
+}
+
+func extractBalancedJSONArray(raw string) (string, bool) {
+	for start := strings.Index(raw, "["); start >= 0; {
+		if start+1 < len(raw) && raw[start+1] == '[' {
+			next := strings.Index(raw[start+2:], "[")
+			if next < 0 {
+				break
+			}
+			start += next + 2
+			continue
+		}
+		if end, ok := findJSONArrayEnd(raw, start); ok {
+			return strings.TrimSpace(raw[start : end+1]), true
+		}
+		next := strings.Index(raw[start+1:], "[")
+		if next < 0 {
+			break
+		}
+		start += next + 1
+	}
+	return "", false
+}
+
+func findJSONArrayEnd(raw string, start int) (int, bool) {
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(raw); i++ {
+		ch := raw[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			switch ch {
+			case '\\':
+				escaped = true
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inString = true
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				return i, true
+			}
+		}
+	}
+	return 0, false
+}
+
 func sanitizePath(filename string) string {
 	name := strings.TrimSuffix(filename, ".md")
 	name = strings.TrimSuffix(name, ".txt")

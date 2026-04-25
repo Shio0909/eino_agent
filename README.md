@@ -2,17 +2,29 @@
 
 基于字节跳动 [Eino](https://github.com/cloudwego/eino) 框架构建的多范式知识库问答平台，使用 Go 语言实现。
 
+项目定位是“企业知识中台 / RAG 能力服务”：后端提供向量检索、Wiki 知识库、GraphRAG、Code Search、MCP Export 等能力，前端提供知识库管理、聊天、引用和图谱浏览。
+
+## 设计目标
+
+> Demo 讲解稿见 `docs/SHOWCASE.md`。
+
+- **双知识库形态**：`vector` 模式负责语义召回，`wiki` 模式把文件/URL 编译成可浏览 Markdown 页面与交叉链接。
+- **多范式 RAG**：Pipeline RAG、Agentic ReAct 工具调用、GraphRAG、Code Search 可按场景组合。
+- **能力中台化**：HTTP API + MCP Export 对外暴露 `chat`、`knowledge_search`、KB 查询等高层能力，管理工具默认关闭。
+- **工程化导入链路**：本地/URL/异步队列/DocReader/MinerU 多解析路径，支持重排序、缓存和导入状态跟踪。
+- **安全与多租户**：JWT、租户隔离、Prompt Injection 检测、URL SSRF 防护和配置化 MCP API Key。
+
 ## 核心特性
 
 - **两种问答模式**：Pipeline（线性 RAG）和 Agentic（ReAct Agent + 工具调用，统一了 Agent 与 Agentic RAG）
-- **混合检索**：向量检索 + BM25 全文检索 RRF 融合，支持 pgvector / Milvus
+- **混合检索**：向量检索 + PostgreSQL FTS/ILIKE 全文检索 RRF 融合，支持 pgvector / Milvus
 - **Reranker**：BGE / Jina / Cohere 重排序，检索后自动精排
 - **流式输出**：所有模式均支持 SSE 流式响应，内置 DeepSeek `<think>` 标签过滤
 - **多租户**：JWT 鉴权 + 租户隔离，知识库和会话均按租户隔离
 - **MCP 工具**：通过 MCP 协议动态挂载远程工具（Streamable HTTP / SSE / Stdio）
 - **Eino Skill**：渐进式披露（Progressive Disclosure）skill 中间件，支持按请求动态选择技能
 - **智能分块**：支持 recursive / markdown / semantic / auto 四种分块策略，可选上下文增强（LLM 生成分块摘要前缀）
-- **Markdown 模式**：知识库可选「纯文本全文检索」模式，无需 embedding 模型，使用 PostgreSQL FTS 检索（适合 Markdown 文档/个人知识库）
+- **Wiki 模式**：知识库可选 `wiki` 模式，LLM 将文件/URL 编译为可浏览的 Markdown 页面和交叉链接，并使用 PostgreSQL FTS/ILIKE 检索（适合长期沉淀的结构化知识库）
 - **记忆系统**：Redis 短期缓存 + PostgreSQL 长期记忆（跨会话）
 - **安全防护**：Prompt Injection 检测 + SSRF 防护（URL 白名单/黑名单）
 - **GraphRAG**：Neo4j 实体关系图谱增强检索（可选）
@@ -40,7 +52,7 @@
 
 ### Pipeline 模式（线性 RAG）
 ```
-查询 → 查询重写 → 混合检索(向量+BM25) → RRF融合 → 重排序 → 构建上下文 → LLM 生成 → 回答
+查询 → 查询重写 → 混合检索(向量+FTS/ILIKE) → RRF融合 → 重排序 → 构建上下文 → LLM 生成 → 回答
 ```
 
 ### Agentic 模式（ReAct Agent + 工具调用）
@@ -95,6 +107,12 @@ eino_agent/
 ├── frontend-react/          # React 前端
 └── docker/                  # Docker 构建文件
 ```
+
+## 安全说明
+
+- `.env`、`configs/config.yaml`、`.tmp_*` 都是本地运行态/测试配置，不应提交。
+- 生产环境启用鉴权时必须配置强随机 `JWT_SECRET`、管理员密码和数据库密码。
+- 如果曾把真实 API Key 写入本地配置，请先轮换密钥，再公开仓库或截图。
 
 ## 快速开始
 
@@ -198,10 +216,13 @@ curl http://localhost:19093/health
 | `/api/v1/auth/me` | GET | 获取当前用户信息 |
 | `/api/v1/chat` | POST | 聊天（非流式） |
 | `/api/v1/chat/stream` | POST | 聊天（SSE 流式） |
-| `/api/v1/knowledge-bases` | GET/POST | 知识库列表 / 创建（支持 mode: vector/markdown） |
+| `/api/v1/knowledge-bases` | GET/POST | 知识库列表 / 创建（支持 mode: vector/wiki） |
 | `/api/v1/knowledge-bases/:id` | GET/PUT/DELETE | 知识库详情 / 更新 / 删除 |
 | `/api/v1/knowledge-bases/:id/documents` | POST/GET | 上传文档 / 文档列表 |
 | `/api/v1/knowledge-bases/:id/documents/url` | POST | 通过 URL 导入文档 |
+| `/api/v1/knowledge-bases/:id/wiki/pages` | GET | Wiki 页面列表 |
+| `/api/v1/knowledge-bases/:id/wiki/page?path=...` | GET | 读取 Wiki 页面 |
+| `/api/v1/knowledge-bases/:id/wiki/search?q=...` | GET | 搜索 Wiki 页面 |
 | `/api/v1/sessions` | GET/POST | 会话列表 / 创建 |
 | `/api/v1/sessions/:id` | GET/DELETE | 会话详情 / 删除 |
 | `/api/v1/sessions/:id/messages` | GET | 会话消息历史 |

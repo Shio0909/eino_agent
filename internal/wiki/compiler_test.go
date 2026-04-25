@@ -69,8 +69,8 @@ func TestParseCompiledPages(t *testing.T) {
 			},
 		},
 		{
-			name: "带 markdown 代码块包裹",
-			raw:  "```json\n[{\"path\":\"test.md\",\"title\":\"Test\",\"content\":\"c\",\"type\":\"topic\"}]\n```",
+			name:    "带 markdown 代码块包裹",
+			raw:     "```json\n[{\"path\":\"test.md\",\"title\":\"Test\",\"content\":\"c\",\"type\":\"topic\"}]\n```",
 			wantLen: 1,
 			wantErr: false,
 			checkFunc: func(t *testing.T, pages []*compiledPage) {
@@ -80,8 +80,8 @@ func TestParseCompiledPages(t *testing.T) {
 			},
 		},
 		{
-			name: "只有 ``` 包裹（无 json 标记）",
-			raw:  "```\n[{\"path\":\"test.md\",\"title\":\"Test\",\"content\":\"c\",\"type\":\"topic\"}]\n```",
+			name:    "只有 ``` 包裹（无 json 标记）",
+			raw:     "```\n[{\"path\":\"test.md\",\"title\":\"Test\",\"content\":\"c\",\"type\":\"topic\"}]\n```",
 			wantLen: 1,
 			wantErr: false,
 		},
@@ -117,8 +117,8 @@ func TestParseCompiledPages(t *testing.T) {
 			},
 		},
 		{
-			name: "缺少 title → 用 path 替代",
-			raw:  `[{"path": "test.md", "content": "c"}]`,
+			name:    "缺少 title → 用 path 替代",
+			raw:     `[{"path": "test.md", "content": "c"}]`,
 			wantLen: 1,
 			wantErr: false,
 			checkFunc: func(t *testing.T, pages []*compiledPage) {
@@ -128,8 +128,8 @@ func TestParseCompiledPages(t *testing.T) {
 			},
 		},
 		{
-			name: "缺少 type → 默认 topic",
-			raw:  `[{"path": "test.md", "title": "T", "content": "c"}]`,
+			name:    "缺少 type → 默认 topic",
+			raw:     `[{"path": "test.md", "title": "T", "content": "c"}]`,
 			wantLen: 1,
 			wantErr: false,
 			checkFunc: func(t *testing.T, pages []*compiledPage) {
@@ -143,6 +143,17 @@ func TestParseCompiledPages(t *testing.T) {
 			raw:     "  \n [{\"path\":\"a.md\",\"title\":\"A\",\"content\":\"c\",\"type\":\"topic\"}]  \n ",
 			wantLen: 1,
 			wantErr: false,
+		},
+		{
+			name:    "带思考标签和解释文本",
+			raw:     "<think>先分析文档结构，使用 [[交叉引用]] 语法</think>\n以下是 JSON：\n[{\"path\":\"real.md\",\"title\":\"真实输出\",\"content\":\"c\",\"type\":\"topic\"}]\n完成。",
+			wantLen: 1,
+			wantErr: false,
+			checkFunc: func(t *testing.T, pages []*compiledPage) {
+				if pages[0].Path != "real.md" {
+					t.Errorf("Path = %q, want %q", pages[0].Path, "real.md")
+				}
+			},
 		},
 	}
 

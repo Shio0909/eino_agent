@@ -4,6 +4,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"eino_agent/internal/database/postgres"
@@ -153,20 +154,57 @@ ORDER BY page_type, path`
 }
 
 func (r *pgWikiRepo) SearchPages(ctx context.Context, kbID string, query string, limit int) ([]*WikiPage, error) {
-	sqlQuery := `
+	// 提取关键词并构建 OR 查询，避免 plainto_tsquery 的 AND 语义
+	// 导致自然语言问句中的停用词(what/are/the)阻断整个匹配
+	keywords := extractSearchKeywords(query)
+	if len(keywords) == 0 {
+		return nil, nil
+	}
+
+	// 构建 OR-based tsquery: 'word1' | 'word2' | ...
+	orTsquery := strings.Join(keywords, " | ")
+
+	// 构建逐词 ILIKE 条件
+	ilikeConds := make([]string, 0, len(keywords))
+	ilikeArgs := make([]interface{}, 0, len(keywords))
+	argIdx := 4 // $1=kbID, $2=orTsquery, $3=limit
+	for _, kw := range keywords {
+		ilikeConds = append(ilikeConds, fmt.Sprintf(
+			"(CASE WHEN content ILIKE '%%' || $%d || '%%' THEN 0.1 ELSE 0 END + CASE WHEN title ILIKE '%%' || $%d || '%%' THEN 0.3 ELSE 0 END)",
+			argIdx, argIdx,
+		))
+		ilikeArgs = append(ilikeArgs, kw)
+		argIdx++
+	}
+	ilikeScoreExpr := strings.Join(ilikeConds, " + ")
+	if ilikeScoreExpr == "" {
+		ilikeScoreExpr = "0"
+	}
+
+	// 构建 ILIKE OR 匹配条件
+	ilikeMatchParts := make([]string, 0, len(keywords))
+	for i := range keywords {
+		idx := 4 + i
+		ilikeMatchParts = append(ilikeMatchParts, fmt.Sprintf("content ILIKE '%%' || $%d || '%%'", idx))
+		ilikeMatchParts = append(ilikeMatchParts, fmt.Sprintf("title ILIKE '%%' || $%d || '%%'", idx))
+	}
+	ilikeMatchExpr := strings.Join(ilikeMatchParts, " OR ")
+
+	sqlQuery := fmt.Sprintf(`
 SELECT id, knowledge_base_id, source_knowledge_id, path, title, content, page_type, metadata, created_at, updated_at,
-    (ts_rank_cd(to_tsvector('simple', content), plainto_tsquery('simple', $2))
-     + CASE WHEN content ILIKE '%' || $2 || '%' THEN 0.2 ELSE 0 END
-     + CASE WHEN title ILIKE '%' || $2 || '%' THEN 0.5 ELSE 0 END) AS score
+    (ts_rank_cd(to_tsvector('simple', content), to_tsquery('simple', $2))
+     + %s) AS score
 FROM wiki_pages
 WHERE knowledge_base_id = $1
-  AND (to_tsvector('simple', content) @@ plainto_tsquery('simple', $2)
-       OR content ILIKE '%' || $2 || '%'
-       OR title ILIKE '%' || $2 || '%')
+  AND (to_tsvector('simple', content) @@ to_tsquery('simple', $2)
+       OR %s)
 ORDER BY score DESC
-LIMIT $3`
+LIMIT $3`, ilikeScoreExpr, ilikeMatchExpr)
 
-	rows, err := r.db.Query(ctx, sqlQuery, kbID, query, limit)
+	args := []interface{}{kbID, orTsquery, limit}
+	args = append(args, ilikeArgs...)
+
+	rows, err := r.db.Query(ctx, sqlQuery, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -187,6 +225,54 @@ LIMIT $3`
 		pages = append(pages, p)
 	}
 	return pages, rows.Err()
+}
+
+// extractSearchKeywords 从查询中提取有意义的搜索关键词
+// 过滤英文停用词和过短的词，保留中文内容
+func extractSearchKeywords(query string) []string {
+	stopWords := map[string]bool{
+		"a": true, "an": true, "the": true, "is": true, "are": true, "was": true, "were": true,
+		"be": true, "been": true, "being": true, "have": true, "has": true, "had": true,
+		"do": true, "does": true, "did": true, "will": true, "would": true, "could": true,
+		"should": true, "may": true, "might": true, "shall": true, "can": true,
+		"what": true, "which": true, "who": true, "whom": true, "where": true, "when": true, "how": true, "why": true,
+		"that": true, "this": true, "these": true, "those": true,
+		"i": true, "me": true, "my": true, "we": true, "our": true, "you": true, "your": true,
+		"he": true, "him": true, "his": true, "she": true, "her": true, "it": true, "its": true, "they": true, "them": true, "their": true,
+		"of": true, "in": true, "on": true, "at": true, "to": true, "for": true, "with": true, "by": true, "from": true,
+		"about": true, "into": true, "through": true, "during": true, "before": true, "after": true,
+		"and": true, "or": true, "but": true, "not": true, "no": true, "if": true, "then": true,
+		"so": true, "as": true, "up": true, "out": true, "just": true, "also": true,
+		"tell": true, "please": true, "describe": true, "explain": true,
+	}
+
+	words := strings.Fields(query)
+	var keywords []string
+	for _, w := range words {
+		// 去除中英文标点
+		w = strings.TrimFunc(w, func(r rune) bool {
+			switch r {
+			case '.', ',', '!', '?', ';', ':', '"', '\'', '(', ')', '[', ']', '{', '}',
+				'\u3001', '\u3002', '\uff0c', '\uff01', '\uff1f', '\uff1b', '\uff1a',
+				'\u201c', '\u201d', '\u2018', '\u2019', '\uff08', '\uff09', '\u3010', '\u3011':
+				return true
+			}
+			return false
+		})
+		lower := strings.ToLower(w)
+		if len(w) == 0 {
+			continue
+		}
+		// 跳过英文停用词和单字符英文
+		if stopWords[lower] {
+			continue
+		}
+		if len(w) <= 1 && w[0] < 128 {
+			continue
+		}
+		keywords = append(keywords, lower)
+	}
+	return keywords
 }
 
 func (r *pgWikiRepo) DeletePagesByKnowledgeBase(ctx context.Context, kbID string) error {

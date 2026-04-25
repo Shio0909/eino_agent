@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -56,6 +57,9 @@ func (r *fakeKnowledgeBaseRepo) GetByID(_ context.Context, id string) (*reposito
 func (r *fakeKnowledgeBaseRepo) List(context.Context, int, int, int) ([]*repository.KnowledgeBase, error) {
 	return nil, nil
 }
+func (r *fakeKnowledgeBaseRepo) ListAccessible(context.Context, int, string, int, int) ([]*repository.KnowledgeBase, error) {
+	return nil, nil
+}
 func (r *fakeKnowledgeBaseRepo) Update(context.Context, *repository.KnowledgeBase) error { return nil }
 func (r *fakeKnowledgeBaseRepo) Delete(context.Context, string) error                    { return nil }
 func (r *fakeKnowledgeBaseRepo) IncrementCounts(_ context.Context, _ string, _ int, chunkDelta int) error {
@@ -63,6 +67,9 @@ func (r *fakeKnowledgeBaseRepo) IncrementCounts(_ context.Context, _ string, _ i
 	return nil
 }
 func (r *fakeKnowledgeBaseRepo) Count(context.Context, int) (int, error) { return 0, nil }
+func (r *fakeKnowledgeBaseRepo) CountAccessible(context.Context, int, string) (int, error) {
+	return 0, nil
+}
 func (r *fakeKnowledgeBaseRepo) UpdateEmbedFingerprint(context.Context, string, string) error {
 	return nil
 }
@@ -72,6 +79,7 @@ type fakeKnowledgeRepo struct {
 	updatedStatus map[string]string
 	updatedChunks map[string]int
 	updatedErrors map[string]string
+	nextID        int
 }
 
 func newFakeKnowledgeRepo(items map[string]*repository.Knowledge) *fakeKnowledgeRepo {
@@ -83,7 +91,20 @@ func newFakeKnowledgeRepo(items map[string]*repository.Knowledge) *fakeKnowledge
 	}
 }
 
-func (r *fakeKnowledgeRepo) Create(context.Context, *repository.Knowledge) error { return nil }
+func (r *fakeKnowledgeRepo) Create(_ context.Context, k *repository.Knowledge) error {
+	if r.items == nil {
+		r.items = make(map[string]*repository.Knowledge)
+	}
+	if k.ID == "" {
+		r.nextID++
+		k.ID = "doc-created-1"
+		if r.nextID > 1 {
+			k.ID = fmt.Sprintf("doc-created-%d", r.nextID)
+		}
+	}
+	r.items[k.ID] = k
+	return nil
+}
 func (r *fakeKnowledgeRepo) GetByID(_ context.Context, id string) (*repository.Knowledge, error) {
 	return r.items[id], nil
 }
@@ -111,9 +132,9 @@ func (r *fakeKnowledgeRepo) UpdateParseStatus(_ context.Context, id, status, err
 	}
 	return nil
 }
-func (r *fakeKnowledgeRepo) Delete(context.Context, string) error { return nil }
+func (r *fakeKnowledgeRepo) Delete(context.Context, string) error                      { return nil }
 func (r *fakeKnowledgeRepo) CountByKnowledgeBase(context.Context, string) (int, error) { return 0, nil }
-func (r *fakeKnowledgeRepo) UpdateContentHash(context.Context, string, string) error { return nil }
+func (r *fakeKnowledgeRepo) UpdateContentHash(context.Context, string, string) error   { return nil }
 
 func TestMarkKnowledgeCompletedUpdatesImportState(t *testing.T) {
 	store := newMemoryImportStateStore()

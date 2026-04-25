@@ -49,11 +49,17 @@ func (m *mockKBRepo) GetByID(_ context.Context, id string) (*repository.Knowledg
 func (m *mockKBRepo) List(_ context.Context, _ int, _, _ int) ([]*repository.KnowledgeBase, error) {
 	return m.kbs, m.err
 }
+func (m *mockKBRepo) ListAccessible(_ context.Context, _ int, _ string, _, _ int) ([]*repository.KnowledgeBase, error) {
+	return m.kbs, m.err
+}
 func (m *mockKBRepo) Update(_ context.Context, _ *repository.KnowledgeBase) error { return nil }
-func (m *mockKBRepo) Delete(_ context.Context, _ string) error                     { return nil }
-func (m *mockKBRepo) IncrementCounts(_ context.Context, _ string, _, _ int) error  { return nil }
-func (m *mockKBRepo) Count(_ context.Context, _ int) (int, error)                  { return 0, nil }
-func (m *mockKBRepo) UpdateEmbedFingerprint(_ context.Context, _, _ string) error  { return nil }
+func (m *mockKBRepo) Delete(_ context.Context, _ string) error                    { return nil }
+func (m *mockKBRepo) IncrementCounts(_ context.Context, _ string, _, _ int) error { return nil }
+func (m *mockKBRepo) Count(_ context.Context, _ int) (int, error)                 { return 0, nil }
+func (m *mockKBRepo) CountAccessible(_ context.Context, _ int, _ string) (int, error) {
+	return 0, nil
+}
+func (m *mockKBRepo) UpdateEmbedFingerprint(_ context.Context, _, _ string) error { return nil }
 
 type mockCodeSearchProvider struct {
 	result string
@@ -74,18 +80,24 @@ func (m *mockGraphRAGProvider) GetGraphForVis(_ context.Context, _ string, _ int
 }
 
 type mockCodeGraphRepo struct {
-	callers    []codegraph.CodeRelation
-	callees    []codegraph.CodeRelation
-	entities   []codegraph.CodeEntity
-	overview   *codegraph.RepoOverview
-	err        error
+	callers  []codegraph.CodeRelation
+	callees  []codegraph.CodeRelation
+	entities []codegraph.CodeEntity
+	overview *codegraph.RepoOverview
+	err      error
 }
 
-func (m *mockCodeGraphRepo) UpsertFile(_ context.Context, _ string, _ string, _ string) error { return nil }
-func (m *mockCodeGraphRepo) UpsertEntities(_ context.Context, _ string, _ []codegraph.CodeEntity) error { return nil }
-func (m *mockCodeGraphRepo) UpsertRelations(_ context.Context, _ string, _ []codegraph.CodeRelation) error { return nil }
+func (m *mockCodeGraphRepo) UpsertFile(_ context.Context, _ string, _ string, _ string) error {
+	return nil
+}
+func (m *mockCodeGraphRepo) UpsertEntities(_ context.Context, _ string, _ []codegraph.CodeEntity) error {
+	return nil
+}
+func (m *mockCodeGraphRepo) UpsertRelations(_ context.Context, _ string, _ []codegraph.CodeRelation) error {
+	return nil
+}
 func (m *mockCodeGraphRepo) DeleteFileGraph(_ context.Context, _ string, _ string) error { return nil }
-func (m *mockCodeGraphRepo) DeleteRepoGraph(_ context.Context, _ string) error { return nil }
+func (m *mockCodeGraphRepo) DeleteRepoGraph(_ context.Context, _ string) error           { return nil }
 func (m *mockCodeGraphRepo) FindCallers(_ context.Context, _ string, _ string, _ int) ([]codegraph.CodeRelation, error) {
 	return m.callers, m.err
 }
@@ -142,8 +154,8 @@ func TestTruncateContent(t *testing.T) {
 		{"等于限制", "hello", 5, "hello"},
 		{"超出限制", "hello world", 5, "hello..."},
 		{"空字符串", "", 5, ""},
-		{"零长度限制", "hello", 0, "..."},
-		{"中文截断", "你好世界测试", 6, "你好..."},
+		{"零长度限制", "hello", 0, ""},
+		{"中文截断", "你好世界测试", 2, "你好..."},
 	}
 
 	for _, tt := range tests {
@@ -213,6 +225,50 @@ func TestHandleKnowledgeSearch_Success(t *testing.T) {
 	}
 }
 
+func TestHandleKnowledgeSearch_RendersWikiSourceMetadata(t *testing.T) {
+	mock := &mockChatProvider{
+		resp: &service.ChatResponse{
+			Answer: "Go Slice 扩容会按容量区间增长。",
+			Sources: []service.Source{
+				{
+					DocID:   "page-1",
+					Content: "# Go语言Slice原理详解\n\n当往切片追加元素时，如果切片容量不足，会自动扩容。",
+					Metadata: map[string]interface{}{
+						"knowledge_base_id": "kb-go",
+						"wiki_path":         "slice-principles.md",
+						"wiki_title":        "Go语言Slice原理详解",
+						"wiki_page_type":    "topic",
+						"match_type":        "fts",
+					},
+				},
+			},
+		},
+	}
+	s := newTestServer(mock, &mockKBRepo{})
+
+	result, err := s.handleKnowledgeSearch(context.Background(), makeCallToolRequest(map[string]any{
+		"query": "Go Slice 扩容规则",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	text := getToolResultText(t, result)
+	for _, want := range []string{
+		"Go语言Slice原理详解",
+		"source_id: page-1",
+		"knowledge_base_id: kb-go",
+		"wiki_path: slice-principles.md",
+		"wiki_page_type: topic",
+		"match_type: fts",
+		"snippet:",
+	} {
+		if !contains(text, want) {
+			t.Errorf("result text should contain %q\ntext: %s", want, text)
+		}
+	}
+}
+
 func TestHandleKnowledgeSearch_WithKBIDs(t *testing.T) {
 	mock := &mockChatProvider{
 		resp: &service.ChatResponse{Answer: "answer"},
@@ -231,11 +287,55 @@ func TestHandleKnowledgeSearch_WithKBIDs(t *testing.T) {
 	if len(mock.lastReq.KnowledgeBaseIDs) != 3 {
 		t.Fatalf("KnowledgeBaseIDs len = %d, want 3", len(mock.lastReq.KnowledgeBaseIDs))
 	}
+	if !mock.lastReq.RestrictRetrieval {
+		t.Fatal("expected RestrictRetrieval = true")
+	}
 	want := []string{"kb-1", "kb-2", "kb-3"}
 	for i, id := range mock.lastReq.KnowledgeBaseIDs {
 		if id != want[i] {
 			t.Errorf("KnowledgeBaseIDs[%d] = %q, want %q", i, id, want[i])
 		}
+	}
+}
+
+func TestHandleKnowledgeSearch_RejectsOutOfScopeKBID(t *testing.T) {
+	mock := &mockChatProvider{resp: &service.ChatResponse{Answer: "answer"}}
+	s := newTestServer(mock, &mockKBRepo{})
+	ctx := context.WithValue(context.Background(), ctxKeyScope, mcpScope{
+		knowledgeBaseIDs: []string{"kb-allowed"},
+		kbRestricted:     true,
+	})
+
+	result, err := s.handleKnowledgeSearch(ctx, makeCallToolRequest(map[string]any{
+		"query":              "test",
+		"knowledge_base_ids": "kb-denied",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertToolError(t, result, "不在当前 MCP 凭据授权范围内")
+	if mock.lastReq != nil {
+		t.Fatal("chat service should not be called for out-of-scope KB")
+	}
+}
+
+func TestHandleKnowledgeSearch_UsesScopedKBIDsWhenRequestOmitsScope(t *testing.T) {
+	mock := &mockChatProvider{resp: &service.ChatResponse{Answer: "answer"}}
+	s := newTestServer(mock, &mockKBRepo{})
+	ctx := context.WithValue(context.Background(), ctxKeyScope, mcpScope{
+		knowledgeBaseIDs: []string{"kb-allowed"},
+		kbRestricted:     true,
+	})
+
+	result, err := s.handleKnowledgeSearch(ctx, makeCallToolRequest(map[string]any{
+		"query": "test",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertToolSuccess(t, result)
+	if len(mock.lastReq.KnowledgeBaseIDs) != 1 || mock.lastReq.KnowledgeBaseIDs[0] != "kb-allowed" {
+		t.Fatalf("KnowledgeBaseIDs = %#v, want [kb-allowed]", mock.lastReq.KnowledgeBaseIDs)
 	}
 }
 

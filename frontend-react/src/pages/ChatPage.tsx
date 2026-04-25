@@ -1,269 +1,147 @@
-import { useRef, useEffect, useState, useMemo, useCallback } from 'react'
-import { useShallow } from 'zustand/react/shallow'
-import { Sparkles, Database, ChevronDown, Download } from 'lucide-react'
-import { useChatStore } from '../stores/chat-store'
-import { useKnowledgeStore } from '../stores/knowledge-store'
-import ChatMessage from '../components/chat/ChatMessage'
-import ChatInput from '../components/chat/ChatInput'
-import ModeSelector from '../components/chat/ModeSelector'
-import AgentStepCard from '../components/chat/AgentStepCard'
-import PipelineViewer from '../components/chat/PipelineViewer'
-import ReferencePanel from '../components/chat/ReferencePanel'
-import ThinkingIndicator from '../components/chat/ThinkingIndicator'
-import { messagesToMarkdown, downloadMarkdown } from '../lib/export'
+import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { Bot, Plus, Send, User } from 'lucide-react';
+import { api } from '../lib/api';
+import { endpoints } from '../hooks/endpoints';
+import { useKnowledgeBases, useSessions } from '../hooks/queries';
+import { useWorkspaceStore } from '../store/workspace';
+import { Button } from '../components/ui/Button';
+import { Badge } from '../components/ui/Badge';
+import { Card } from '../components/ui/Card';
+import { Textarea } from '../components/ui/Textarea';
+import type { Message, ReferenceDocument, TraceStep } from '../types/api';
 
-const quickPrompts = [
-  '总结当前知识库的核心主题',
-  '给我一个可执行的 RAG 调优清单',
-  '对比 Pipeline 和 Agent 模式差异',
-  '帮我设计文档导入与评测流程',
-]
+interface ChatPageProps {
+  onEvidence: (references: ReferenceDocument[], trace: TraceStep[], streaming: boolean) => void;
+}
 
-const skillOptions = [
-  { name: 'citation-generator', label: '引用生成' },
-  { name: 'document-analyzer', label: '文档分析' },
-  { name: 'compare-documents', label: '文档对比' },
-  { name: 'table-data-processor', label: '数据处理' },
-]
+export function ChatPage({ onEvidence }: ChatPageProps) {
+  const { data: kbData } = useKnowledgeBases();
+  const { data: sessionsData, refetch: refetchSessions } = useSessions();
+  const selectedSessionId = useWorkspaceStore((state) => state.selectedSessionId);
+  const setSelectedSessionId = useWorkspaceStore((state) => state.setSelectedSessionId);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [input, setInput] = useState('');
+  const [mode, setMode] = useState('agentic');
+  const [knowledgeBaseIds, setKnowledgeBaseIds] = useState<string[]>([]);
+  const [streaming, setStreaming] = useState(false);
+  const abortRef = useRef<AbortController | null>(null);
 
-export default function ChatPage() {
-  // Split selectors to minimize re-renders
-  const messages = useChatStore((s) => s.messages)
-  const streaming = useChatStore((s) => s.streaming)
-  const streamContent = useChatStore((s) => s.streamContent)
-  const mode = useChatStore((s) => s.mode)
-  const resolvedMode = useChatStore((s) => s.resolvedMode)
-  const agentSteps = useChatStore((s) => s.agentSteps)
-  const references = useChatStore((s) => s.references)
-  const pipelineStatus = useChatStore((s) => s.pipelineStatus)
-  const { forceCitation, enableSkills, selectedSkills, selectedKBIds } = useChatStore(
-    useShallow((s) => ({
-      forceCitation: s.forceCitation,
-      enableSkills: s.enableSkills,
-      selectedSkills: s.selectedSkills,
-      selectedKBIds: s.selectedKBIds,
-    })),
-  )
-  const sendMessage = useChatStore((s) => s.sendMessage)
-  const regenerateLastMessage = useChatStore((s) => s.regenerateLastMessage)
-  const setForceCitation = useChatStore((s) => s.setForceCitation)
-  const setEnableSkills = useChatStore((s) => s.setEnableSkills)
-  const toggleSkill = useChatStore((s) => s.toggleSkill)
-  const toggleKB = useChatStore((s) => s.toggleKB)
+  const sessions = sessionsData?.sessions ?? [];
+  const kbs = kbData?.knowledge_bases ?? [];
+  const activeRefs = useMemo(() => messages.at(-1)?.trace ?? [], [messages]);
 
-  const { knowledgeBases, loadKBs } = useKnowledgeStore()
-  const [showKBPicker, setShowKBPicker] = useState(false)
-  const scrollRef = useRef<HTMLDivElement>(null)
-  const abortRef = useRef<AbortController | null>(null)
-  const streamStartRef = useRef('')
-
-  useEffect(() => { loadKBs() }, [loadKBs])
-
-  // Abort SSE stream on unmount to prevent memory leaks
-  useEffect(() => () => { abortRef.current?.abort() }, [])
-
-  // Smart auto-scroll: only scroll if user is near the bottom
   useEffect(() => {
-    const el = scrollRef.current
-    if (!el) return
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120
-    if (nearBottom) el.scrollTop = el.scrollHeight
-  }, [messages, streamContent, agentSteps])
+    if (!selectedSessionId) return;
+    endpoints.sessionMessages(selectedSessionId).then((response) => setMessages(response.messages ?? [])).catch(() => setMessages([]));
+  }, [selectedSessionId]);
 
-  const handleSend = useCallback((query: string) => {
-    const controller = new AbortController()
-    abortRef.current = controller
-    streamStartRef.current = new Date().toISOString()
-    sendMessage(query, controller.signal)
-  }, [sendMessage])
+  useEffect(() => {
+    const lastAssistant = [...messages].reverse().find((message) => message.role === 'assistant');
+    onEvidence([], lastAssistant?.trace ?? activeRefs, streaming);
+  }, [activeRefs, messages, onEvidence, streaming]);
 
-  const handleStop = useCallback(() => { abortRef.current?.abort() }, [])
+  const toggleKb = (id: string) => {
+    setKnowledgeBaseIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
+  };
 
-  const handleExport = useCallback(() => {
-    const msgs = useChatStore.getState().messages
-    if (msgs.length === 0) return
-    const title = msgs[0]?.content.slice(0, 30) || '对话'
-    const md = messagesToMarkdown(msgs, title)
-    const ts = new Date().toISOString().slice(0, 10)
-    downloadMarkdown(`eino-chat-${ts}.md`, md)
-  }, [])
+  const newSession = async () => {
+    const session = await endpoints.createSession('新会话', knowledgeBaseIds);
+    setSelectedSessionId(session.id);
+    setMessages([]);
+    refetchSessions();
+  };
 
-  const handleRegenerate = useCallback(() => {
-    const controller = new AbortController()
-    abortRef.current = controller
-    streamStartRef.current = new Date().toISOString()
-    regenerateLastMessage(controller.signal)
-  }, [regenerateLastMessage])
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    const message = input.trim();
+    if (!message || streaming) return;
+    setInput('');
+    setStreaming(true);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const userMessage: Message = { role: 'user', content: message };
+    const assistantMessage: Message = { role: 'assistant', content: '', trace: [] };
+    setMessages((current) => [...current, userMessage, assistantMessage]);
+    const references: ReferenceDocument[] = [];
+    const trace: TraceStep[] = [];
 
-  // Stable streaming message object — only recreated when streamContent changes
-  const streamingMessage = useMemo(() => ({
-    id: 'streaming',
-    session_id: '',
-    role: 'assistant' as const,
-    content: streamContent,
-    created_at: streamStartRef.current || new Date().toISOString(),
-  }), [streamContent])
-
-  const isEmpty = messages.length === 0 && !streaming
+    try {
+      await api.stream('/chat/stream', {
+        message,
+        session_id: selectedSessionId || undefined,
+        mode,
+        knowledge_base_ids: knowledgeBaseIds,
+        force_citation: knowledgeBaseIds.length > 0,
+      }, (event) => {
+        if (event.type === 'done') return;
+        if (event.sources?.length) references.splice(0, references.length, ...event.sources);
+        if (event.trace_step) trace.push(event.trace_step);
+        if (event.session_id && !selectedSessionId) setSelectedSessionId(event.session_id);
+        if (event.content) {
+          setMessages((current) => current.map((item, index) => index === current.length - 1 ? { ...item, content: `${item.content}${event.content}`, trace } : item));
+        }
+        onEvidence([...references], [...trace], true);
+      }, controller.signal);
+      refetchSessions();
+    } catch (err) {
+      setMessages((current) => current.map((item, index) => index === current.length - 1 ? { ...item, content: err instanceof Error ? err.message : '请求失败' } : item));
+    } finally {
+      setStreaming(false);
+      onEvidence([...references], [...trace], false);
+      abortRef.current = null;
+    }
+  };
 
   return (
-    <div className="flex-1 flex flex-col h-full min-w-0">
-      {/* Header */}
-      <header className="h-14 shrink-0 border-b border-[var(--color-border-subtle)] bg-[var(--color-bg-primary)] px-8 flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <p className="text-base font-semibold text-[var(--color-text-primary)]">Eino Agent</p>
-          {/* Context indicators */}
-          <div className="flex items-center gap-1.5">
-            <span className="px-2 py-0.5 rounded-md text-[11px] font-medium bg-[var(--color-accent-light)] text-[var(--color-accent)]">
-              {resolvedMode || mode}
-            </span>
-            {selectedKBIds.length > 0 ? (
-              <>
-                {knowledgeBases.filter(kb => selectedKBIds.includes(kb.id)).slice(0, 2).map(kb => (
-                  <span key={kb.id} className="px-2 py-0.5 rounded-md text-[11px] font-medium bg-[var(--color-bg-tertiary)] text-[var(--color-text-secondary)] truncate max-w-[120px]">
-                    {kb.name}
-                  </span>
-                ))}
-                {selectedKBIds.length > 2 && (
-                  <span className="px-1.5 py-0.5 rounded-md text-[11px] font-medium bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)]">
-                    +{selectedKBIds.length - 2}
-                  </span>
-                )}
-              </>
-            ) : (
-              <span className="px-2 py-0.5 rounded-md text-[11px] bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)]">
-                全部知识库
-              </span>
-            )}
-          </div>
+    <div className="grid h-full min-h-0 gap-4 lg:grid-cols-[18rem_minmax(0,1fr)]">
+      <Card className="min-h-0 p-4">
+        <div className="flex items-center justify-between">
+          <h3 className="font-display text-xl font-semibold">会话</h3>
+          <Button className="px-3" onClick={newSession}><Plus className="h-4 w-4" /></Button>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={handleExport}
-            disabled={messages.length === 0}
-            title="导出 Markdown"
-            className="p-2 rounded-lg text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-tertiary)] transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-          >
-            <Download size={16} />
-          </button>
-          <ModeSelector />
-        </div>
-      </header>
-
-      {/* Messages */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto">
-        {isEmpty ? (
-          <div className="h-full flex flex-col items-center justify-center px-8">
-            <div className="w-16 h-16 rounded-2xl bg-[var(--color-accent-light)] flex items-center justify-center mb-5">
-              <Sparkles size={32} className="text-[var(--color-accent)]" />
-            </div>
-            <h2 className="text-2xl font-semibold mb-2 text-[var(--color-text-primary)]">欢迎使用 Eino Agent</h2>
-            <p className="text-base text-[var(--color-text-muted)] mb-8">提问、检索知识库、调用工具完成复杂任务</p>
-            <div className="grid grid-cols-2 gap-3 w-full max-w-2xl">
-              {quickPrompts.map((prompt) => (
-                <button
-                  key={prompt}
-                  onClick={() => handleSend(prompt)}
-                  className="text-left px-5 py-4 rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-card)] hover:bg-[var(--color-bg-tertiary)] transition-colors text-sm text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] leading-relaxed"
-                >
-                  {prompt}
-                </button>
-              ))}
-            </div>
-          </div>
-        ) : (
-          <div className="py-4 px-8 lg:px-16 xl:px-24">
-            {messages.map((msg, idx) => (
-              <ChatMessage
-                key={msg.id}
-                message={msg}
-                isLast={idx === messages.length - 1 && msg.role === 'assistant'}
-                onRegenerate={handleRegenerate}
-                regenerating={streaming}
-              />
-            ))}
-            {streaming && streamContent && (
-              <ChatMessage message={streamingMessage} isStreaming />
-            )}
-            {streaming && !streamContent && (
-              <ThinkingIndicator />
-            )}
-            {streaming && agentSteps.length > 0 && (
-              <div className="ml-12"><AgentStepCard steps={agentSteps} live /></div>
-            )}
-            {streaming && pipelineStatus && mode === 'pipeline' && (
-              <div className="ml-12"><PipelineViewer status={pipelineStatus} /></div>
-            )}
-            {streaming && references.length > 0 && (
-              <div className="ml-12"><ReferencePanel references={references} /></div>
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* Input area */}
-      <div className="border-t border-[var(--color-border-subtle)] bg-[var(--color-bg-primary)] px-8 lg:px-16 xl:px-24 pt-3 pb-4">
-        <div className="mb-2.5 flex flex-wrap items-center gap-4 text-sm text-[var(--color-text-secondary)]">
-          <label className="inline-flex items-center gap-2 cursor-pointer select-none">
-            <input type="checkbox" checked={forceCitation} onChange={(e) => setForceCitation(e.target.checked)} className="accent-[var(--color-accent)] w-4 h-4" />
-            <span>引用强制</span>
-          </label>
-          <label className="inline-flex items-center gap-2 cursor-pointer select-none">
-            <input type="checkbox" checked={enableSkills} onChange={(e) => setEnableSkills(e.target.checked)} className="accent-[var(--color-accent)] w-4 h-4" />
-            <span>Skills</span>
-          </label>
-          <div className="relative">
-            <button
-              onClick={() => setShowKBPicker(!showKBPicker)}
-              className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-[var(--color-border)] hover:bg-[var(--color-bg-tertiary)] transition-colors"
-            >
-              <Database size={14} />
-              <span>知识库{selectedKBIds.length > 0 ? ` (${selectedKBIds.length})` : ''}</span>
-              <ChevronDown size={14} />
+        <div className="mt-4 max-h-48 space-y-2 overflow-auto lg:max-h-none">
+          {sessions.map((session) => (
+            <button key={session.id} onClick={() => setSelectedSessionId(session.id)} className="focus-ring w-full rounded-2xl border border-border/70 bg-surface/45 p-3 text-left text-sm hover:bg-text/5">
+              <span className="block truncate font-semibold">{session.title || '未命名会话'}</span>
+              <span className="font-mono text-xs text-muted">{session.id.slice(0, 8)}</span>
             </button>
-            {showKBPicker && (
-              <div className="absolute bottom-full left-0 mb-2 w-60 rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-card)] shadow-lg p-2 z-20">
-                {knowledgeBases.length === 0 ? (
-                  <p className="text-sm text-[var(--color-text-muted)] px-3 py-2">暂无知识库</p>
-                ) : (
-                  knowledgeBases.map((kb) => (
-                    <label key={kb.id} className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-[var(--color-bg-tertiary)] cursor-pointer">
-                      <input type="checkbox" checked={selectedKBIds.includes(kb.id)} onChange={() => toggleKB(kb.id)} className="accent-[var(--color-accent)] w-4 h-4" />
-                      <div className="flex-1 min-w-0">
-                        <p className="text-sm text-[var(--color-text-primary)] truncate">{kb.name}</p>
-                        <p className="text-xs text-[var(--color-text-muted)]">{kb.document_count} docs</p>
-                      </div>
-                    </label>
-                  ))
-                )}
-              </div>
-            )}
+          ))}
+        </div>
+        <div className="mt-5 border-t border-border/70 pt-4">
+          <label className="text-sm font-semibold">模式</label>
+          <select value={mode} onChange={(event) => setMode(event.target.value)} className="focus-ring mt-2 w-full rounded-xl border-border/80 bg-panel/80 text-sm">
+            <option value="pipeline">Pipeline RAG</option>
+            <option value="agentic">Agentic</option>
+          </select>
+          <div className="mt-4 space-y-2">
+            <p className="text-sm font-semibold">知识库</p>
+            {kbs.map((kb) => (
+              <label key={kb.id} className="flex cursor-pointer items-center gap-2 rounded-xl px-2 py-1.5 hover:bg-text/5">
+                <input type="checkbox" checked={knowledgeBaseIds.includes(kb.id)} onChange={() => toggleKb(kb.id)} className="rounded border-border text-primary" />
+                <span className="truncate text-sm">{kb.name}</span>
+                <Badge tone={kb.mode === 'wiki' ? 'accent' : 'primary'}>{kb.mode}</Badge>
+              </label>
+            ))}
           </div>
         </div>
-
-        {enableSkills && (
-          <div className="flex flex-wrap gap-2 mb-2.5">
-            {skillOptions.map((item) => {
-              const active = selectedSkills.includes(item.name)
-              return (
-                <button
-                  key={item.name}
-                  onClick={() => toggleSkill(item.name)}
-                  className={`px-3 py-1.5 rounded-lg border text-sm transition-colors ${
-                    active
-                      ? 'border-[var(--color-accent)] bg-[var(--color-accent-light)] text-[var(--color-accent)]'
-                      : 'border-[var(--color-border)] text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)]'
-                  }`}
-                >
-                  {item.label}
-                </button>
-              )
-            })}
-          </div>
-        )}
-
-        <ChatInput onSend={handleSend} onStop={handleStop} streaming={streaming} />
-      </div>
+      </Card>
+      <Card className="flex min-h-0 flex-col p-5">
+        <div className="min-h-0 flex-1 space-y-4 overflow-auto pr-1">
+          {messages.length === 0 ? <div className="grid h-full place-items-center text-center"><div><h3 className="font-display text-3xl font-semibold">问一个需要证据的问题</h3><p className="mt-3 text-muted">选择知识库后，引用和工具步骤会实时出现在右侧。</p></div></div> : messages.map((message, index) => (
+            <article key={index} className={`flex gap-3 ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+              {message.role !== 'user' ? <Bot className="mt-3 h-5 w-5 text-primary" /> : null}
+              <div className={`max-w-[82%] rounded-3xl px-4 py-3 ${message.role === 'user' ? 'bg-text text-surface' : 'bg-surface/70'}`}>
+                <p className="whitespace-pre-wrap text-sm leading-6">{message.content || (streaming ? '思考中…' : '')}</p>
+              </div>
+              {message.role === 'user' ? <User className="mt-3 h-5 w-5 text-accent" /> : null}
+            </article>
+          ))}
+        </div>
+        <form className="mt-4 flex gap-3" onSubmit={submit}>
+          <Textarea rows={3} value={input} onChange={(event) => setInput(event.target.value)} placeholder="询问知识库、代码库或让 Agent 调用工具…" onKeyDown={(event) => { if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) submit(event); }} />
+          <Button className="self-end px-5" disabled={streaming || !input.trim()}>{streaming ? '生成中' : <Send className="h-5 w-5" />}</Button>
+        </form>
+      </Card>
     </div>
-  )
+  );
 }
