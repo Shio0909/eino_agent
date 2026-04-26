@@ -178,7 +178,7 @@ check:
 
 # 在 Docker 中运行迁移
 migrate:
-	docker compose exec postgres psql -U eino -d eino_rag -f /docker-entrypoint-initdb.d/000001_init.up.sql
+	docker compose run --rm app ./eino-rag -config configs/config.yaml -migrate
 
 # 进入 PostgreSQL Shell
 db-shell:
@@ -186,7 +186,7 @@ db-shell:
 
 # 本地运行迁移
 migrate-local:
-	psql -h localhost -U eino -d eino_rag -f migrations/000001_init.up.sql
+	go run ./cmd/server -config configs/config.yaml -migrate
 
 # =====================
 # 工具命令

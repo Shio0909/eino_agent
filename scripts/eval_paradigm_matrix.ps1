@@ -13,7 +13,7 @@ $datasets = @(
   @{ name = 'large'; path = 'data/eval_public_go_large.jsonl'; rounds = 3 }
 )
 
-$modes = @('pipeline', 'agent', 'agentic_rag')
+$modes = @('pipeline', 'agentic')
 
 function Parse-Metric {
   param(

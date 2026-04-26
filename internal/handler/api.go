@@ -493,7 +493,7 @@ type ReferenceDocument struct {
 
 // Chat 聊天接口
 // @Summary 聊天问答
-// @Description 发送消息并获取 AI 回答，支持 Pipeline/Agent/Agentic RAG 三种模式
+// @Description 发送消息并获取 AI 回答，支持 Pipeline 和 Agentic 两种模式
 // @Tags 聊天
 // @Accept json
 // @Produce json
@@ -529,14 +529,12 @@ func (h *Handler) Chat(c *gin.Context) {
 	}
 
 	// 调用聊天服务
-	// "agent", "agentic", "agentic_rag" 统一走 Agentic 模式
-	useAgent := req.UseAgent || strings.EqualFold(req.Mode, "agent") || strings.EqualFold(req.Mode, "agentic") || strings.EqualFold(req.Mode, "agentic_rag")
+	var useAgent bool
+	req.Mode, useAgent = normalizeChatMode(req.Mode, req.UseAgent)
 	if decision.DisableToolCalls {
 		log.Printf("[Security][Chat] downgrade to pipeline: level=%s rules=%v", decision.Level, decision.MatchedRules)
 		useAgent = false
-		if strings.EqualFold(req.Mode, "agent") || strings.EqualFold(req.Mode, "agentic") || strings.EqualFold(req.Mode, "agentic_rag") {
-			req.Mode = "pipeline"
-		}
+		req.Mode = "pipeline"
 	}
 	allowedKBIDs, ok := h.resolveAuthorizedKnowledgeBaseIDs(c, req.KnowledgeBaseIDs)
 	if !ok {
@@ -612,14 +610,12 @@ func (h *Handler) ChatStream(c *gin.Context) {
 	}
 
 	// 使用流式响应
-	// "agent", "agentic", "agentic_rag" 统一走 Agentic 模式
-	useAgent := req.UseAgent || strings.EqualFold(req.Mode, "agent") || strings.EqualFold(req.Mode, "agentic") || strings.EqualFold(req.Mode, "agentic_rag")
+	var useAgent bool
+	req.Mode, useAgent = normalizeChatMode(req.Mode, req.UseAgent)
 	if decision.DisableToolCalls {
 		log.Printf("[Security][ChatStream] downgrade to pipeline: level=%s rules=%v", decision.Level, decision.MatchedRules)
 		useAgent = false
-		if strings.EqualFold(req.Mode, "agent") || strings.EqualFold(req.Mode, "agentic") || strings.EqualFold(req.Mode, "agentic_rag") {
-			req.Mode = "pipeline"
-		}
+		req.Mode = "pipeline"
 	}
 	allowedKBIDs, ok := h.resolveAuthorizedKnowledgeBaseIDs(c, req.KnowledgeBaseIDs)
 	if !ok {

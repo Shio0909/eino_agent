@@ -46,7 +46,7 @@ $retrievalConfigs = @(
   @{ name='hybrid_rrf_rerank';enable_hybrid=$true;  enable_rerank=$true;  enable_rewrite=$false }
 )
 
-$modes = @('pipeline','agent','agentic_rag')
+$modes = @('pipeline','agentic')
 $rows = @()
 
 function Parse-Metric([string]$content,[string]$name){

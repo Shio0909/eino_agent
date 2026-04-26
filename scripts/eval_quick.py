@@ -80,7 +80,7 @@ def main():
     parser = argparse.ArgumentParser(description="Quick RAGAS eval")
     parser.add_argument("--dataset", type=str, default=str(DATASET_PATH), help="Path to eval JSONL")
     parser.add_argument("--kb", type=str, default="", help="Knowledge base name or ID (comma-separated for multiple)")
-    parser.add_argument("--mode", type=str, default="pipeline", help="Chat mode: pipeline|agent|agentic_rag")
+    parser.add_argument("--mode", type=str, default="pipeline", help="Chat mode: pipeline|agentic")
     parser.add_argument("--eval-model", type=str, default="", help="Override LLM model for RAGAS evaluation (e.g. Pro/MiniMaxAI/MiniMax-M2.5)")
     parser.add_argument("--rerank", action="store_true", help="Enable reranking")
     parser.add_argument("--rewrite", action="store_true", help="Enable query rewrite")

@@ -15,14 +15,10 @@ $combos = @(
     @{ Mode = "pipeline"; Strategy = "hybrid" },
     @{ Mode = "pipeline"; Strategy = "hybrid_rerank" },
     @{ Mode = "pipeline"; Strategy = "full" },
-    @{ Mode = "agent"; Strategy = "vector" },
-    @{ Mode = "agent"; Strategy = "hybrid" },
-    @{ Mode = "agent"; Strategy = "hybrid_rerank" },
-    @{ Mode = "agent"; Strategy = "full" },
-    @{ Mode = "agentic_rag"; Strategy = "vector" },
-    @{ Mode = "agentic_rag"; Strategy = "hybrid" },
-    @{ Mode = "agentic_rag"; Strategy = "hybrid_rerank" },
-    @{ Mode = "agentic_rag"; Strategy = "full" }
+    @{ Mode = "agentic"; Strategy = "vector" },
+    @{ Mode = "agentic"; Strategy = "hybrid" },
+    @{ Mode = "agentic"; Strategy = "hybrid_rerank" },
+    @{ Mode = "agentic"; Strategy = "full" }
 )
 
 $total = $combos.Count

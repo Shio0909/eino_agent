@@ -4,7 +4,7 @@
 //
 // @title Eino RAG Agent API
 // @version 1.0.0
-// @description 基于字节跳动 Eino 框架的智能知识库问答系统。支持 Pipeline RAG、ReAct Agent、Agentic RAG 三种模式。
+// @description 基于字节跳动 Eino 框架的智能知识库问答系统。支持 Pipeline 和 Agentic 两种问答模式。
 // @host localhost:8080
 // @BasePath /api/v1
 // @schemes http
@@ -35,19 +35,19 @@ import (
 	"eino_agent/internal/config"
 	"eino_agent/internal/container"
 	"eino_agent/internal/database/postgres"
+	"eino_agent/internal/database/repository"
 	"eino_agent/internal/docreader"
 	"eino_agent/internal/document"
 	"eino_agent/internal/graphrag"
 	"eino_agent/internal/handler"
 	"eino_agent/internal/importqueue"
 	"eino_agent/internal/logger"
-	"eino_agent/internal/metrics"
 	mcpmanager "eino_agent/internal/mcp"
+	"eino_agent/internal/metrics"
 	"eino_agent/internal/rediscache"
 	"eino_agent/internal/service"
 	"eino_agent/internal/tool"
 	"eino_agent/internal/wiki"
-	"eino_agent/internal/database/repository"
 )
 
 func main() {
@@ -147,7 +147,12 @@ func main() {
 
 		// 运行迁移
 		if db != nil && *migrateDB {
-			log.Println("[Database] 跳过自动迁移，请手动运行: psql -f migrations/000001_init.up.sql")
+			result, err := db.RunMigrations(ctx, "migrations")
+			if err != nil {
+				log.Fatalf("[Database] 迁移失败: %v", err)
+			}
+			log.Printf("[Database] 迁移完成: applied=%v skipped=%v", result.Applied, result.Skipped)
+			return
 		}
 	}
 
@@ -393,8 +398,8 @@ func main() {
 	if cfg.Agent.EnableCodeGraph && cfg.GraphRAG.Enabled {
 		log.Println("[CodeGraph] 初始化代码知识图谱...")
 		codeGraphCfg := &graphrag.Config{
-			Enabled:  true,
-			Neo4jURI: cfg.GraphRAG.Neo4jURI,
+			Enabled:   true,
+			Neo4jURI:  cfg.GraphRAG.Neo4jURI,
 			Neo4jUser: cfg.GraphRAG.Neo4jUsername,
 			Neo4jPass: cfg.GraphRAG.Neo4jPassword,
 		}

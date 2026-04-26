@@ -22,7 +22,7 @@ const docTemplate = `{
     "paths": {
         "/chat": {
             "post": {
-                "description": "发送消息并获取 AI 回答，支持 Pipeline/Agent/Agentic RAG 三种模式",
+                "description": "发送消息并获取 AI 回答，支持 Pipeline 和 Agentic 两种模式",
                 "consumes": [
                     "application/json"
                 ],
@@ -1178,7 +1178,7 @@ var SwaggerInfo = &swag.Spec{
 	BasePath:         "/api/v1",
 	Schemes:          []string{"http"},
 	Title:            "Eino RAG Agent API",
-	Description:      "基于字节跳动 Eino 框架的智能知识库问答系统。支持 Pipeline RAG、ReAct Agent、Agentic RAG 三种模式。",
+	Description:      "基于字节跳动 Eino 框架的智能知识库问答系统。支持 Pipeline 和 Agentic 两种问答模式。",
 	InfoInstanceName: "swagger",
 	SwaggerTemplate:  docTemplate,
 	LeftDelim:        "{{",

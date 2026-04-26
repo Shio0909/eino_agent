@@ -32,7 +32,7 @@
 
 做 3 组 A/B 对比（每组跑全量问题集）：
 
-1. Pipeline vs Agent vs Agentic RAG
+1. Pipeline vs Agentic
 2. Reranker On vs Off
 3. Query Rewrite On vs Off
 
