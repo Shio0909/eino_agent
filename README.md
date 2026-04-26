@@ -16,7 +16,7 @@
 
 ## 核心特性
 
-- **两种问答模式**：Pipeline（线性 RAG）和 Agentic（ReAct Agent + 工具调用，统一了 Agent 与 Agentic RAG）
+- **两种问答模式**：Pipeline（线性 RAG）和 Agentic（ReAct Agent + 工具调用）
 - **混合检索**：向量检索 + PostgreSQL FTS/ILIKE 全文检索 RRF 融合，支持 pgvector / Milvus
 - **Reranker**：BGE / Jina / Cohere 重排序，检索后自动精排
 - **流式输出**：所有模式均支持 SSE 流式响应，内置 DeepSeek `<think>` 标签过滤
@@ -81,7 +81,7 @@ eino_agent/
 │   │   ├── chat_memory.go   # 短期/长期记忆
 │   │   ├── chat_persistence.go # 会话消息持久化
 │   │   └── runtime_agent.go # per-request Agent 构建（skill + event sink）
-│   ├── pipeline/            # RAG Pipeline & Agentic RAG Graph
+│   ├── pipeline/            # RAG Pipeline
 │   ├── prompt/              # Prompt 模板管理
 │   ├── tool/                # Agent 工具集
 │   │   ├── knowledge.go     # 知识库检索工具

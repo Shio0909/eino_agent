@@ -8,7 +8,7 @@ func normalizeChatMode(mode string, useAgent bool) (string, bool) {
 	}
 
 	switch strings.ToLower(strings.TrimSpace(mode)) {
-	case "agent", "agentic", "agentic_rag":
+	case "agentic":
 		return "agentic", true
 	default:
 		return "pipeline", false

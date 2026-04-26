@@ -1811,8 +1811,8 @@ func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeI
 	}
 
 	// 上下文富化（可选）
-	if h.cfg.RAG.EnableContextualEnrichment && h.cfg.Agent.AgenticRAG.LightLLM != nil && h.cfg.Agent.AgenticRAG.LightLLM.BaseURL != "" {
-		lightLLM, _, llmErr := container.NewLLMProvider(ctx, h.cfg.Agent.AgenticRAG.LightLLM)
+	if h.cfg.RAG.EnableContextualEnrichment && h.cfg.Agent.LightLLM != nil && h.cfg.Agent.LightLLM.BaseURL != "" {
+		lightLLM, _, llmErr := container.NewLLMProvider(ctx, h.cfg.Agent.LightLLM)
 		if llmErr != nil {
 			log.Printf("[Enricher] 创建 LLM 失败，跳过富化: %v", llmErr)
 		} else {
@@ -3235,13 +3235,6 @@ func (h *Handler) GetSettings(c *gin.Context) {
 			"max_steps":     h.cfg.Agent.MaxSteps,
 			"system_prompt": h.cfg.Agent.SystemPrompt,
 			"tools":         []string{},
-			"agentic_rag": gin.H{
-				"enabled":             h.cfg.Agent.AgenticRAG.Enabled,
-				"max_retries":         h.cfg.Agent.AgenticRAG.MaxRetries,
-				"quality_threshold":   h.cfg.Agent.AgenticRAG.QualityThreshold,
-				"enable_web_fallback": h.cfg.Agent.AgenticRAG.EnableWebFallback,
-				"max_run_steps":       h.cfg.Agent.AgenticRAG.MaxRunSteps,
-			},
 		},
 		"mcp": gin.H{
 			"enabled":      h.cfg.MCP.Enabled,
@@ -3275,14 +3268,13 @@ func (h *Handler) GetSettings(c *gin.Context) {
 
 // SettingsUpdateRequest 设置更新请求
 type SettingsUpdateRequest struct {
-	RAG        *RAGSettingsUpdate        `json:"rag,omitempty"`
-	LLM        *LLMSettingsUpdate        `json:"llm,omitempty"`
-	Embedding  *EmbeddingSettingsUpdate  `json:"embedding,omitempty"`
-	Reranker   *RerankerSettingsUpdate   `json:"reranker,omitempty"`
-	Agent      *AgentSettingsUpdate      `json:"agent,omitempty"`
-	AgenticRAG *AgenticRAGSettingsUpdate `json:"agentic_rag,omitempty"`
-	GraphRAG   *GraphRAGSettingsUpdate   `json:"graphrag,omitempty"`
-	GraphRAGV2 *GraphRAGSettingsUpdate   `json:"graph_rag,omitempty"`
+	RAG        *RAGSettingsUpdate       `json:"rag,omitempty"`
+	LLM        *LLMSettingsUpdate       `json:"llm,omitempty"`
+	Embedding  *EmbeddingSettingsUpdate `json:"embedding,omitempty"`
+	Reranker   *RerankerSettingsUpdate  `json:"reranker,omitempty"`
+	Agent      *AgentSettingsUpdate     `json:"agent,omitempty"`
+	GraphRAG   *GraphRAGSettingsUpdate  `json:"graphrag,omitempty"`
+	GraphRAGV2 *GraphRAGSettingsUpdate  `json:"graph_rag,omitempty"`
 }
 
 // EmbeddingSettingsUpdate Embedding 设置更新
@@ -3340,18 +3332,9 @@ type AgentSettingsUpdate struct {
 	EnableWebSearch     *bool `json:"enable_web_search,omitempty"`
 }
 
-// AgenticRAGSettingsUpdate Agentic RAG 设置更新
-type AgenticRAGSettingsUpdate struct {
-	Enabled           *bool    `json:"enabled,omitempty"`
-	MaxRetries        *int     `json:"max_retries,omitempty"`
-	QualityThreshold  *float64 `json:"quality_threshold,omitempty"`
-	EnableWebFallback *bool    `json:"enable_web_fallback,omitempty"`
-	MaxRunSteps       *int     `json:"max_run_steps,omitempty"`
-}
-
 // UpdateSettings 更新系统设置
 // @Summary 更新设置
-// @Description 运行时更新系统配置（RAG、Agent、Agentic RAG）
+// @Description 运行时更新系统配置（RAG、Agent、GraphRAG）
 // @Tags 设置
 // @Accept json
 // @Produce json
@@ -3576,30 +3559,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		// 重建 Reranker Provider (如果需要的话，可以在这里触发重建)
 		if len(changed) > 0 {
 			log.Printf("[Settings] Reranker 配置已更新: %v", changed)
-		}
-	}
-
-	// 更新 Agentic RAG 设置
-	if req.AgenticRAG != nil {
-		if req.AgenticRAG.Enabled != nil {
-			h.cfg.Agent.AgenticRAG.Enabled = *req.AgenticRAG.Enabled
-			changed = append(changed, "agentic_rag.enabled")
-		}
-		if req.AgenticRAG.MaxRetries != nil {
-			h.cfg.Agent.AgenticRAG.MaxRetries = *req.AgenticRAG.MaxRetries
-			changed = append(changed, "agentic_rag.max_retries")
-		}
-		if req.AgenticRAG.QualityThreshold != nil {
-			h.cfg.Agent.AgenticRAG.QualityThreshold = *req.AgenticRAG.QualityThreshold
-			changed = append(changed, "agentic_rag.quality_threshold")
-		}
-		if req.AgenticRAG.EnableWebFallback != nil {
-			h.cfg.Agent.AgenticRAG.EnableWebFallback = *req.AgenticRAG.EnableWebFallback
-			changed = append(changed, "agentic_rag.enable_web_fallback")
-		}
-		if req.AgenticRAG.MaxRunSteps != nil {
-			h.cfg.Agent.AgenticRAG.MaxRunSteps = *req.AgenticRAG.MaxRunSteps
-			changed = append(changed, "agentic_rag.max_run_steps")
 		}
 	}
 
@@ -3933,7 +3892,6 @@ func (h *Handler) GetSystemInfo(c *gin.Context) {
 		"features": gin.H{
 			"pipeline_rag": true,
 			"react_agent":  h.cfg.Agent.Enabled,
-			"agentic_rag":  h.cfg.Agent.AgenticRAG.Enabled,
 			"graph_rag":    h.cfg.GraphRAG.Enabled,
 			"web_search":   h.cfg.Agent.EnableWebSearch,
 			"mcp":          h.cfg.MCP.Enabled,

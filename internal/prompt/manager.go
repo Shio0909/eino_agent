@@ -137,7 +137,7 @@ func (m *Manager) registerDefaults() {
 当前时间：{{.CurrentTime}}`,
 	}
 
-	// Agentic 系统提示词 (v3 — 统一 agent + agentic_rag)
+	// Agentic 系统提示词
 	agenticPrompt := &Template{
 		ID:               "agentic",
 		Name:             "Agentic 模式",
@@ -247,9 +247,6 @@ Kubernetes 提供三种重启策略：
 Skill 只是参考，不是强制流程——根据具体问题决定是否需要 Skill 辅助。`,
 	}
 	m.systemPrompts["agentic"] = agenticPrompt
-	// 向后兼容：agent 和 agentic_rag 都指向新的统一 prompt
-	m.systemPrompts["agent"] = agenticPrompt
-	m.systemPrompts["agentic_rag"] = agenticPrompt
 
 	// 默认上下文模板
 	m.contextTpls["default"] = &Template{

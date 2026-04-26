@@ -63,7 +63,7 @@
 
 ## 4) 建议的最小 A/B 组合（两周内可完成）
 
-- A: `pipeline` vs `agentic_rag`
+- A: `pipeline` vs `agentic`
 - B: `reranker on` vs `off`
 - C: `query rewrite on` vs `off`
 

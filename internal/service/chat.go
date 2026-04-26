@@ -169,7 +169,7 @@ func (s *ChatService) InitWithComponents(
 	s.retriever = retriever
 
 	// 初始化轻量模型（用于 query_decompose 等辅助工具）
-	if lm := s.config.Agent.AgenticRAG.LightLLM; lm != nil && lm.ModelID != "" {
+	if lm := s.config.Agent.LightLLM; lm != nil && lm.ModelID != "" {
 		lightModel, _, err := container.NewLLMProvider(ctx, lm)
 		if err != nil {
 			log.Printf("[ChatService] 轻量模型初始化失败，降级使用主模型: %v", err)
@@ -756,7 +756,7 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 	var resp *ChatResponse
 	mode := "pipeline"
 
-	// Agentic 模式（统一 agent / agentic / agentic_rag）
+	// Agentic 模式
 	if req.UseAgent && s.config.Agent.Enabled {
 		mode = "agentic"
 		modeStart := time.Now()
@@ -957,7 +957,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 		// 创建流式 think 标签过滤器
 		thinkFilter := filter.NewThinkTagStreamFilter()
 
-		// Agentic 模式（统一 agent / agentic / agentic_rag）
+		// Agentic 模式
 		if req.UseAgent && s.config.Agent.Enabled {
 			trace.add(TraceStep{Type: "status", Stage: "agent_start", Metadata: map[string]any{"max_steps": s.config.Agent.MaxSteps}})
 			eventSink := func(ev StreamEvent) { trySend(ev) }

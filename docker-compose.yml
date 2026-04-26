@@ -54,7 +54,7 @@ services:
 
   # ===========================================
   # App - Eino RAG 主服务 (Go Backend)
-  # 【核心】Eino Graph 编排 + ReAct Agent + Agentic RAG
+  # 【核心】Pipeline RAG + ReAct Agent + GraphRAG
   # ===========================================
   app:
     build:
@@ -118,8 +118,6 @@ services:
       - MCP_ENABLED=${MCP_ENABLED:-false}
       # Web Search
       - TAVILY_API_KEY=${TAVILY_API_KEY:-}
-      # Agentic RAG (Graph 有环编排)
-      - AGENTIC_RAG_ENABLED=${AGENTIC_RAG_ENABLED:-true}
       # GraphRAG (Neo4j 知识图谱增强检索)
       - NEO4J_ENABLE=${NEO4J_ENABLE:-false}
       - NEO4J_URI=bolt://neo4j:7687

@@ -120,9 +120,9 @@ func main() {
 		fmt.Printf("[eval] 检索策略已切换为: %s\n", strategyName)
 	}
 
-	// agentic_rag 模式已废弃，向后兼容映射到 agentic
-	if *mode == "agentic_rag" || *mode == "agent" {
-		*mode = "agentic"
+	if *mode != "pipeline" && *mode != "agentic" {
+		fmt.Printf("[eval] 未知模式: %s (可选: pipeline|agentic)\n", *mode)
+		os.Exit(1)
 	}
 
 	results := make([]sampleResult, 0, len(samples))
@@ -254,35 +254,6 @@ func applyStrategy(client *http.Client, baseURL, bearer, strategy string) error 
 		return fmt.Errorf("未知策略: %s (可选: vector|hybrid|hybrid_rerank|full)", strategy)
 	}
 
-	body, _ := json.Marshal(s)
-	req, err := http.NewRequest(http.MethodPut, baseURL+"/api/v1/settings", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if bearer != "" {
-		req.Header.Set("Authorization", "Bearer "+bearer)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		raw, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(raw)))
-	}
-	return nil
-}
-
-func setAgenticRAG(client *http.Client, baseURL, bearer string, enabled bool) error {
-	type agenticRAGSettings struct {
-		Enabled *bool `json:"enabled"`
-	}
-	type settingsReq struct {
-		AgenticRAG *agenticRAGSettings `json:"agentic_rag"`
-	}
-	s := settingsReq{AgenticRAG: &agenticRAGSettings{Enabled: &enabled}}
 	body, _ := json.Marshal(s)
 	req, err := http.NewRequest(http.MethodPut, baseURL+"/api/v1/settings", bytes.NewReader(body))
 	if err != nil {

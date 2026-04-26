@@ -728,7 +728,7 @@ const docTemplate = `{
                 }
             },
             "put": {
-                "description": "运行时更新系统配置（RAG、Agent、Agentic RAG）",
+                "description": "运行时更新系统配置（RAG、Agent、GraphRAG）",
                 "consumes": [
                     "application/json"
                 ],
@@ -807,26 +807,6 @@ const docTemplate = `{
                 },
                 "max_steps": {
                     "type": "integer"
-                }
-            }
-        },
-        "handler.AgenticRAGSettingsUpdate": {
-            "type": "object",
-            "properties": {
-                "enable_web_fallback": {
-                    "type": "boolean"
-                },
-                "enabled": {
-                    "type": "boolean"
-                },
-                "max_retries": {
-                    "type": "integer"
-                },
-                "max_run_steps": {
-                    "type": "integer"
-                },
-                "quality_threshold": {
-                    "type": "number"
                 }
             }
         },
@@ -1057,9 +1037,6 @@ const docTemplate = `{
             "properties": {
                 "agent": {
                     "$ref": "#/definitions/handler.AgentSettingsUpdate"
-                },
-                "agentic_rag": {
-                    "$ref": "#/definitions/handler.AgenticRAGSettingsUpdate"
                 },
                 "embedding": {
                     "$ref": "#/definitions/handler.EmbeddingSettingsUpdate"

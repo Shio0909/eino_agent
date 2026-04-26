@@ -4,7 +4,7 @@
 
 用复杂语料拉开不同方案差异，避免所有模式都接近 100%。
 
-- 模式：pipeline / agent / agentic_rag
+- 模式：pipeline / agentic
 - 检索：vector_only / vector_rerank / hybrid_rrf / hybrid_rrf_rerank
 
 ## 语料设计原则
@@ -39,7 +39,7 @@
 建议优先比较：
 
 - `pipeline + vector_only` vs `pipeline + hybrid_rrf`
-- `pipeline + hybrid_rrf` vs `agentic_rag + hybrid_rrf`
+- `pipeline + hybrid_rrf` vs `agentic + hybrid_rrf`
 
 如果差异仍不明显：
 

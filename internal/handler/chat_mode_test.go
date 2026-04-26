@@ -2,7 +2,7 @@ package handler
 
 import "testing"
 
-func TestNormalizeChatModePreservesTwoPublicModesAndAliases(t *testing.T) {
+func TestNormalizeChatModeUsesOnlyPipelineAndAgentic(t *testing.T) {
 	tests := []struct {
 		name     string
 		mode     string
@@ -12,8 +12,8 @@ func TestNormalizeChatModePreservesTwoPublicModesAndAliases(t *testing.T) {
 	}{
 		{name: "pipeline", mode: "pipeline", wantMode: "pipeline"},
 		{name: "agentic", mode: "agentic", wantMode: "agentic", wantUse: true},
-		{name: "legacy agent", mode: "agent", wantMode: "agentic", wantUse: true},
-		{name: "legacy agentic rag", mode: "agentic_rag", wantMode: "agentic", wantUse: true},
+		{name: "legacy agent falls back", mode: "agent", wantMode: "pipeline"},
+		{name: "removed legacy rag mode falls back", mode: "agentic_" + "rag", wantMode: "pipeline"},
 		{name: "use agent flag", mode: "pipeline", useAgent: true, wantMode: "agentic", wantUse: true},
 	}
 

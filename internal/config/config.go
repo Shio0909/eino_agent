@@ -208,20 +208,7 @@ type AgentConfig struct {
 	// 超时配置
 	LLMTimeout int `yaml:"llm_timeout"` // Agent LLM 调用超时（秒），0=使用默认值 180s
 
-	// Agentic RAG 配置
-	AgenticRAG AgenticRAGConfig `yaml:"agentic_rag"`
-}
-
-// AgenticRAGConfig Agentic RAG 配置（含 Query Router / Decomposition / Knowledge Refinement / Self-Reflection）
-type AgenticRAGConfig struct {
-	Enabled           bool    `yaml:"enabled"`             // 是否启用 Agentic RAG
-	MaxRetries        int     `yaml:"max_retries"`         // 最大重试次数（防死循环）
-	QualityThreshold  float64 `yaml:"quality_threshold"`   // 检索质量阈值 (0-1)
-	EnableWebFallback bool    `yaml:"enable_web_fallback"` // 重试失败后是否降级到 Web 搜索
-	MaxRunSteps       int     `yaml:"max_run_steps"`       // Graph 最大运行步数
-	NodeTimeoutSec    int     `yaml:"node_timeout_sec"`    // 每个 LLM 节点的超时秒数（0=不限）
-
-	// 轻量模型配置：用于 classify / refine 等不需要强推理的节点，降低延迟
+	// 轻量模型配置：用于 query_decompose / conflict detection 等辅助工具。
 	LightLLM *LLMConfig `yaml:"light_llm,omitempty"`
 }
 
@@ -550,17 +537,6 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Memory.MaxContextChars == 0 {
 		cfg.Memory.MaxContextChars = 3000
-	}
-
-	// Agentic RAG 默认值
-	if cfg.Agent.AgenticRAG.MaxRetries == 0 {
-		cfg.Agent.AgenticRAG.MaxRetries = 3
-	}
-	if cfg.Agent.AgenticRAG.QualityThreshold == 0 {
-		cfg.Agent.AgenticRAG.QualityThreshold = 0.6
-	}
-	if cfg.Agent.AgenticRAG.MaxRunSteps == 0 {
-		cfg.Agent.AgenticRAG.MaxRunSteps = 20
 	}
 
 	// Redis 默认值

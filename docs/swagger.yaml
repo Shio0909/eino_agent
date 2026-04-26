@@ -11,19 +11,6 @@ definitions:
       max_steps:
         type: integer
     type: object
-  handler.AgenticRAGSettingsUpdate:
-    properties:
-      enable_web_fallback:
-        type: boolean
-      enabled:
-        type: boolean
-      max_retries:
-        type: integer
-      max_run_steps:
-        type: integer
-      quality_threshold:
-        type: number
-    type: object
   handler.ChatRequest:
     properties:
       document_ids:
@@ -174,8 +161,6 @@ definitions:
     properties:
       agent:
         $ref: '#/definitions/handler.AgentSettingsUpdate'
-      agentic_rag:
-        $ref: '#/definitions/handler.AgenticRAGSettingsUpdate'
       embedding:
         $ref: '#/definitions/handler.EmbeddingSettingsUpdate'
       graph_rag:
@@ -730,7 +715,7 @@ paths:
     put:
       consumes:
       - application/json
-      description: 运行时更新系统配置（RAG、Agent、Agentic RAG）
+      description: 运行时更新系统配置（RAG、Agent、GraphRAG）
       parameters:
       - description: 要更新的设置
         in: body
