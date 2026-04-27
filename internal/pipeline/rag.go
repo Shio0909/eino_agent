@@ -25,6 +25,7 @@ type RAGPipeline struct {
 	rewriter  QueryRewriter
 	reranker  Reranker
 	generator Generator
+	fallback  ExternalFallbackProvider
 }
 
 // Config 流水线配置
@@ -41,6 +42,71 @@ type Config struct {
 	ModelID string
 	// 系统提示词
 	SystemPrompt string
+	// 外部降级策略
+	Fallback FallbackConfig
+}
+
+type FallbackConfig struct {
+	Enabled             bool
+	MinKnowledgeDocs    int
+	MinContextChars     int
+	MaxExternalResults  int
+	MaxExternalContext  int
+	AllowedProviders    []string
+	ProviderByKeyword   map[string][]string
+	RefuseWhenNoSources bool
+}
+
+type AnswerState string
+
+const (
+	StateKBRetrieve           AnswerState = "kb_retrieve"
+	StateKBAssess             AnswerState = "kb_assess"
+	StateKBContextBuild       AnswerState = "kb_context_build"
+	StateExternalPlan         AnswerState = "external_plan"
+	StateExternalSearch       AnswerState = "external_search"
+	StateExternalAssess       AnswerState = "external_assess"
+	StateExternalContextBuild AnswerState = "external_context_build"
+	StateGenerate             AnswerState = "generate"
+	StateRefuseOrClarify      AnswerState = "refuse_or_clarify"
+)
+
+type FallbackReason string
+
+const (
+	FallbackReasonNone          FallbackReason = "none"
+	FallbackReasonNoDocuments   FallbackReason = "no_documents"
+	FallbackReasonShortContext  FallbackReason = "short_context"
+	FallbackReasonNoExternal    FallbackReason = "no_external_results"
+	FallbackReasonProviderError FallbackReason = "provider_error"
+)
+
+type FallbackDecision struct {
+	State         AnswerState    `json:"state"`
+	Reason        FallbackReason `json:"reason"`
+	AllowExternal bool           `json:"allow_external"`
+	Providers     []string       `json:"providers,omitempty"`
+	DocsCount     int            `json:"docs_count"`
+	ContextChars  int            `json:"context_chars"`
+}
+
+type ExternalSearchRequest struct {
+	Query      string
+	Providers  []string
+	MaxResults int
+}
+
+type ExternalSearchResult struct {
+	Provider string
+	Title    string
+	URL      string
+	Content  string
+	Score    float64
+	Metadata map[string]interface{}
+}
+
+type ExternalFallbackProvider interface {
+	Search(ctx context.Context, req ExternalSearchRequest) ([]ExternalSearchResult, error)
 }
 
 // DefaultConfig 返回默认配置
@@ -114,6 +180,12 @@ func WithGenerator(g Generator) Option {
 	}
 }
 
+func WithExternalFallbackProvider(provider ExternalFallbackProvider) Option {
+	return func(p *RAGPipeline) {
+		p.fallback = provider
+	}
+}
+
 // RAGRequest RAG 请求
 type RAGRequest struct {
 	Query                 string            // 用户查询
@@ -131,13 +203,15 @@ type RAGResponse struct {
 	RewriteQ string            // 重写后的查询（如果启用）
 	Metadata map[string]string // 附加元数据
 	Trace    RetrievalTrace    // 检索链路明细
+	Fallback FallbackDecision  // 确定性降级决策
 }
 
 type RetrievalTrace struct {
-	Retrieved    []TraceChunk `json:"retrieved,omitempty"`
-	RerankBefore []TraceChunk `json:"rerank_before,omitempty"`
-	RerankAfter  []TraceChunk `json:"rerank_after,omitempty"`
-	Context      []TraceChunk `json:"context,omitempty"`
+	Retrieved    []TraceChunk        `json:"retrieved,omitempty"`
+	RerankBefore []TraceChunk        `json:"rerank_before,omitempty"`
+	RerankAfter  []TraceChunk        `json:"rerank_after,omitempty"`
+	Context      []TraceChunk        `json:"context,omitempty"`
+	Fallback     []FallbackGraphStep `json:"fallback,omitempty"`
 }
 
 type TraceChunk struct {
@@ -192,8 +266,19 @@ func (p *RAGPipeline) Run(ctx context.Context, req *RAGRequest) (*RAGResponse, e
 	if err != nil {
 		return nil, fmt.Errorf("retrieve: %w", err)
 	}
+	fallbackOutput, err := p.runFallbackGraph(ctx, query, docs)
+	if err != nil {
+		return nil, err
+	}
+	resp.Fallback = fallbackOutput.Decision
+	resp.Trace.Fallback = fallbackOutput.Trace
+	resp.Metadata["fallback_state"] = string(resp.Fallback.State)
+	resp.Metadata["fallback_reason"] = string(resp.Fallback.Reason)
+	if fallbackOutput.Err != nil {
+		resp.Metadata["fallback_error"] = fallbackOutput.Err.Error()
+	}
+	docs = fallbackOutput.Docs
 
-	// Step 3: 重排序
 	resp.Trace.Retrieved = traceChunksFromDocs(docs)
 	resp.Trace.RerankBefore = traceChunksFromDocs(docs)
 	passages := extractPassages(docs)
@@ -250,6 +335,13 @@ func (p *RAGPipeline) Run(ctx context.Context, req *RAGRequest) (*RAGResponse, e
 	}
 
 	generateStart := time.Now()
+	if len(resp.Sources) == 0 && p.fallbackConfig().RefuseWhenNoSources {
+		resp.Fallback.State = StateRefuseOrClarify
+		resp.Answer = "⚠️ 未在当前知识库或已启用的外部来源中找到足够依据，请补充资料或放宽检索范围。"
+		log.Printf("[Timing][Pipeline] stage=refuse duration_ms=%d", time.Since(generateStart).Milliseconds())
+		return resp, nil
+	}
+	resp.Fallback.State = StateGenerate
 	answer, err := p.generator.Generate(ctx, generationQuery, contextBuilder)
 	log.Printf("[Timing][Pipeline] stage=generate duration_ms=%d context_chars=%d", time.Since(generateStart).Milliseconds(), len(contextBuilder))
 	if err != nil {
@@ -371,6 +463,15 @@ func (p *RAGPipeline) RunStream(ctx context.Context, req *RAGRequest) (<-chan St
 			ch <- StreamChunk{Type: ChunkTypeError, Content: err.Error()}
 			return
 		}
+		fallbackOutput, err := p.runFallbackGraph(ctx, query, docs)
+		if err != nil {
+			ch <- StreamChunk{Type: ChunkTypeError, Content: err.Error()}
+			return
+		}
+		for _, step := range fallbackOutput.Trace {
+			ch <- StreamChunk{Type: ChunkTypeTrace, Metadata: map[string]any{"stage": string(step.State), "decision": fallbackOutput.Decision, "step": step}}
+		}
+		docs = fallbackOutput.Docs
 		ch <- StreamChunk{Type: ChunkTypeTrace, Metadata: map[string]any{"stage": "retrieved_candidates", "chunks": traceChunksFromDocs(docs), "count": len(docs)}}
 		rankedDocs := docs
 		passages := extractPassages(docs)
@@ -431,6 +532,13 @@ func (p *RAGPipeline) RunStream(ctx context.Context, req *RAGRequest) (<-chan St
 		generationQuery := req.Query
 		if req.GenerationInstruction != "" {
 			generationQuery = req.Query + "\n\n" + req.GenerationInstruction
+		}
+
+		if len(rankedDocs) == 0 && p.fallbackConfig().RefuseWhenNoSources {
+			ch <- StreamChunk{Type: ChunkTypeTrace, Metadata: map[string]any{"stage": string(StateRefuseOrClarify)}}
+			ch <- StreamChunk{Type: ChunkTypeContent, Content: "⚠️ 未在当前知识库或已启用的外部来源中找到足够依据，请补充资料或放宽检索范围。"}
+			ch <- StreamChunk{Type: ChunkTypeDone}
+			return
 		}
 
 		stream, err := p.generator.GenerateStream(ctx, generationQuery, contextBuilder)

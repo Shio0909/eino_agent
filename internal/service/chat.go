@@ -192,6 +192,13 @@ func (s *ChatService) InitWithComponents(
 	}
 	// 注入查询重写器
 	pipeOpts = append(pipeOpts, pipeline.WithRewriter(pipeline.NewLLMRewriter(chatModel)))
+	if s.config.Agent.EnableWebSearch && (s.config.Agent.TavilyAPIKey != "" || s.config.Agent.SerpAPIKey != "") {
+		pipeOpts = append(pipeOpts, pipeline.WithExternalFallbackProvider(internalTool.NewWebSearchTool(&internalTool.WebSearchConfig{
+			TavilyAPIKey: s.config.Agent.TavilyAPIKey,
+			SerpAPIKey:   s.config.Agent.SerpAPIKey,
+			MaxResults:   5,
+		})))
+	}
 	s.pipeline = pipeline.NewRAGPipeline(
 		&pipeline.Config{
 			EnableRewrite: s.config.RAG.EnableRewrite,
@@ -485,6 +492,13 @@ func (s *ChatService) buildRuntimePipeline(runtimeRetriever retriever.Retriever)
 	}
 	// 注入查询重写器
 	pipeOpts = append(pipeOpts, pipeline.WithRewriter(pipeline.NewLLMRewriter(s.chatModel)))
+	if s.config.Agent.EnableWebSearch && (s.config.Agent.TavilyAPIKey != "" || s.config.Agent.SerpAPIKey != "") {
+		pipeOpts = append(pipeOpts, pipeline.WithExternalFallbackProvider(internalTool.NewWebSearchTool(&internalTool.WebSearchConfig{
+			TavilyAPIKey: s.config.Agent.TavilyAPIKey,
+			SerpAPIKey:   s.config.Agent.SerpAPIKey,
+			MaxResults:   5,
+		})))
+	}
 	return pipeline.NewRAGPipeline(
 		&pipeline.Config{
 			EnableRewrite: s.config.RAG.EnableRewrite,
