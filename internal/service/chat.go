@@ -310,7 +310,7 @@ func (s *ChatService) buildRuntimeInstruction(ctx context.Context, req *ChatRequ
 
 	if req.ForceCitation {
 		parts = append(parts,
-			"【引用强制模式】回答中的关键结论必须附带来源标注（如 [来源1]）。若无法从已知信息获得来源，请明确说明\u201c当前信息无可验证来源\u201d。",
+			"【引用强制模式】必须优先且只能基于选中的知识库/检索结果回答。每个关键结论必须附带来源标注（如 [来源1]）。如果检索结果不足或没有可验证来源，不要输出普通科普答案，必须明确写出：⚠️ 未在当前知识库中找到足够依据，以下内容不是知识库证据支持的回答。",
 		)
 	}
 
@@ -651,17 +651,7 @@ func sourceFromDocument(doc *schema.Document) Source {
 	return Source{Content: doc.Content, DocID: doc.ID, Metadata: doc.MetaData}
 }
 
-func (s *ChatService) buildSourcesFromRetriever(ctx context.Context, runtimeRetriever retriever.Retriever, query string, maxN int) []Source {
-	if runtimeRetriever == nil || strings.TrimSpace(query) == "" {
-		return nil
-	}
-
-	docs, err := runtimeRetriever.Retrieve(ctx, query)
-	if err != nil {
-		log.Printf("[ChatService] 回填来源检索失败: %v", err)
-		return nil
-	}
-
+func sourcesFromDocuments(docs []*schema.Document, maxN int) []Source {
 	if maxN <= 0 {
 		maxN = 5
 	}
@@ -687,6 +677,20 @@ func (s *ChatService) buildSourcesFromRetriever(ctx context.Context, runtimeRetr
 	}
 
 	return sources
+}
+
+func (s *ChatService) buildSourcesFromRetriever(ctx context.Context, runtimeRetriever retriever.Retriever, query string, maxN int) []Source {
+	if runtimeRetriever == nil || strings.TrimSpace(query) == "" {
+		return nil
+	}
+
+	docs, err := runtimeRetriever.Retrieve(ctx, query)
+	if err != nil {
+		log.Printf("[ChatService] 回填来源检索失败: %v", err)
+		return nil
+	}
+
+	return sourcesFromDocuments(docs, maxN)
 }
 
 // skillsEnabledForRequest 判断本次请求是否启用 Eino skill 功能。
@@ -732,6 +736,41 @@ func (s *ChatService) prepareChatContext(ctx context.Context, req *ChatRequest) 
 		messageWithInst:    messageWithInst,
 		runtimeRetriever:   runtimeRetriever,
 	}
+}
+
+func addPipelineRetrievalTrace(trace *traceCollector, details pipeline.RetrievalTrace) {
+	if trace == nil {
+		return
+	}
+	if len(details.Retrieved) > 0 {
+		trace.add(TraceStep{Type: "retrieval", Stage: "retrieved_candidates", Metadata: map[string]any{"chunks": details.Retrieved, "count": len(details.Retrieved)}})
+	}
+	if len(details.RerankBefore) > 0 || len(details.RerankAfter) > 0 {
+		trace.add(TraceStep{Type: "rerank", Stage: "rerank", Metadata: map[string]any{"before": details.RerankBefore, "after": details.RerankAfter}})
+	}
+	if len(details.Context) > 0 {
+		trace.add(TraceStep{Type: "context", Stage: "context_build", Metadata: map[string]any{"chunks": details.Context, "count": len(details.Context)}})
+	}
+}
+
+func traceStepFromPipelineMetadata(metadata map[string]any) *TraceStep {
+	if metadata == nil {
+		return nil
+	}
+	stage, _ := metadata["stage"].(string)
+	if stage == "" {
+		stage = "trace"
+	}
+	traceType := "status"
+	switch stage {
+	case "retrieved_candidates":
+		traceType = "retrieval"
+	case "rerank":
+		traceType = "rerank"
+	case "context_build":
+		traceType = "context"
+	}
+	return &TraceStep{Type: traceType, Stage: stage, Metadata: metadata}
 }
 
 // Chat 执行聊天
@@ -862,6 +901,8 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 		}
 		trace.add(TraceStep{Type: "status", Stage: "pipeline_run", LatencyMs: time.Since(pipelineStart).Milliseconds(), Metadata: map[string]any{"source_count": len(pipeResp.Sources)}})
 
+		addPipelineRetrievalTrace(trace, pipeResp.Trace)
+
 		pipeResp.Answer = filter.StripThinkTags(pipeResp.Answer)
 
 		sources := make([]Source, len(pipeResp.Sources))
@@ -961,7 +1002,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 		if req.UseAgent && s.config.Agent.Enabled {
 			trace.add(TraceStep{Type: "status", Stage: "agent_start", Metadata: map[string]any{"max_steps": s.config.Agent.MaxSteps}})
 			eventSink := func(ev StreamEvent) { trySend(ev) }
-			runtimeAgent, _, createErr := s.buildRuntimeAgentForRequest(ctx, cc.runtimeRetriever, req, eventSink)
+			runtimeAgent, kt, createErr := s.buildRuntimeAgentForRequest(ctx, cc.runtimeRetriever, req, eventSink)
 			if createErr != nil {
 				trySend(StreamEvent{Type: "error", Error: createErr.Error()})
 				return
@@ -988,6 +1029,12 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			}
 			// Strip think-tag content, then fake-stream the final answer rune by rune.
 			answer = filter.StripThinkTags(answer)
+			if kt != nil {
+				sources := sourcesFromDocuments(kt.LastDocs(), s.config.RAG.TopK)
+				if len(sources) > 0 && !trySend(StreamEvent{Type: "sources", Sources: sources, SourceCount: len(sources)}) {
+					return
+				}
+			}
 			trace.add(TraceStep{Type: "status", Stage: "agent_generate", LatencyMs: time.Since(startTime).Milliseconds()})
 			if answer != "" {
 				log.Printf("[Timing][ChatService] mode=agentic stage=first_token duration_ms=%d", time.Since(startTime).Milliseconds())
@@ -1063,11 +1110,15 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 						}
 					}
 				} else {
-					if !trySend(StreamEvent{
+					event := StreamEvent{
 						Type:    string(chunk.Type),
 						Content: chunk.Content,
 						DocID:   chunk.DocID,
-					}) {
+					}
+					if chunk.Type == pipeline.ChunkTypeTrace {
+						event.TraceStep = traceStepFromPipelineMetadata(chunk.Metadata)
+					}
+					if !trySend(event) {
 						return
 					}
 				}

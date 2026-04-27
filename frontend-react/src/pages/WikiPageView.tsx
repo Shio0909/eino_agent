@@ -28,7 +28,7 @@ export function WikiPageView() {
 
   return (
     <div className="grid h-full min-h-0 gap-4 lg:grid-cols-[21rem_minmax(0,1fr)]">
-      <Card className="min-h-0 p-5">
+      <Card className="flex min-h-0 flex-col p-5">
         <div className="flex items-center gap-2">
           <BookOpen className="h-5 w-5 text-accent" />
           <h3 className="font-display text-2xl font-semibold">Wiki Browser</h3>
@@ -40,7 +40,7 @@ export function WikiPageView() {
           <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-muted" />
           <Input className="pl-9" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索页面路径" />
         </div>
-        <div className="mt-4 min-h-0 space-y-2 overflow-auto">
+        <div className="mt-4 min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
           {filtered.map((item) => (
             <button key={item.path} onClick={() => setPath(item.path)} className="focus-ring w-full rounded-2xl border border-border/70 bg-surface/45 p-3 text-left hover:bg-text/5">
               <span className="block truncate text-sm font-semibold">{item.title || item.path}</span>

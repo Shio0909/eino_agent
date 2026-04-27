@@ -130,6 +130,24 @@ type RAGResponse struct {
 	Sources  []Source          // 引用来源
 	RewriteQ string            // 重写后的查询（如果启用）
 	Metadata map[string]string // 附加元数据
+	Trace    RetrievalTrace    // 检索链路明细
+}
+
+type RetrievalTrace struct {
+	Retrieved    []TraceChunk `json:"retrieved,omitempty"`
+	RerankBefore []TraceChunk `json:"rerank_before,omitempty"`
+	RerankAfter  []TraceChunk `json:"rerank_after,omitempty"`
+	Context      []TraceChunk `json:"context,omitempty"`
+}
+
+type TraceChunk struct {
+	Rank      int                    `json:"rank"`
+	DocID     string                 `json:"doc_id"`
+	Content   string                 `json:"content,omitempty"`
+	Score     float64                `json:"score,omitempty"`
+	MatchType string                 `json:"match_type,omitempty"`
+	Source    string                 `json:"source,omitempty"`
+	Metadata  map[string]interface{} `json:"metadata,omitempty"`
 }
 
 // Source 来源信息
@@ -176,6 +194,8 @@ func (p *RAGPipeline) Run(ctx context.Context, req *RAGRequest) (*RAGResponse, e
 	}
 
 	// Step 3: 重排序
+	resp.Trace.Retrieved = traceChunksFromDocs(docs)
+	resp.Trace.RerankBefore = traceChunksFromDocs(docs)
 	passages := extractPassages(docs)
 	rerankedIdx := make([]int, len(passages))
 	for i := range rerankedIdx {
@@ -194,6 +214,8 @@ func (p *RAGPipeline) Run(ctx context.Context, req *RAGRequest) (*RAGResponse, e
 	}
 
 	// Step 4: 构建上下文
+	rankedDocs := reorderDocs(docs, rerankedIdx)
+	resp.Trace.RerankAfter = traceChunksFromDocs(rankedDocs)
 	topK := p.config.RerankTopK
 	if topK > len(rerankedIdx) {
 		topK = len(rerankedIdx)
@@ -212,6 +234,7 @@ func (p *RAGPipeline) Run(ctx context.Context, req *RAGRequest) (*RAGResponse, e
 				Score:    float64(topK - i), // 简单的位置分数
 				Metadata: doc.MetaData,
 			})
+			resp.Trace.Context = append(resp.Trace.Context, traceChunkFromDoc(doc, i+1))
 		}
 	}
 	log.Printf("[Timing][Pipeline] stage=build_context duration_ms=%d top_k=%d", time.Since(contextStart).Milliseconds(), topK)
@@ -247,6 +270,79 @@ func extractPassages(docs []*schema.Document) []string {
 	return passages
 }
 
+func reorderDocs(docs []*schema.Document, indices []int) []*schema.Document {
+	if len(indices) == 0 {
+		return docs
+	}
+	ordered := make([]*schema.Document, 0, len(indices))
+	for _, idx := range indices {
+		if idx < 0 || idx >= len(docs) {
+			continue
+		}
+		ordered = append(ordered, docs[idx])
+	}
+	if len(ordered) == 0 {
+		return docs
+	}
+	return ordered
+}
+
+func traceChunksFromDocs(docs []*schema.Document) []TraceChunk {
+	chunks := make([]TraceChunk, 0, len(docs))
+	for i, doc := range docs {
+		chunks = append(chunks, traceChunkFromDoc(doc, i+1))
+	}
+	return chunks
+}
+
+func traceChunkFromDoc(doc *schema.Document, rank int) TraceChunk {
+	if doc == nil {
+		return TraceChunk{Rank: rank}
+	}
+	metadata := make(map[string]interface{}, len(doc.MetaData))
+	for key, value := range doc.MetaData {
+		metadata[key] = value
+	}
+	return TraceChunk{
+		Rank:      rank,
+		DocID:     doc.ID,
+		Content:   doc.Content,
+		Score:     doc.Score(),
+		MatchType: stringMetadata(metadata, "match_type"),
+		Source:    firstStringMetadata(metadata, "source", "source_filename", "file_name", "wiki_path"),
+		Metadata:  metadata,
+	}
+}
+
+func stringMetadata(metadata map[string]interface{}, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	if value, ok := metadata[key].(string); ok {
+		return value
+	}
+	return ""
+}
+
+func firstStringMetadata(metadata map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if value := stringMetadata(metadata, key); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func boundedTopK(length, topK int) int {
+	if topK < 0 {
+		return 0
+	}
+	if topK < length {
+		return topK
+	}
+	return length
+}
+
 // RunStream 流式执行 RAG 流水线
 // 【Eino 特点】原生支持流式输出，与 Eino 的 StreamReader 无缝集成
 func (p *RAGPipeline) RunStream(ctx context.Context, req *RAGRequest) (<-chan StreamChunk, error) {
@@ -275,6 +371,7 @@ func (p *RAGPipeline) RunStream(ctx context.Context, req *RAGRequest) (<-chan St
 			ch <- StreamChunk{Type: ChunkTypeError, Content: err.Error()}
 			return
 		}
+		ch <- StreamChunk{Type: ChunkTypeTrace, Metadata: map[string]any{"stage": "retrieved_candidates", "chunks": traceChunksFromDocs(docs), "count": len(docs)}}
 		rankedDocs := docs
 		passages := extractPassages(docs)
 		rerankedIdx := make([]int, len(passages))
@@ -286,6 +383,7 @@ func (p *RAGPipeline) RunStream(ctx context.Context, req *RAGRequest) (<-chan St
 				rerankedIdx = idx
 			}
 		}
+		ch <- StreamChunk{Type: ChunkTypeTrace, Metadata: map[string]any{"stage": "rerank", "before": traceChunksFromDocs(docs)}}
 		if len(rerankedIdx) > 0 {
 			reordered := make([]*schema.Document, 0, len(rerankedIdx))
 			for _, idx := range rerankedIdx {
@@ -298,6 +396,7 @@ func (p *RAGPipeline) RunStream(ctx context.Context, req *RAGRequest) (<-chan St
 				rankedDocs = reordered
 			}
 		}
+		ch <- StreamChunk{Type: ChunkTypeTrace, Metadata: map[string]any{"stage": "rerank", "after": traceChunksFromDocs(rankedDocs)}}
 
 		// 发送来源信息
 		for i, doc := range rankedDocs {
@@ -319,6 +418,9 @@ func (p *RAGPipeline) RunStream(ctx context.Context, req *RAGRequest) (<-chan St
 			}
 			contextBuilder += fmt.Sprintf("[%d] %s\n\n", i+1, doc.Content)
 		}
+
+		contextCount := boundedTopK(len(rankedDocs), p.config.RerankTopK)
+		ch <- StreamChunk{Type: ChunkTypeTrace, Metadata: map[string]any{"stage": "context_build", "chunks": traceChunksFromDocs(rankedDocs[:contextCount]), "count": contextCount}}
 
 		// 流式生成
 		if p.generator == nil {
@@ -349,9 +451,10 @@ func (p *RAGPipeline) RunStream(ctx context.Context, req *RAGRequest) (<-chan St
 
 // StreamChunk 流式输出块
 type StreamChunk struct {
-	Type    ChunkType // 块类型
-	Content string    // 内容
-	DocID   string    // 文档 ID（仅 source 类型）
+	Type     ChunkType      // 块类型
+	Content  string         // 内容
+	DocID    string         // 文档 ID（仅 source 类型）
+	Metadata map[string]any // 结构化链路信息
 }
 
 // ChunkType 块类型
@@ -360,6 +463,7 @@ type ChunkType string
 const (
 	ChunkTypeRewrite ChunkType = "rewrite" // 重写结果
 	ChunkTypeSource  ChunkType = "source"  // 来源信息
+	ChunkTypeTrace   ChunkType = "trace"   // 检索链路明细
 	ChunkTypeContent ChunkType = "content" // 生成内容
 	ChunkTypeDone    ChunkType = "done"    // 完成
 	ChunkTypeError   ChunkType = "error"   // 错误

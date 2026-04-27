@@ -46,3 +46,19 @@ func TestKnowledgeBaseRetrievalScopeFiltersDocuments(t *testing.T) {
 		t.Fatalf("unexpected docs: %#v", docs)
 	}
 }
+
+func TestSourcesFromDocumentsUsesDefaultLimitForInvalidMax(t *testing.T) {
+	docs := []*schema.Document{
+		{ID: "doc-1", Content: "one"},
+		{ID: "doc-2", Content: "two"},
+	}
+
+	sources := sourcesFromDocuments(docs, -1)
+
+	if len(sources) != 2 {
+		t.Fatalf("sources len = %d, want 2", len(sources))
+	}
+	if sources[0].DocID != "doc-1" || sources[1].DocID != "doc-2" {
+		t.Fatalf("unexpected sources: %#v", sources)
+	}
+}

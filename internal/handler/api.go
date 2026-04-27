@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +36,8 @@ import (
 	"eino_agent/internal/security"
 	"eino_agent/internal/service"
 	"eino_agent/internal/wiki"
+
+	"github.com/cloudwego/eino/components/model"
 )
 
 // Handler HTTP 处理器
@@ -57,6 +60,7 @@ type Handler struct {
 	codeGraphRepo    codegraph.CodeGraphRepository
 	codeIndexer      *codegraph.Indexer
 	wikiCompiler     *wiki.Compiler
+	chatModelFactory func(context.Context) (model.ChatModel, error)
 
 	// Repositories
 	kbRepo        repository.KnowledgeBaseRepository
@@ -97,6 +101,46 @@ func (h *Handler) SetImportStateStore(importStateStore cachepkg.ImportStateStore
 // SetGraphRAGService 设置 GraphRAG 服务。
 func (h *Handler) SetGraphRAGService(svc *graphrag.Service) {
 	h.graphRAGService = svc
+}
+
+func (h *Handler) contextModel(ctx context.Context) (model.ChatModel, error) {
+	if h.chatModelFactory != nil {
+		return h.chatModelFactory(ctx)
+	}
+	if h.cfg == nil || h.cfg.Agent.LightLLM == nil || h.cfg.Agent.LightLLM.BaseURL == "" {
+		return nil, fmt.Errorf("light LLM 未配置")
+	}
+	llm, _, err := container.NewLLMProvider(ctx, h.cfg.Agent.LightLLM)
+	return llm, err
+}
+
+func (h *Handler) docReaderStatus() gin.H {
+	status := gin.H{
+		"enabled":     h.cfg.DocReader.Enabled,
+		"mode":        h.cfg.DocReader.Mode,
+		"endpoint":    h.cfg.DocReader.Endpoint,
+		"render_mode": h.cfg.DocReader.RenderMode,
+		"active":      h.docReaderCli != nil,
+	}
+	mode := strings.ToLower(strings.TrimSpace(h.cfg.DocReader.Mode))
+	switch mode {
+	case "mineru":
+		status["primary"] = "mineru"
+		status["fallback"] = "none"
+	case "mineru_with_fallback":
+		status["primary"] = "mineru"
+		status["fallback"] = "local"
+	case "grpc", "auto", "grpc_with_fallback":
+		status["primary"] = "grpc"
+		status["fallback"] = "local"
+	default:
+		status["primary"] = "local"
+		status["fallback"] = "none"
+	}
+	if h.cfg.DocReader.MinerUEndpoint != "" {
+		status["mineru_endpoint"] = h.cfg.DocReader.MinerUEndpoint
+	}
+	return status
 }
 
 // SetCodeGraph 设置代码知识图谱组件。
@@ -256,6 +300,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		graphragAPI := protected.Group("/graphrag")
 		{
 			graphragAPI.GET("/status", h.GetGraphRAGStatus)
+			graphragAPI.GET("/:kbId/graph", h.GetGraphRAGGraph)
 			graphragAPI.POST("/build/:kbId", h.BuildGraphForKB)
 			graphragAPI.DELETE("/:kbId", h.DeleteGraphForKB)
 		}
@@ -318,6 +363,33 @@ func (h *Handler) GetGraphRAGStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, h.graphRAGService.GetStatus())
 }
 
+// GetGraphRAGGraph 获取知识库图谱可视化数据
+func (h *Handler) GetGraphRAGGraph(c *gin.Context) {
+	if h.graphRAGService == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "GraphRAG 未启用"})
+		return
+	}
+	kbID := c.Param("kbId")
+	if kbID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少知识库 ID"})
+		return
+	}
+	limit := parsePositiveInt(c.Query("limit"), 200)
+	if limit > 500 {
+		limit = 500
+	}
+
+	graph, err := h.graphRAGService.GetGraphForVis(c.Request.Context(), kbID, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("获取图谱失败: %v", err)})
+		return
+	}
+	if graph == nil {
+		graph = &graphrag.VisGraph{}
+	}
+	c.JSON(http.StatusOK, graph)
+}
+
 // BuildGraphForKB 为知识库构建图谱（手动触发，接受 chunks）
 func (h *Handler) BuildGraphForKB(c *gin.Context) {
 	if h.graphRAGService == nil {
@@ -374,6 +446,14 @@ func (h *Handler) DeleteGraphForKB(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "图谱已删除"})
+}
+
+func parsePositiveInt(value string, fallback int) int {
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
 }
 
 // ChatRequest 聊天请求
@@ -660,6 +740,9 @@ func (h *Handler) ChatStream(c *gin.Context) {
 			}
 			if event.ToolInput != "" {
 				data["tool_input"] = event.ToolInput
+			}
+			if len(event.Sources) > 0 {
+				data["sources"] = h.toReferences(event.Sources)
 			}
 			if event.LatencyMs > 0 {
 				data["latency_ms"] = event.LatencyMs
@@ -1777,6 +1860,25 @@ func contentHash(content string) string {
 	return hex.EncodeToString(h[:])
 }
 
+func (h *Handler) enrichChunks(ctx context.Context, docContent string, chunks []*container.Document) []*container.Document {
+	if h.cfg == nil || !h.cfg.RAG.EnableContextualEnrichment {
+		return chunks
+	}
+	llm, llmErr := h.contextModel(ctx)
+	if llmErr != nil {
+		log.Printf("[Enricher] 创建 LLM 失败，跳过富化: %v", llmErr)
+		return chunks
+	}
+	enricher := document.NewContextualEnricher(llm)
+	enrichedChunks, enrichErr := enricher.Enrich(ctx, docContent, chunks)
+	if enrichErr != nil {
+		log.Printf("[Enricher] 富化失败，使用原始 chunks: %v", enrichErr)
+		return chunks
+	}
+	log.Printf("[Enricher] 成功富化 %d 个 chunks", len(enrichedChunks))
+	return enrichedChunks
+}
+
 func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeID, filename string, content []byte) (int, error) {
 	rawDoc := &document.RawDocument{
 		ID:      knowledgeID,
@@ -1811,21 +1913,7 @@ func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeI
 	}
 
 	// 上下文富化（可选）
-	if h.cfg.RAG.EnableContextualEnrichment && h.cfg.Agent.LightLLM != nil && h.cfg.Agent.LightLLM.BaseURL != "" {
-		lightLLM, _, llmErr := container.NewLLMProvider(ctx, h.cfg.Agent.LightLLM)
-		if llmErr != nil {
-			log.Printf("[Enricher] 创建 LLM 失败，跳过富化: %v", llmErr)
-		} else {
-			enricher := document.NewContextualEnricher(lightLLM)
-			enrichedChunks, enrichErr := enricher.Enrich(ctx, string(content), chunks)
-			if enrichErr != nil {
-				log.Printf("[Enricher] 富化失败，使用原始 chunks: %v", enrichErr)
-			} else {
-				chunks = enrichedChunks
-				log.Printf("[Enricher] 成功富化 %d 个 chunks", len(chunks))
-			}
-		}
-	}
+	chunks = h.enrichChunks(ctx, string(content), chunks)
 
 	contents := make([]string, len(chunks))
 	for i, chunk := range chunks {
@@ -2025,7 +2113,12 @@ func (h *Handler) processAndStoreChunks(ctx context.Context, kbID, knowledgeID, 
 				"uploaded_at":       time.Now().Format(time.RFC3339),
 			},
 		}
-		contents[i] = chunk.Content
+	}
+
+	docContent := strings.Join(parsedChunkContents(chunks), "\n\n")
+	docs = h.enrichChunks(ctx, docContent, docs)
+	for i, doc := range docs {
+		contents[i] = doc.Content
 	}
 
 	// 批量向量化
@@ -2092,6 +2185,16 @@ func (h *Handler) processAndStoreChunks(ctx context.Context, kbID, knowledgeID, 
 	}
 
 	return nil
+}
+
+func parsedChunkContents(chunks []docreader.ParsedChunk) []string {
+	contents := make([]string, 0, len(chunks))
+	for _, chunk := range chunks {
+		if strings.TrimSpace(chunk.Content) != "" {
+			contents = append(contents, chunk.Content)
+		}
+	}
+	return contents
 }
 
 // ListDocuments 获取知识库文档列表
@@ -3240,12 +3343,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 			"enabled":      h.cfg.MCP.Enabled,
 			"server_count": len(h.cfg.MCP.Servers),
 		},
-		"docreader": gin.H{
-			"enabled":     h.cfg.DocReader.Enabled,
-			"mode":        h.cfg.DocReader.Mode,
-			"endpoint":    h.cfg.DocReader.Endpoint,
-			"render_mode": h.cfg.DocReader.RenderMode,
-		},
+		"docreader": h.docReaderStatus(),
 		// 前端使用 graph_rag 作为 key
 		"graph_rag": gin.H{
 			"enabled":             h.cfg.GraphRAG.Enabled,

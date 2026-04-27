@@ -92,6 +92,7 @@ export interface Message {
   role: 'user' | 'assistant' | string;
   content: string;
   trace?: TraceStep[];
+  ungrounded?: boolean;
   agent_steps?: unknown;
   created_at?: string;
 }
@@ -139,7 +140,44 @@ export interface StreamEvent {
   latency_ms?: number;
   source_count?: number;
   retry_count?: number;
+  metadata?: Record<string, unknown>;
   trace_step?: TraceStep;
+}
+
+export interface GraphNode {
+  id: string;
+  label: string;
+  degree: number;
+  chunk_count: number;
+}
+
+export interface GraphEdge {
+  source: string;
+  target: string;
+  label: string;
+}
+
+export interface GraphData {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+export interface SettingsResponse {
+  settings?: {
+    docreader?: DocReaderStatus;
+    [key: string]: unknown;
+  };
+}
+
+export interface DocReaderStatus {
+  enabled?: boolean;
+  active?: boolean;
+  mode?: string;
+  primary?: string;
+  fallback?: string;
+  endpoint?: string;
+  mineru_endpoint?: string;
+  render_mode?: string;
 }
 
 export interface MCPStatus {

@@ -20,7 +20,7 @@ export class ApiClient {
   constructor(options: ApiClientOptions = {}) {
     this.baseUrl = (options.baseUrl ?? '/api/v1').replace(/\/$/, '');
     this.getToken = options.getToken;
-    this.fetcher = options.fetcher ?? fetch;
+    this.fetcher = options.fetcher ?? ((...args) => globalThis.fetch(...args));
   }
 
   get<T = unknown>(path: string, options?: RequestOptions) {

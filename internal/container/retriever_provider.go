@@ -82,12 +82,6 @@ func (r *CompositeRetriever) SetGraphRetrieverFactory(f GraphRetrieverFactory) {
 
 // Retrieve 执行检索
 func (r *CompositeRetriever) Retrieve(ctx context.Context, query string, opts ...einoretriever.Option) ([]*schema.Document, error) {
-	if cachedDocs, ok, err := r.getCachedRetrievalDocuments(ctx, query, false); err != nil {
-		log.Printf("[Retriever] 读取检索缓存失败，降级到实时检索: %v", err)
-	} else if ok {
-		return toSchemaDocuments(cachedDocs), nil
-	}
-
 	if r.cfg.EnableHybrid {
 		return r.retrieveWithHybrid(ctx, query, opts...)
 	}
@@ -112,8 +106,6 @@ func (r *CompositeRetriever) Retrieve(ctx context.Context, query string, opts ..
 		docs = docs[:topK]
 	}
 
-	r.setCachedRetrievalDocuments(ctx, query, false, docs)
-
 	return toSchemaDocuments(docs), nil
 }
 
@@ -121,12 +113,6 @@ func (r *CompositeRetriever) retrieveWithHybrid(ctx context.Context, query strin
 	topK := r.cfg.TopK
 	if topK <= 0 {
 		topK = 10
-	}
-
-	if cachedDocs, ok, err := r.getCachedRetrievalDocuments(ctx, query, true); err != nil {
-		log.Printf("[Retriever] 读取检索缓存失败，降级到实时检索: %v", err)
-	} else if ok {
-		return toSchemaDocuments(cachedDocs), nil
 	}
 
 	queryVector, err := r.getQueryEmbedding(ctx, query)
@@ -189,8 +175,6 @@ func (r *CompositeRetriever) retrieveWithHybrid(ctx context.Context, query strin
 		fused = append(fused, graphContextDoc)
 		log.Printf("[Retriever] 已注入图谱上下文文档（%d 字符）", len(graphContextDoc.Content))
 	}
-
-	r.setCachedRetrievalDocuments(ctx, query, true, fused)
 
 	return toSchemaDocuments(fused), nil
 }
@@ -257,65 +241,6 @@ func (r *CompositeRetriever) getQueryEmbedding(ctx context.Context, query string
 	return EmbedFloat32(ctx, r.embedding, query)
 }
 
-func (r *CompositeRetriever) getCachedRetrievalDocuments(ctx context.Context, query string, hybrid bool) ([]*Document, bool, error) {
-	if r.retrievalCache == nil {
-		return nil, false, nil
-	}
-	cacheKey := r.retrievalCacheKey(query, hybrid)
-	result, hit, err := r.retrievalCache.GetRetrievalResult(ctx, cacheKey)
-	if err != nil {
-		return nil, false, err
-	}
-	if !hit || result == nil || len(result.Documents) == 0 {
-		log.Printf("[Cache][Retrieval] miss mode=%s", map[bool]string{true: "hybrid", false: "vector"}[hybrid])
-		return nil, false, nil
-	}
-	log.Printf("[Cache][Retrieval] hit mode=%s docs=%d", map[bool]string{true: "hybrid", false: "vector"}[hybrid], len(result.Documents))
-	return retrievalCacheDocsToDocuments(result.Documents), true, nil
-}
-
-func (r *CompositeRetriever) setCachedRetrievalDocuments(ctx context.Context, query string, hybrid bool, docs []*Document) {
-	if r.retrievalCache == nil || len(docs) == 0 {
-		return
-	}
-	result := &cachepkg.RetrievalResult{
-		DocIDs:    make([]string, 0, len(docs)),
-		Scores:    make([]float64, 0, len(docs)),
-		Documents: documentsToRetrievalCacheDocs(docs),
-		CachedAt:  time.Now(),
-	}
-	for _, doc := range docs {
-		if doc == nil {
-			continue
-		}
-		result.DocIDs = append(result.DocIDs, doc.ID)
-		result.Scores = append(result.Scores, doc.Score)
-	}
-	if err := r.retrievalCache.SetRetrievalResult(ctx, r.retrievalCacheKey(query, hybrid), result, r.retrievalCacheTTL()); err != nil {
-		log.Printf("[Retriever] 写入检索缓存失败，继续返回实时结果: %v", err)
-	}
-}
-
-func (r *CompositeRetriever) retrievalCacheKey(query string, hybrid bool) string {
-	mode := "vector"
-	if hybrid {
-		mode = "hybrid"
-	}
-	return fmt.Sprintf("%s:%d:%s:%s", mode, r.cfg.TopK, r.scopeCacheKey(), hashQuery(query))
-}
-
-func (r *CompositeRetriever) scopeCacheKey() string {
-	if scoped, ok := r.vectorDB.(*knowledgeBaseScopedVectorDB); ok {
-		ids := make([]string, 0, len(scoped.kbSet))
-		for id := range scoped.kbSet {
-			ids = append(ids, id)
-		}
-		sort.Strings(ids)
-		return strings.Join(ids, ",")
-	}
-	return "all"
-}
-
 func (r *CompositeRetriever) embeddingModelID() string {
 	if r.embeddingCfg != nil && strings.TrimSpace(r.embeddingCfg.ModelID) != "" {
 		return strings.TrimSpace(r.embeddingCfg.ModelID)
@@ -327,14 +252,6 @@ func (r *CompositeRetriever) embeddingCacheTTL() time.Duration {
 	minutes := r.cfg.EmbeddingCacheTTLMinutes
 	if minutes <= 0 {
 		minutes = 1440
-	}
-	return time.Duration(minutes) * time.Minute
-}
-
-func (r *CompositeRetriever) retrievalCacheTTL() time.Duration {
-	minutes := r.cfg.RetrievalCacheTTLMinutes
-	if minutes <= 0 {
-		minutes = 10
 	}
 	return time.Duration(minutes) * time.Minute
 }
@@ -354,43 +271,6 @@ func toSchemaDocuments(docs []*Document) []*schema.Document {
 			ID:       doc.ID,
 			Content:  doc.Content,
 			MetaData: doc.Metadata,
-		})
-	}
-	return result
-}
-
-func documentsToRetrievalCacheDocs(docs []*Document) []cachepkg.RetrievalDocument {
-	result := make([]cachepkg.RetrievalDocument, 0, len(docs))
-	for _, doc := range docs {
-		if doc == nil {
-			continue
-		}
-		metadata := make(map[string]any, len(doc.Metadata))
-		for key, value := range doc.Metadata {
-			metadata[key] = value
-		}
-		result = append(result, cachepkg.RetrievalDocument{
-			ID:       doc.ID,
-			Content:  doc.Content,
-			Score:    doc.Score,
-			Metadata: metadata,
-		})
-	}
-	return result
-}
-
-func retrievalCacheDocsToDocuments(docs []cachepkg.RetrievalDocument) []*Document {
-	result := make([]*Document, 0, len(docs))
-	for _, doc := range docs {
-		metadata := make(map[string]interface{}, len(doc.Metadata))
-		for key, value := range doc.Metadata {
-			metadata[key] = value
-		}
-		result = append(result, &Document{
-			ID:       doc.ID,
-			Content:  doc.Content,
-			Score:    doc.Score,
-			Metadata: metadata,
 		})
 	}
 	return result

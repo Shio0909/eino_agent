@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 
-export type AppView = 'chat' | 'knowledge' | 'wiki' | 'ops';
+export type AppView = 'chat' | 'knowledge' | 'wiki' | 'graph' | 'settings';
 
 interface WorkspaceState {
   view: AppView;

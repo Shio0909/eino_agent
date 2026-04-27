@@ -8,7 +8,8 @@ import { EvidenceRail } from './components/layout/EvidenceRail';
 import { ChatPage } from './pages/ChatPage';
 import { KnowledgePage } from './pages/KnowledgePage';
 import { WikiPageView } from './pages/WikiPageView';
-import { OpsPage } from './pages/OpsPage';
+import { GraphPage } from './pages/GraphPage';
+import { SettingsPage } from './pages/SettingsPage';
 import { LoginPage } from './pages/LoginPage';
 import type { ReferenceDocument, TraceStep } from './types/api';
 
@@ -21,6 +22,9 @@ export function App() {
   const [references, setReferences] = useState<ReferenceDocument[]>([]);
   const [trace, setTrace] = useState<TraceStep[]>([]);
   const [streaming, setStreaming] = useState(false);
+  const [chatMode, setChatMode] = useState('agentic');
+  const [forceCitation, setForceCitation] = useState(true);
+  const [evidenceOptions, setEvidenceOptions] = useState({ showRetrieval: true, showRerank: true, showTrace: true, showContext: true });
 
   useEffect(() => {
     endpoints.me()
@@ -51,13 +55,14 @@ export function App() {
       <section className="flex min-h-0 flex-col gap-4">
         <TopBar user={user} onLogout={logout} />
         <div className="min-h-0 flex-1">
-          {view === 'chat' ? <ChatPage onEvidence={updateEvidence} /> : null}
+          {view === 'chat' ? <ChatPage onEvidence={updateEvidence} mode={chatMode} forceCitation={forceCitation} /> : null}
           {view === 'knowledge' ? <KnowledgePage /> : null}
           {view === 'wiki' ? <WikiPageView /> : null}
-          {view === 'ops' ? <OpsPage /> : null}
+          {view === 'graph' ? <GraphPage /> : null}
+          {view === 'settings' ? <SettingsPage mode={chatMode} forceCitation={forceCitation} evidenceOptions={evidenceOptions} onModeChange={setChatMode} onForceCitationChange={setForceCitation} onEvidenceOptionsChange={setEvidenceOptions} /> : null}
         </div>
       </section>
-      <EvidenceRail references={references} trace={trace} streaming={streaming} />
+      <EvidenceRail references={references} trace={trace} streaming={streaming} options={evidenceOptions} />
     </main>
   );
 }

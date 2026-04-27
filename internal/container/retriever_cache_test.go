@@ -110,7 +110,7 @@ func (m *memoryRetrievalCache) InvalidateKnowledgeBase(_ context.Context, knowle
 	return nil
 }
 
-func TestCompositeRetrieverCachesVectorSearch(t *testing.T) {
+func TestCompositeRetrieverCachesEmbeddingButNotRetrievalResults(t *testing.T) {
 	embedder := &fakeEmbedder{vector: []float32{0.1, 0.2}}
 	vectorDB := &fakeVectorDB{docs: []*Document{{ID: "d1", Content: "doc1", Score: 0.9, Metadata: map[string]interface{}{"knowledge_base_id": "kb1"}}}}
 	cacheStore := newMemoryRetrievalCache()
@@ -142,8 +142,11 @@ func TestCompositeRetrieverCachesVectorSearch(t *testing.T) {
 	if embedder.callCount != 1 {
 		t.Fatalf("expected embedding cache hit, got embed call count %d", embedder.callCount)
 	}
-	if vectorDB.searchCalls != 1 {
-		t.Fatalf("expected retrieval cache hit, got search call count %d", vectorDB.searchCalls)
+	if vectorDB.searchCalls != 2 {
+		t.Fatalf("expected retrieval result cache bypassed, got search call count %d", vectorDB.searchCalls)
+	}
+	if len(cacheStore.results) != 0 {
+		t.Fatalf("expected no retrieval results cached, got %d", len(cacheStore.results))
 	}
 }
 

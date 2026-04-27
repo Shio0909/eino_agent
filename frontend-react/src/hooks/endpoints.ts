@@ -1,5 +1,5 @@
 import { api } from '../lib/api';
-import type { AuthResponse, ChatResponse, DocumentListResponse, ImportStatus, KnowledgeBase, KnowledgeBaseListResponse, MCPStatus, Message, Session, User, WikiPage, WikiPageListResponse } from '../types/api';
+import type { AuthResponse, ChatResponse, DocumentListResponse, GraphData, ImportStatus, KnowledgeBase, KnowledgeBaseListResponse, MCPStatus, Message, Session, SettingsResponse, User, WikiPage, WikiPageListResponse } from '../types/api';
 
 export const endpoints = {
   me: () => api.get<{ user: User }>('/auth/me'),
@@ -18,7 +18,8 @@ export const endpoints = {
   sessionMessages: (id: string) => api.get<{ messages: Message[] }>(`/sessions/${id}/messages`),
   chat: (input: Record<string, unknown>) => api.post<ChatResponse>('/chat', input),
   mcp: () => api.get<MCPStatus>('/mcp'),
-  settings: () => api.get<Record<string, unknown>>('/settings'),
+  settings: () => api.get<SettingsResponse>('/settings'),
   systemInfo: () => api.get<Record<string, unknown>>('/system/info'),
   graphStatus: () => api.get<Record<string, unknown>>('/graphrag/status'),
+  graph: (kbId: string, limit = 200) => api.get<GraphData>(`/graphrag/${kbId}/graph?limit=${limit}`),
 };

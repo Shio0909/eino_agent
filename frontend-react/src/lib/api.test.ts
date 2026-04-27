@@ -2,6 +2,25 @@ import { describe, expect, it, vi } from 'vitest';
 import { ApiClient } from './api';
 
 describe('ApiClient', () => {
+  it('calls the default browser fetch with the window binding', async () => {
+    const fetchMock = vi.fn(function (this: unknown) {
+      if (this !== globalThis) throw new TypeError('Illegal invocation');
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        headers: new Headers({ 'content-type': 'application/json' }),
+        json: async () => ({ ok: true }),
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new ApiClient({ baseUrl: '/api/v1' });
+
+    await expect(client.get('/health')).resolves.toEqual({ ok: true });
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/health', expect.objectContaining({ method: 'GET' }));
+    vi.unstubAllGlobals();
+  });
+
   it('sends bearer tokens and parses json responses', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,

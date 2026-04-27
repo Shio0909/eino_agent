@@ -10,4 +10,17 @@ describe('renderSafeMarkdown', () => {
     expect(html).not.toContain('<script>');
     expect(html).toContain('Home');
   });
+
+  it('links source citations in chat markdown', () => {
+    const html = renderSafeMarkdown('结论 [来源2]', { linkCitations: true });
+
+    expect(html).toContain('<a href="#source-2">来源2</a>');
+  });
+
+  it('maps source ids to numbered citations in chat markdown', () => {
+    const html = renderSafeMarkdown('结论 [来源：doc-b]', { linkCitations: true, sourceIds: ['doc-a', 'doc-b'] });
+
+    expect(html).toContain('<a href="#source-2">来源2</a>');
+    expect(html).not.toContain('doc-b');
+  });
 });

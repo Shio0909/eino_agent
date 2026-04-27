@@ -42,6 +42,14 @@ export function useSessions() {
   return useQuery({ queryKey: ['sessions'], queryFn: endpoints.sessions });
 }
 
+export function useGraph(kbId?: string | null, limit = 200) {
+  return useQuery({
+    queryKey: ['graphrag-graph', kbId, limit],
+    queryFn: () => endpoints.graph(kbId!, limit),
+    enabled: Boolean(kbId),
+  });
+}
+
 export function useOpsStatus() {
   return {
     mcp: useQuery({ queryKey: ['mcp'], queryFn: endpoints.mcp }),
