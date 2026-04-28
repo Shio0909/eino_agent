@@ -813,56 +813,24 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 	if req.UseAgent && s.config.Agent.Enabled {
 		mode = "agentic"
 		modeStart := time.Now()
-		trace.add(TraceStep{Type: "status", Stage: "agent_start", Metadata: map[string]any{"max_steps": s.config.Agent.MaxSteps}})
-		runtimeAgent, kt, createErr := s.buildRuntimeAgentForRequest(ctx, cc.runtimeRetriever, req, trace.addEvent)
-		if createErr != nil {
-			return nil, fmt.Errorf("build runtime agent: %w", createErr)
-		}
-
-		messages := []*schema.Message{
-			{Role: schema.User, Content: cc.messageWithInst},
-		}
-		llmCtx, llmCancel := context.WithTimeout(ctx, time.Duration(s.config.Agent.LLMTimeout)*time.Second)
-		defer llmCancel()
-		respMsg, agentErr := runtimeAgent.Generate(llmCtx, messages)
-		if agentErr != nil {
-			return nil, fmt.Errorf("agent chat: %w", agentErr)
-		}
-
-		answer := ""
-		var promptTokens, completionTokens int
-		if respMsg != nil {
-			answer = respMsg.Content
-			if respMsg.ResponseMeta != nil && respMsg.ResponseMeta.Usage != nil {
-				promptTokens = respMsg.ResponseMeta.Usage.PromptTokens
-				completionTokens = respMsg.ResponseMeta.Usage.CompletionTokens
-			}
-		}
-		answer = filter.StripThinkTags(answer)
-		trace.add(TraceStep{
-			Type:       "status",
-			Stage:      "agent_generate",
-			LatencyMs:  time.Since(modeStart).Milliseconds(),
-			TokenCount: promptTokens + completionTokens,
-			Metadata: map[string]any{
-				"prompt_tokens":     promptTokens,
-				"completion_tokens": completionTokens,
-			},
+		agentOut, agentErr := s.runAgentStateGraph(ctx, agentStateGraphInput{
+			Request:          req,
+			Message:          cc.messageWithInst,
+			RuntimeRetriever: cc.runtimeRetriever,
+			EventSink:        trace.addEvent,
 		})
-
-		// 从 KnowledgeTool 缓存中提取 sources，避免冗余二次检索
-		var sources []Source
-		if kt != nil {
-			for _, doc := range kt.LastDocs() {
-				if doc == nil || strings.TrimSpace(doc.ID) == "" {
-					continue
-				}
-				sources = append(sources, sourceFromDocument(doc))
-				if len(sources) >= s.config.RAG.TopK {
-					break
-				}
-			}
+		appendTraceSteps(trace, agentOut.Trace)
+		if agentErr != nil {
+			return nil, agentErr
 		}
+		if agentOut.Err != nil {
+			return nil, agentOut.Err
+		}
+
+		answer := agentOut.Answer
+		sources := agentOut.Sources
+		promptTokens := agentOut.PromptTokens
+		completionTokens := agentOut.CompletionTokens
 		logger.FromContext(ctx).Info("chat_agentic",
 			"sources", len(sources),
 			"duration_ms", time.Since(modeStart).Milliseconds(),
@@ -1014,42 +982,30 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 
 		// Agentic 模式
 		if req.UseAgent && s.config.Agent.Enabled {
-			trace.add(TraceStep{Type: "status", Stage: "agent_start", Metadata: map[string]any{"max_steps": s.config.Agent.MaxSteps}})
-			eventSink := func(ev StreamEvent) { trySend(ev) }
-			runtimeAgent, kt, createErr := s.buildRuntimeAgentForRequest(ctx, cc.runtimeRetriever, req, eventSink)
-			if createErr != nil {
-				trySend(StreamEvent{Type: "error", Error: createErr.Error()})
-				return
-			}
-
-			messages := []*schema.Message{
-				{Role: schema.User, Content: cc.messageWithInst},
-			}
-			// Use Generate (not Stream) because our tools only implement InvokableTool,
-			// not StreamableTool. The ReAct graph in streaming mode tries to stream-invoke
-			// tools, which fails. Generate runs the full ReAct loop correctly.
-			// Action/observation events still fire via eventSink during tool execution.
-			llmCtx, llmCancel := context.WithTimeout(ctx, time.Duration(s.config.Agent.LLMTimeout)*time.Second)
-			respMsg, agentErr := runtimeAgent.Generate(llmCtx, messages)
-			llmCancel()
-			if agentErr != nil {
-				trySend(StreamEvent{Type: "error", Error: agentErr.Error(), TraceStep: &TraceStep{Type: "error", Stage: "agent_generate", Content: agentErr.Error(), LatencyMs: time.Since(startTime).Milliseconds()}})
-				return
-			}
-
-			answer := ""
-			if respMsg != nil {
-				answer = respMsg.Content
-			}
-			// Strip think-tag content, then fake-stream the final answer rune by rune.
-			answer = filter.StripThinkTags(answer)
-			if kt != nil {
-				sources := sourcesFromDocuments(kt.LastDocs(), s.config.RAG.TopK)
-				if len(sources) > 0 && !trySend(StreamEvent{Type: "sources", Sources: sources, SourceCount: len(sources)}) {
+			agentOut, agentErr := s.runAgentStateGraph(ctx, agentStateGraphInput{
+				Request:          req,
+				Message:          cc.messageWithInst,
+				RuntimeRetriever: cc.runtimeRetriever,
+				EventSink:        func(ev StreamEvent) { trySend(ev) },
+			})
+			for _, step := range agentOut.Trace {
+				if !trySend(StreamEvent{Type: step.Type, Content: step.Content, LatencyMs: step.LatencyMs, TraceStep: &step}) {
 					return
 				}
 			}
-			trace.add(TraceStep{Type: "status", Stage: "agent_generate", LatencyMs: time.Since(startTime).Milliseconds()})
+			if agentErr != nil {
+				trySend(StreamEvent{Type: "error", Error: agentErr.Error()})
+				return
+			}
+			if agentOut.Err != nil {
+				trySend(StreamEvent{Type: "error", Error: agentOut.Err.Error()})
+				return
+			}
+
+			answer := agentOut.Answer
+			if len(agentOut.Sources) > 0 && !trySend(StreamEvent{Type: "sources", Sources: agentOut.Sources, SourceCount: len(agentOut.Sources)}) {
+				return
+			}
 			if answer != "" {
 				log.Printf("[Timing][ChatService] mode=agentic stage=first_token duration_ms=%d", time.Since(startTime).Milliseconds())
 				for _, r := range []rune(answer) {
@@ -1063,11 +1019,8 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 
 			// 记录流式 agentic 模式的指标和审计日志
 			duration := time.Since(startTime)
-			var promptTokens, completionTokens int
-			if respMsg != nil && respMsg.ResponseMeta != nil && respMsg.ResponseMeta.Usage != nil {
-				promptTokens = respMsg.ResponseMeta.Usage.PromptTokens
-				completionTokens = respMsg.ResponseMeta.Usage.CompletionTokens
-			}
+			promptTokens := agentOut.PromptTokens
+			completionTokens := agentOut.CompletionTokens
 			metrics.RecordLLMCall(s.config.LLM.Provider, s.config.LLM.ModelID, "agentic", duration, promptTokens, completionTokens)
 			s.recordLLMAudit(ctx, &repository.LLMAuditLog{
 				TraceID:          logger.TraceIDFrom(ctx),
