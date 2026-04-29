@@ -11,10 +11,13 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/cloudwego/eino/components/retriever"
 	"github.com/cloudwego/eino/schema"
+
+	"eino_agent/internal/tracing"
 )
 
 // RAGPipeline RAG 流水线
@@ -188,10 +191,19 @@ func (p *RAGPipeline) Run(ctx context.Context, req *RAGRequest) (*RAGResponse, e
 
 	retrieveStart := time.Now()
 	docs, err := p.retriever.Retrieve(ctx, query)
-	log.Printf("[Timing][Pipeline] stage=retrieve duration_ms=%d docs=%d", time.Since(retrieveStart).Milliseconds(), len(docs))
+	retrieveLatencyMs := time.Since(retrieveStart).Milliseconds()
+	log.Printf("[Timing][Pipeline] stage=retrieve duration_ms=%d docs=%d", retrieveLatencyMs, len(docs))
 	if err != nil {
+		tracing.Emit(ctx, tracing.Event{Type: "error", Stage: "retrieve", Summary: err.Error(), Error: err.Error(), LatencyMs: retrieveLatencyMs})
 		return nil, fmt.Errorf("retrieve: %w", err)
 	}
+	tracing.Emit(ctx, tracing.Event{
+		Type:      "retrieval",
+		Stage:     "retrieved_candidates",
+		Summary:   "retrieved candidate documents",
+		LatencyMs: retrieveLatencyMs,
+		Metadata:  map[string]any{"query": query, "count": len(docs), "chunks": traceChunksFromDocs(docs)},
+	})
 
 	// Step 3: 重排序
 	resp.Trace.Retrieved = traceChunksFromDocs(docs)
@@ -238,6 +250,17 @@ func (p *RAGPipeline) Run(ctx context.Context, req *RAGRequest) (*RAGResponse, e
 		}
 	}
 	log.Printf("[Timing][Pipeline] stage=build_context duration_ms=%d top_k=%d", time.Since(contextStart).Milliseconds(), topK)
+	tracing.Emit(ctx, tracing.Event{
+		Type:    "context",
+		Stage:   "context_build",
+		Summary: "built generation context",
+		Metadata: map[string]any{
+			"chunks":          resp.Trace.Context,
+			"count":           len(resp.Trace.Context),
+			"context_chars":   len(contextBuilder),
+			"context_preview": compactText(contextBuilder, 500),
+		},
+	})
 
 	// Step 5: 生成回答
 	if p.generator == nil {
@@ -251,10 +274,23 @@ func (p *RAGPipeline) Run(ctx context.Context, req *RAGRequest) (*RAGResponse, e
 
 	generateStart := time.Now()
 	answer, err := p.generator.Generate(ctx, generationQuery, contextBuilder)
-	log.Printf("[Timing][Pipeline] stage=generate duration_ms=%d context_chars=%d", time.Since(generateStart).Milliseconds(), len(contextBuilder))
+	generateLatencyMs := time.Since(generateStart).Milliseconds()
+	log.Printf("[Timing][Pipeline] stage=generate duration_ms=%d context_chars=%d", generateLatencyMs, len(contextBuilder))
 	if err != nil {
+		tracing.Emit(ctx, tracing.Event{Type: "error", Stage: "generate", Summary: err.Error(), Error: err.Error(), LatencyMs: generateLatencyMs})
 		return nil, fmt.Errorf("generate: %w", err)
 	}
+	tracing.Emit(ctx, tracing.Event{
+		Type:      "llm",
+		Stage:     "generate",
+		Summary:   "answer generated",
+		LatencyMs: generateLatencyMs,
+		Metadata: map[string]any{
+			"context_chars":     len(contextBuilder),
+			"answer_chars":      len(answer),
+			"token_unavailable": true,
+		},
+	})
 	resp.Answer = answer
 	log.Printf("[Timing][Pipeline] stage=total duration_ms=%d", time.Since(startTime).Milliseconds())
 
@@ -343,6 +379,18 @@ func boundedTopK(length, topK int) int {
 	return length
 }
 
+func compactText(text string, maxLen int) string {
+	trimmed := strings.TrimSpace(text)
+	if maxLen <= 0 {
+		return trimmed
+	}
+	runes := []rune(trimmed)
+	if len(runes) <= maxLen {
+		return trimmed
+	}
+	return string(runes[:maxLen]) + "..."
+}
+
 // RunStream 流式执行 RAG 流水线
 // 【Eino 特点】原生支持流式输出，与 Eino 的 StreamReader 无缝集成
 func (p *RAGPipeline) RunStream(ctx context.Context, req *RAGRequest) (<-chan StreamChunk, error) {
@@ -368,10 +416,14 @@ func (p *RAGPipeline) RunStream(ctx context.Context, req *RAGRequest) (<-chan St
 
 		docs, err := p.retriever.Retrieve(ctx, query)
 		if err != nil {
+			tracing.Emit(ctx, tracing.Event{Type: "error", Stage: "retrieve", Summary: err.Error(), Error: err.Error()})
 			ch <- StreamChunk{Type: ChunkTypeError, Content: err.Error()}
 			return
 		}
-		ch <- StreamChunk{Type: ChunkTypeTrace, Metadata: map[string]any{"stage": "retrieved_candidates", "chunks": traceChunksFromDocs(docs), "count": len(docs)}}
+		chunks := traceChunksFromDocs(docs)
+		traceMetadata := map[string]any{"stage": "retrieved_candidates", "query": query, "chunks": chunks, "count": len(docs)}
+		tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "retrieved_candidates", Summary: "retrieved candidate documents", Metadata: traceMetadata})
+		ch <- StreamChunk{Type: ChunkTypeTrace, Metadata: traceMetadata}
 		rankedDocs := docs
 		passages := extractPassages(docs)
 		rerankedIdx := make([]int, len(passages))
@@ -420,7 +472,16 @@ func (p *RAGPipeline) RunStream(ctx context.Context, req *RAGRequest) (<-chan St
 		}
 
 		contextCount := boundedTopK(len(rankedDocs), p.config.RerankTopK)
-		ch <- StreamChunk{Type: ChunkTypeTrace, Metadata: map[string]any{"stage": "context_build", "chunks": traceChunksFromDocs(rankedDocs[:contextCount]), "count": contextCount}}
+		contextChunks := traceChunksFromDocs(rankedDocs[:contextCount])
+		contextMetadata := map[string]any{
+			"stage":           "context_build",
+			"chunks":          contextChunks,
+			"count":           contextCount,
+			"context_chars":   len(contextBuilder),
+			"context_preview": compactText(contextBuilder, 500),
+		}
+		tracing.Emit(ctx, tracing.Event{Type: "context", Stage: "context_build", Summary: "built generation context", Metadata: contextMetadata})
+		ch <- StreamChunk{Type: ChunkTypeTrace, Metadata: contextMetadata}
 
 		// 流式生成
 		if p.generator == nil {
@@ -435,13 +496,28 @@ func (p *RAGPipeline) RunStream(ctx context.Context, req *RAGRequest) (<-chan St
 
 		stream, err := p.generator.GenerateStream(ctx, generationQuery, contextBuilder)
 		if err != nil {
+			tracing.Emit(ctx, tracing.Event{Type: "error", Stage: "generate", Summary: err.Error(), Error: err.Error()})
 			ch <- StreamChunk{Type: ChunkTypeError, Content: err.Error()}
 			return
 		}
 
+		generateStart := time.Now()
+		answerChars := 0
 		for chunk := range stream {
+			answerChars += len(chunk)
 			ch <- StreamChunk{Type: ChunkTypeContent, Content: chunk}
 		}
+		tracing.Emit(ctx, tracing.Event{
+			Type:      "llm",
+			Stage:     "generate",
+			Summary:   "answer streamed",
+			LatencyMs: time.Since(generateStart).Milliseconds(),
+			Metadata: map[string]any{
+				"context_chars":     len(contextBuilder),
+				"answer_chars":      answerChars,
+				"token_unavailable": true,
+			},
+		})
 
 		ch <- StreamChunk{Type: ChunkTypeDone}
 	}()

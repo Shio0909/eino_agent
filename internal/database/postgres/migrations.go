@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 		{"000005_add_embed_fingerprint.up.sql", "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'knowledge_bases' AND column_name = 'embed_model_fingerprint')"},
 		{"000006_add_content_hash.up.sql", "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'knowledges' AND column_name = 'content_hash')"},
 		{"000007_add_kb_access_control.up.sql", "SELECT to_regclass('public.knowledge_base_shares') IS NOT NULL"},
+		{"000008_create_request_traces.up.sql", "SELECT to_regclass('public.request_traces') IS NOT NULL"},
 	}
 
 	for _, check := range baselineChecks {

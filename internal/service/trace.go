@@ -6,28 +6,45 @@ import (
 
 	"github.com/cloudwego/eino/components/retriever"
 	"github.com/cloudwego/eino/schema"
+
+	"eino_agent/internal/database/repository"
+	"eino_agent/internal/tracing"
 )
 
 type traceCollector struct {
+	traceID string
 	started time.Time
 	steps   []TraceStep
 }
 
-func newTraceCollector() *traceCollector {
-	return &traceCollector{started: time.Now()}
+func newTraceCollector(traceID string) *traceCollector {
+	return &traceCollector{traceID: traceID, started: time.Now()}
 }
 
-func (t *traceCollector) add(step TraceStep) {
+func (t *traceCollector) add(step TraceStep) TraceStep {
 	if t == nil {
-		return
+		return step
+	}
+	if step.TraceID == "" {
+		step.TraceID = t.traceID
+	}
+	if step.Seq == 0 {
+		step.Seq = len(t.steps) + 1
 	}
 	if step.Type == "" {
 		step.Type = "status"
+	}
+	if step.Level == "" {
+		step.Level = "info"
+	}
+	if step.Error != "" && step.Level == "info" {
+		step.Level = "error"
 	}
 	if step.LatencyMs == 0 {
 		step.LatencyMs = time.Since(t.started).Milliseconds()
 	}
 	t.steps = append(t.steps, step)
+	return step
 }
 
 func (t *traceCollector) addStage(stage string, started time.Time, metadata map[string]any) {
@@ -46,7 +63,68 @@ func (t *traceCollector) addEvent(ev StreamEvent) {
 		ToolInput: ev.ToolInput,
 		DocID:     ev.DocID,
 		LatencyMs: ev.LatencyMs,
+		Error:     ev.Error,
 	})
+}
+
+func (t *traceCollector) addTraceEvent(ev tracing.Event) {
+	if t == nil {
+		return
+	}
+	t.add(TraceStep{
+		Type:      ev.Type,
+		Stage:     ev.Stage,
+		Level:     ev.Level,
+		Summary:   ev.Summary,
+		Content:   ev.Content,
+		ToolName:  ev.ToolName,
+		ToolInput: ev.ToolInput,
+		DocID:     ev.DocID,
+		LatencyMs: ev.LatencyMs,
+		Error:     ev.Error,
+		Metadata:  ev.Metadata,
+	})
+}
+
+func (t *traceCollector) context(ctx context.Context) context.Context {
+	if t == nil {
+		return ctx
+	}
+	return tracing.WithSink(ctx, t.addTraceEvent)
+}
+
+func (t *traceCollector) addError(stage string, err error, metadata map[string]any) {
+	if err == nil {
+		return
+	}
+	t.add(TraceStep{Type: "error", Stage: stage, Level: "error", Error: err.Error(), Summary: err.Error(), Metadata: metadata})
+}
+
+func (t *traceCollector) summary(mode, status string, latencyMs int64, sourceCount int, errText string) repository.JSON {
+	if t == nil {
+		return repository.JSON{}
+	}
+	summary := repository.JSON{
+		"mode":         mode,
+		"status":       status,
+		"latency_ms":   latencyMs,
+		"source_count": sourceCount,
+		"step_count":   len(t.steps),
+	}
+	if errText != "" {
+		summary["error"] = errText
+	}
+	for _, step := range t.steps {
+		if step.Stage == "request" && step.Metadata != nil {
+			if query, ok := step.Metadata["query"].(string); ok && query != "" {
+				summary["query"] = query
+			}
+		}
+		if step.Stage == "rewrite" && step.Content != "" {
+			summary["rewrite_query"] = step.Content
+		}
+	}
+	return summary
 }
 
 func (t *traceCollector) snapshot() []TraceStep {

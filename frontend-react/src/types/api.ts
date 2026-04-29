@@ -91,6 +91,7 @@ export interface Message {
   session_id?: string;
   role: 'user' | 'assistant' | string;
   content: string;
+  trace_id?: string;
   trace?: TraceStep[];
   ungrounded?: boolean;
   agent_steps?: unknown;
@@ -106,14 +107,19 @@ export interface ReferenceDocument {
 }
 
 export interface TraceStep {
+  trace_id?: string;
+  seq?: number;
   type: string;
   stage?: string;
+  level?: string;
+  summary?: string;
   content?: string;
   tool_name?: string;
   tool_input?: string;
   doc_id?: string;
   latency_ms?: number;
   token_count?: number;
+  error?: string;
   metadata?: Record<string, unknown>;
 }
 
@@ -122,6 +128,7 @@ export interface ChatResponse {
   references?: ReferenceDocument[];
   sources?: ReferenceDocument[];
   session_id?: string;
+  trace_id?: string;
   tokens_used?: number;
   latency_ms?: number;
   trace?: TraceStep[];
@@ -133,6 +140,7 @@ export interface StreamEvent {
   doc_id?: string;
   error?: string;
   session_id?: string;
+  trace_id?: string;
   resolved_mode?: string;
   tool_name?: string;
   tool_input?: string;
@@ -142,6 +150,24 @@ export interface StreamEvent {
   retry_count?: number;
   metadata?: Record<string, unknown>;
   trace_step?: TraceStep;
+  trace_snapshot?: TraceStep[];
+}
+
+export interface RequestTrace {
+  id: number;
+  trace_id: string;
+  tenant_id: number;
+  user_id: string;
+  session_id: string;
+  message_id: string;
+  mode: string;
+  status: string;
+  latency_ms: number;
+  steps?: TraceStep[];
+  summary?: Record<string, unknown>;
+  error?: string;
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface GraphNode {

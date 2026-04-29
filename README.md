@@ -20,6 +20,7 @@
 - **混合检索**：向量检索 + PostgreSQL FTS/ILIKE 全文检索 RRF 融合，支持 pgvector / Milvus
 - **Reranker**：BGE / Jina / Cohere 重排序，检索后自动精排
 - **流式输出**：所有模式均支持 SSE 流式响应，内置 DeepSeek `<think>` 标签过滤
+- **请求级 Trace**：每次用户 query 生成统一 `trace_id`，记录检索、RRF、rerank、工具调用、生成、sources、错误和延迟，可实时 SSE 观察并通过接口回看
 - **多租户**：JWT 鉴权 + 租户隔离，知识库和会话均按租户隔离
 - **MCP 工具**：通过 MCP 协议动态挂载远程工具（Streamable HTTP / SSE / Stdio）
 - **Eino Skill**：渐进式披露（Progressive Disclosure）skill 中间件，支持按请求动态选择技能
@@ -54,6 +55,8 @@
 ```
 查询 → 查询重写 → 混合检索(向量+FTS/ILIKE) → RRF融合 → 重排序 → 构建上下文 → LLM 生成 → 回答
 ```
+
+每次请求都会生成统一 `trace_id`，用于串联原始 query、检索模式、各路召回、RRF 分数、rerank 分数、最终上下文、LLM 生成、sources、错误和各阶段延迟。
 
 ### Agentic 模式（ReAct Agent + 工具调用）
 ```
@@ -103,7 +106,7 @@ eino_agent/
 │   └── mcp/                 # MCP 工具管理器
 ├── skills/                  # Eino Skill 定义文件
 ├── scripts/                 # 评估与运维脚本
-├── migrations/              # 数据库迁移
+├── migrations/              # 数据库迁移（包含 request_traces 链路观测表）
 ├── frontend-react/          # React 前端
 └── docker/                  # Docker 构建文件
 ```
@@ -202,6 +205,18 @@ curl -X POST http://localhost:19093/api/v1/chat/stream \
   -d '{"message": "帮我搜索最新资料", "mode": "agentic"}'
 ```
 
+**按 trace_id 回看完整链路**
+```bash
+curl http://localhost:19093/api/v1/traces/<trace_id> \
+  -H "Authorization: Bearer <token>"
+```
+
+**查看某个会话下的请求链路列表**
+```bash
+curl http://localhost:19093/api/v1/sessions/<session_id>/traces \
+  -H "Authorization: Bearer <token>"
+```
+
 **健康检查**
 ```bash
 curl http://localhost:19093/health
@@ -209,13 +224,17 @@ curl http://localhost:19093/health
 
 ## API 概览
 
+> 请求级 Trace 的字段、SSE 事件和排查方式见 `docs/TRACE_OBSERVABILITY.md`。
+
 | 路由 | 方法 | 说明 |
 |------|------|------|
 | `/health` | GET | 健康检查 |
 | `/api/v1/auth/login` | POST | 登录获取 Token |
 | `/api/v1/auth/me` | GET | 获取当前用户信息 |
 | `/api/v1/chat` | POST | 聊天（非流式） |
-| `/api/v1/chat/stream` | POST | 聊天（SSE 流式） |
+| `/api/v1/chat/stream` | POST | 聊天（SSE 流式，包含 `trace_step` / `trace_snapshot`） |
+| `/api/v1/traces/:trace_id` | GET | 查看单次 query 的完整 trace |
+| `/api/v1/sessions/:id/traces` | GET | 查看会话下的 query trace 列表 |
 | `/api/v1/knowledge-bases` | GET/POST | 知识库列表 / 创建（支持 mode: vector/wiki） |
 | `/api/v1/knowledge-bases/:id` | GET/PUT/DELETE | 知识库详情 / 更新 / 删除 |
 | `/api/v1/knowledge-bases/:id/documents` | POST/GET | 上传文档 / 文档列表 |

@@ -55,10 +55,11 @@ type ChatService struct {
 	promptManager   *promptmgr.Manager
 
 	// 持久化
-	sessionRepo  repository.SessionRepository
-	messageRepo  repository.MessageRepository
-	sessionCache cachepkg.SessionCache
-	auditRepo    repository.LLMAuditRepository // LLM 调用审计日志（可选）
+	sessionRepo      repository.SessionRepository
+	messageRepo      repository.MessageRepository
+	sessionCache     cachepkg.SessionCache
+	auditRepo        repository.LLMAuditRepository // LLM 调用审计日志（可选）
+	requestTraceRepo repository.RequestTraceRepository
 }
 
 // NewChatService 创建聊天服务
@@ -132,6 +133,39 @@ func (s *ChatService) SetRepositories(sessionRepo repository.SessionRepository, 
 // SetAuditRepo 设置 LLM 调用审计日志仓储（可选，nil 则不记录）
 func (s *ChatService) SetAuditRepo(repo repository.LLMAuditRepository) {
 	s.auditRepo = repo
+}
+
+func (s *ChatService) SetRequestTraceRepo(repo repository.RequestTraceRepository) {
+	s.requestTraceRepo = repo
+}
+
+func (s *ChatService) recordRequestTrace(traceID string, req *ChatRequest, sessionID, messageID, mode, status string, latencyMs int64, steps []TraceStep, summary repository.JSON, errText string) {
+	if s.requestTraceRepo == nil || traceID == "" {
+		return
+	}
+	trace := &repository.RequestTrace{
+		TraceID:   traceID,
+		TenantID:  req.TenantID,
+		UserID:    req.UserID,
+		SessionID: sessionID,
+		MessageID: messageID,
+		Mode:      mode,
+		Status:    status,
+		LatencyMs: int(latencyMs),
+		Steps:     steps,
+		Summary:   summary,
+		Error:     errText,
+	}
+	if trace.TenantID <= 0 {
+		trace.TenantID = 1
+	}
+	go func() {
+		writeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := s.requestTraceRepo.Create(writeCtx, trace); err != nil {
+			log.Printf("[Trace] 写入请求 trace 失败: %v", err)
+		}
+	}()
 }
 
 // recordLLMAudit 异步写入 LLM 审计日志，不阻塞主流程。
@@ -776,11 +810,14 @@ func traceStepFromPipelineMetadata(metadata map[string]any) *TraceStep {
 // Chat 执行聊天
 func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
 	startTime := time.Now()
-	trace := newTraceCollector()
+	traceID := logger.TraceIDFrom(ctx)
+	trace := newTraceCollector(traceID)
+	ctx = trace.context(ctx)
 	trace.add(TraceStep{
 		Type:  "status",
 		Stage: "request",
 		Metadata: map[string]any{
+			"query":                req.Message,
 			"mode":                 req.Mode,
 			"use_agent":            req.UseAgent,
 			"knowledge_base_ids":   req.KnowledgeBaseIDs,
@@ -860,6 +897,7 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 			Answer:    answer,
 			Sources:   sources,
 			SessionID: cc.sessionID,
+			TraceID:   traceID,
 			Trace:     trace.snapshot(),
 		}
 
@@ -919,6 +957,7 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 			Answer:    pipeResp.Answer,
 			Sources:   sources,
 			SessionID: cc.sessionID,
+			TraceID:   traceID,
 			Trace:     trace.snapshot(),
 		}
 
@@ -942,7 +981,8 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 	latencyMs := time.Since(startTime).Milliseconds()
 	trace.add(TraceStep{Type: "status", Stage: "complete", LatencyMs: latencyMs, Metadata: map[string]any{"mode": mode, "source_count": len(resp.Sources)}})
 	resp.Trace = trace.snapshot()
-	s.saveAssistantMessageWithTrace(ctx, cc.sessionID, resp.Answer, 0, latencyMs, resp.Trace)
+	messageID := s.saveAssistantMessageWithTrace(ctx, cc.sessionID, resp.Answer, 0, latencyMs, resp.Trace)
+	s.recordRequestTrace(traceID, req, cc.sessionID, messageID, mode, "completed", latencyMs, resp.Trace, trace.summary(mode, "completed", latencyMs, len(resp.Sources), ""), "")
 
 	return resp, nil
 }
@@ -950,12 +990,15 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 // ChatStream 流式聊天
 func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan StreamEvent, error) {
 	ch := make(chan StreamEvent, 100)
+	traceID := logger.TraceIDFrom(ctx)
+	trace := newTraceCollector(traceID)
+	ctx = trace.context(ctx)
 	cc := s.prepareChatContext(ctx, req)
-	trace := newTraceCollector()
 	trace.add(TraceStep{
 		Type:  "status",
 		Stage: "request",
 		Metadata: map[string]any{
+			"query":                req.Message,
 			"mode":                 req.Mode,
 			"use_agent":            req.UseAgent,
 			"knowledge_base_ids":   req.KnowledgeBaseIDs,
@@ -968,12 +1011,16 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 
 	// trySend 向 channel 发送事件，如果 ctx 已取消则放弃，防止 goroutine 泄露
 	trySend := func(ev StreamEvent) bool {
-		if ev.TraceStep == nil && (ev.Type == "status" || ev.Type == "rewrite" || ev.Type == "source" || ev.Type == "action" || ev.Type == "observation") {
-			step := TraceStep{Type: ev.Type, Stage: ev.Type, Content: ev.Content, ToolName: ev.ToolName, ToolInput: ev.ToolInput, DocID: ev.DocID, LatencyMs: ev.LatencyMs}
+		if ev.TraceID == "" {
+			ev.TraceID = traceID
+		}
+		if ev.TraceStep == nil && (ev.Type == "status" || ev.Type == "rewrite" || ev.Type == "source" || ev.Type == "action" || ev.Type == "observation" || ev.Type == "error") {
+			step := TraceStep{Type: ev.Type, Stage: ev.Type, Content: ev.Content, ToolName: ev.ToolName, ToolInput: ev.ToolInput, DocID: ev.DocID, LatencyMs: ev.LatencyMs, Error: ev.Error}
 			ev.TraceStep = &step
 		}
 		if ev.TraceStep != nil {
-			trace.add(*ev.TraceStep)
+			step := trace.add(*ev.TraceStep)
+			ev.TraceStep = &step
 		}
 		select {
 		case ch <- ev:
@@ -985,7 +1032,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 
 	// 发送 session_id 事件（首个事件）
 	if cc.sessionID != "" {
-		ch <- StreamEvent{Type: "session_id", SessionID: cc.sessionID}
+		ch <- StreamEvent{Type: "session_id", SessionID: cc.sessionID, TraceID: traceID}
 	}
 
 	go func() {
@@ -997,14 +1044,22 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 
 		// 创建流式 think 标签过滤器
 		thinkFilter := filter.NewThinkTagStreamFilter()
+		finishError := func(mode, stage, errText string) {
+			latencyMs := time.Since(startTime).Milliseconds()
+			trySend(StreamEvent{Type: "error", Error: errText, TraceStep: &TraceStep{Type: "error", Stage: stage, Error: errText, Summary: errText, LatencyMs: latencyMs}})
+			snapshot := trace.snapshot()
+			s.recordRequestTrace(traceID, req, cc.sessionID, "", mode, "error", latencyMs, snapshot, trace.summary(mode, "error", latencyMs, 0, errText), errText)
+			trySend(StreamEvent{Type: "trace_snapshot", TraceSnapshot: snapshot})
+		}
 
 		// Agentic 模式
 		if req.UseAgent && s.config.Agent.Enabled {
+			mode := "agentic"
 			trace.add(TraceStep{Type: "status", Stage: "agent_start", Metadata: map[string]any{"max_steps": s.config.Agent.MaxSteps}})
 			eventSink := func(ev StreamEvent) { trySend(ev) }
 			runtimeAgent, kt, createErr := s.buildRuntimeAgentForRequest(ctx, cc.runtimeRetriever, req, eventSink)
 			if createErr != nil {
-				trySend(StreamEvent{Type: "error", Error: createErr.Error()})
+				finishError(mode, "agent_create", createErr.Error())
 				return
 			}
 
@@ -1019,7 +1074,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			respMsg, agentErr := runtimeAgent.Generate(llmCtx, messages)
 			llmCancel()
 			if agentErr != nil {
-				trySend(StreamEvent{Type: "error", Error: agentErr.Error(), TraceStep: &TraceStep{Type: "error", Stage: "agent_generate", Content: agentErr.Error(), LatencyMs: time.Since(startTime).Milliseconds()}})
+				finishError(mode, "agent_generate", agentErr.Error())
 				return
 			}
 
@@ -1029,8 +1084,9 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			}
 			// Strip think-tag content, then fake-stream the final answer rune by rune.
 			answer = filter.StripThinkTags(answer)
+			var sources []Source
 			if kt != nil {
-				sources := sourcesFromDocuments(kt.LastDocs(), s.config.RAG.TopK)
+				sources = sourcesFromDocuments(kt.LastDocs(), s.config.RAG.TopK)
 				if len(sources) > 0 && !trySend(StreamEvent{Type: "sources", Sources: sources, SourceCount: len(sources)}) {
 					return
 				}
@@ -1045,7 +1101,6 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 				}
 				fullResponse.WriteString(answer)
 			}
-			trySend(StreamEvent{Type: "done"})
 
 			// 记录流式 agentic 模式的指标和审计日志
 			duration := time.Since(startTime)
@@ -1069,8 +1124,12 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			})
 
 			latencyMs := time.Since(startTime).Milliseconds()
-			trace.add(TraceStep{Type: "status", Stage: "complete", LatencyMs: latencyMs, Metadata: map[string]any{"mode": "agentic"}})
-			s.saveAssistantMessageWithTrace(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs, trace.snapshot())
+			trace.add(TraceStep{Type: "status", Stage: "complete", LatencyMs: latencyMs, Metadata: map[string]any{"mode": mode}})
+			snapshot := trace.snapshot()
+			messageID := s.saveAssistantMessageWithTrace(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs, snapshot)
+			s.recordRequestTrace(traceID, req, cc.sessionID, messageID, mode, "completed", latencyMs, snapshot, trace.summary(mode, "completed", latencyMs, len(sources), ""), "")
+			trySend(StreamEvent{Type: "trace_snapshot", TraceSnapshot: snapshot})
+			trySend(StreamEvent{Type: "done"})
 			return
 		}
 
@@ -1088,11 +1147,16 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 				GenerationInstruction: cc.runtimeInstruction,
 			})
 			if err != nil {
-				trySend(StreamEvent{Type: "error", Error: err.Error(), TraceStep: &TraceStep{Type: "error", Stage: "pipeline_stream", Content: err.Error(), LatencyMs: time.Since(startTime).Milliseconds()}})
+				finishError("pipeline", "pipeline_stream", err.Error())
 				return
 			}
 
+			pipelineDone := false
 			for chunk := range stream {
+				if chunk.Type == pipeline.ChunkTypeDone {
+					pipelineDone = true
+					continue
+				}
 				if chunk.Type == pipeline.ChunkTypeContent {
 					filtered := thinkFilter.Filter(chunk.Content)
 					if filtered != "" {
@@ -1131,13 +1195,17 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 
 			latencyMs := time.Since(startTime).Milliseconds()
 			trace.add(TraceStep{Type: "status", Stage: "complete", LatencyMs: latencyMs, Metadata: map[string]any{"mode": "pipeline"}})
-			s.saveAssistantMessageWithTrace(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs, trace.snapshot())
+			snapshot := trace.snapshot()
+			messageID := s.saveAssistantMessageWithTrace(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs, snapshot)
+			s.recordRequestTrace(traceID, req, cc.sessionID, messageID, "pipeline", "completed", latencyMs, snapshot, trace.summary("pipeline", "completed", latencyMs, 0, ""), "")
+			trySend(StreamEvent{Type: "trace_snapshot", TraceSnapshot: snapshot})
+			if pipelineDone {
+				trySend(StreamEvent{Type: string(pipeline.ChunkTypeDone)})
+			}
 			return
 		}
 
-		if !trySend(StreamEvent{Type: "error", Error: "no handler available", TraceStep: &TraceStep{Type: "error", Stage: "handler", Content: "no handler available", LatencyMs: time.Since(startTime).Milliseconds()}}) {
-			return
-		}
+		finishError("pipeline", "handler", "no handler available")
 	}()
 
 	return ch, nil

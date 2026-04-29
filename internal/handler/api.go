@@ -63,14 +63,15 @@ type Handler struct {
 	chatModelFactory func(context.Context) (model.ChatModel, error)
 
 	// Repositories
-	kbRepo        repository.KnowledgeBaseRepository
-	accessRepo    repository.AccessControlRepository
-	knowledgeRepo repository.KnowledgeRepository
-	chunkRepo     repository.ChunkRepository
-	wikiRepo      repository.WikiPageRepository
-	embeddingRepo repository.EmbeddingRepository
-	sessionRepo   repository.SessionRepository
-	messageRepo   repository.MessageRepository
+	kbRepo           repository.KnowledgeBaseRepository
+	accessRepo       repository.AccessControlRepository
+	knowledgeRepo    repository.KnowledgeRepository
+	chunkRepo        repository.ChunkRepository
+	wikiRepo         repository.WikiPageRepository
+	embeddingRepo    repository.EmbeddingRepository
+	sessionRepo      repository.SessionRepository
+	messageRepo      repository.MessageRepository
+	requestTraceRepo repository.RequestTraceRepository
 }
 
 // SetMCPManager 设置 MCP 管理器
@@ -198,7 +199,9 @@ func NewHandler(
 		h.embeddingRepo = repository.NewEmbeddingRepository(db)
 		h.sessionRepo = repository.NewSessionRepository(db)
 		h.messageRepo = repository.NewMessageRepository(db)
+		h.requestTraceRepo = repository.NewRequestTraceRepository(db)
 		h.chatService.SetRepositories(h.sessionRepo, h.messageRepo)
+		h.chatService.SetRequestTraceRepo(h.requestTraceRepo)
 	}
 
 	return h
@@ -229,6 +232,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			chat.POST("", h.Chat)
 			chat.POST("/stream", h.ChatStream)
 		}
+		protected.GET("/traces/:trace_id", h.GetTrace)
 
 		// 知识库管理
 		kb := protected.Group("/knowledge-bases")
@@ -264,6 +268,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			sessions.GET("/:id", h.GetSession)
 			sessions.DELETE("/:id", h.DeleteSession)
 			sessions.GET("/:id/messages", h.GetSessionMessages)
+			sessions.GET("/:id/traces", h.ListSessionTraces)
 		}
 
 		// 模型管理
@@ -485,6 +490,7 @@ type ChatResponse struct {
 	Answer     string              `json:"answer"`
 	References []ReferenceDocument `json:"references,omitempty"`
 	SessionID  string              `json:"session_id,omitempty"`
+	TraceID    string              `json:"trace_id,omitempty"`
 	TokensUsed int                 `json:"tokens_used,omitempty"`
 	LatencyMs  int64               `json:"latency_ms"`
 	Trace      []service.TraceStep `json:"trace,omitempty"`
@@ -518,14 +524,19 @@ func (h *Handler) toMessageResponses(messages []*repository.Message) []messageRe
 
 func traceStepFromMap(m map[string]any) service.TraceStep {
 	step := service.TraceStep{
+		TraceID:   stringValue(m["trace_id"]),
 		Type:      stringValue(m["type"]),
 		Stage:     stringValue(m["stage"]),
+		Level:     stringValue(m["level"]),
+		Summary:   stringValue(m["summary"]),
 		Content:   stringValue(m["content"]),
 		ToolName:  stringValue(m["tool_name"]),
 		ToolInput: stringValue(m["tool_input"]),
 		DocID:     stringValue(m["doc_id"]),
+		Error:     stringValue(m["error"]),
 		Metadata:  mapValue(m["metadata"]),
 	}
+	step.Seq = intValue(m["seq"])
 	step.LatencyMs = int64Value(m["latency_ms"])
 	step.TokenCount = intValue(m["token_count"])
 	return step
@@ -643,6 +654,7 @@ func (h *Handler) Chat(c *gin.Context) {
 		Answer:     resp.Answer,
 		References: h.toReferences(resp.Sources),
 		SessionID:  resp.SessionID,
+		TraceID:    resp.TraceID,
 		LatencyMs:  time.Since(startTime).Milliseconds(),
 		Trace:      resp.Trace,
 	})
@@ -729,6 +741,9 @@ func (h *Handler) ChatStream(c *gin.Context) {
 			if event.SessionID != "" {
 				data["session_id"] = event.SessionID
 			}
+			if event.TraceID != "" {
+				data["trace_id"] = event.TraceID
+			}
 			if event.Error != "" {
 				data["error"] = event.Error
 			}
@@ -756,12 +771,80 @@ func (h *Handler) ChatStream(c *gin.Context) {
 			if event.TraceStep != nil {
 				data["trace_step"] = event.TraceStep
 			}
+			if len(event.TraceSnapshot) > 0 {
+				data["trace_snapshot"] = event.TraceSnapshot
+			}
 			c.SSEvent("message", data)
 			return true
 		}
 		c.SSEvent("done", gin.H{})
 		return false
 	})
+}
+
+func (h *Handler) GetTrace(c *gin.Context) {
+	if h.requestTraceRepo == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "request trace repository not configured"})
+		return
+	}
+	traceID := strings.TrimSpace(c.Param("trace_id"))
+	if traceID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少 trace_id"})
+		return
+	}
+	trace, err := h.requestTraceRepo.GetByTraceID(c.Request.Context(), traceID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if trace == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "trace 不存在"})
+		return
+	}
+	if !h.canAccessTrace(c, trace) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "无权访问该 trace"})
+		return
+	}
+	c.JSON(http.StatusOK, trace)
+}
+
+func (h *Handler) ListSessionTraces(c *gin.Context) {
+	if h.requestTraceRepo == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "request trace repository not configured"})
+		return
+	}
+	sessionID := c.Param("id")
+	if h.sessionRepo != nil {
+		if _, ok := h.ensureSessionAccess(c, sessionID); !ok {
+			return
+		}
+	}
+	page, pageSize := parsePagination(c, 20, 100)
+	filter := repository.RequestTraceFilter{
+		TenantID:  h.getTenantID(c),
+		SessionID: sessionID,
+		Limit:     pageSize,
+		Offset:    (page - 1) * pageSize,
+	}
+	if h.getUserRole(c) != "admin" {
+		filter.UserID = h.getUserID(c)
+	}
+	traces, total, err := h.requestTraceRepo.List(c.Request.Context(), filter)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"traces": traces, "total": total, "page": page, "page_size": pageSize})
+}
+
+func (h *Handler) canAccessTrace(c *gin.Context, trace *repository.RequestTrace) bool {
+	if trace == nil || trace.TenantID != h.getTenantID(c) {
+		return false
+	}
+	if h.getUserRole(c) == "admin" {
+		return true
+	}
+	return trace.UserID == h.getUserID(c)
 }
 
 func (h *Handler) ensureKnowledgeBaseAccess(c *gin.Context, id string) (*repository.KnowledgeBase, bool) {
