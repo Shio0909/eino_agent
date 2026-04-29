@@ -117,7 +117,7 @@
   - `public benchmark score`（可比）
   - `in-domain regression score`（可落地）
 
-### D. 今天可执行的最小闭环
+### D. 当前可执行的最小闭环
 
 1. 先保留当前 20 条回归集（已跑通三模式，便于持续回归）。
 2. 新增 `BEIR` 子集评测脚本（retriever-only）并产出首版公开分数。
