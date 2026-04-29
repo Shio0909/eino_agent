@@ -224,8 +224,6 @@ curl http://localhost:19093/health
 
 ## API 概览
 
-> 请求级 Trace 的字段、SSE 事件和排查方式见 `docs/TRACE_OBSERVABILITY.md`。
-
 | 路由 | 方法 | 说明 |
 |------|------|------|
 | `/health` | GET | 健康检查 |

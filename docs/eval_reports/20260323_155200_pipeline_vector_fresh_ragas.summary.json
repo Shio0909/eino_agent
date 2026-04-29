@@ -1,9 +1,0 @@
-{
-  "mode": "pipeline_vector",
-  "samples_total": 12,
-  "answer_relevancy": 0.14873216371283235,
-  "faithfulness": 0.8571428571428571,
-  "avg_latency_ms": 59720.324166666665,
-  "errors": 1,
-  "nonempty_contexts": 11
-}
