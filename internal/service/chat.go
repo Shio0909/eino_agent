@@ -1082,7 +1082,6 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 				}
 				fullResponse.WriteString(answer)
 			}
-			trySend(StreamEvent{Type: "done"})
 
 			// 记录流式 agentic 模式的指标和审计日志
 			duration := time.Since(startTime)
@@ -1108,6 +1107,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			messageID := s.saveAssistantMessageWithTrace(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs, snapshot)
 			s.recordRequestTrace(traceID, req, cc.sessionID, messageID, "agentic", "completed", latencyMs, snapshot, trace.summary("agentic", "completed", latencyMs, sourceCount, ""), "")
 			trySend(StreamEvent{Type: "trace_snapshot", TraceSnapshot: snapshot})
+			trySend(StreamEvent{Type: "done"})
 			return
 		}
 
@@ -1131,7 +1131,12 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 				return
 			}
 
+			pipelineDone := false
 			for chunk := range stream {
+				if chunk.Type == pipeline.ChunkTypeDone {
+					pipelineDone = true
+					continue
+				}
 				if chunk.Type == pipeline.ChunkTypeContent {
 					filtered := thinkFilter.Filter(chunk.Content)
 					if filtered != "" {
@@ -1176,6 +1181,9 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			messageID := s.saveAssistantMessageWithTrace(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs, snapshot)
 			s.recordRequestTrace(traceID, req, cc.sessionID, messageID, "pipeline", "completed", latencyMs, snapshot, trace.summary("pipeline", "completed", latencyMs, sourceCount, ""), "")
 			trySend(StreamEvent{Type: "trace_snapshot", TraceSnapshot: snapshot})
+			if pipelineDone {
+				trySend(StreamEvent{Type: string(pipeline.ChunkTypeDone)})
+			}
 			return
 		}
 
