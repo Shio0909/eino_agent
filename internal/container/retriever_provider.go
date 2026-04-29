@@ -19,6 +19,7 @@ import (
 
 	cachepkg "eino_agent/internal/cache"
 	"eino_agent/internal/config"
+	"eino_agent/internal/tracing"
 )
 
 // CompositeRetriever 组合检索器
@@ -91,13 +92,16 @@ func (r *CompositeRetriever) Retrieve(ctx context.Context, query string, opts ..
 		topK = 10
 	}
 
-	// 尝试向量检索
+	tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "retrieval_mode", Summary: "semantic", Metadata: map[string]any{"mode": "semantic", "top_k": topK}})
 	queryVector, err := r.getQueryEmbedding(ctx, query)
 	if err != nil {
+		tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "embedding", Level: "error", Error: err.Error(), Metadata: map[string]any{"query": query}})
 		return nil, fmt.Errorf("生成查询向量失败: %w", err)
 	}
 
+	vectorStart := time.Now()
 	docs, err := r.vectorDB.Search(ctx, queryVector, topK*2)
+	tracing.Emit(ctx, retrievalSourceEvent("vector", query, docs, vectorStart, err))
 	if err != nil {
 		return nil, fmt.Errorf("向量检索失败: %w", err)
 	}
@@ -114,31 +118,41 @@ func (r *CompositeRetriever) retrieveWithHybrid(ctx context.Context, query strin
 	if topK <= 0 {
 		topK = 10
 	}
+	tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "retrieval_mode", Summary: "hybrid", Metadata: map[string]any{"mode": "hybrid", "top_k": topK, "candidate_k": topK * 2}})
 
 	queryVector, err := r.getQueryEmbedding(ctx, query)
 	if err != nil {
+		tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "embedding", Level: "error", Error: err.Error(), Metadata: map[string]any{"query": query}})
 		return nil, fmt.Errorf("生成查询向量失败: %w", err)
 	}
 
+	vectorStart := time.Now()
 	vectorDocs, err := r.vectorDB.Search(ctx, queryVector, topK*2)
+	tracing.Emit(ctx, retrievalSourceEvent("vector", query, vectorDocs, vectorStart, err))
 	if err != nil {
 		return nil, fmt.Errorf("向量检索失败: %w", err)
 	}
 
 	var keywordDocs []*Document
 	if ks, ok := r.vectorDB.(keywordSearcher); ok {
+		keywordStart := time.Now()
 		keywordDocs, err = ks.SearchKeyword(ctx, query, topK*2)
+		tracing.Emit(ctx, retrievalSourceEvent("keyword", query, keywordDocs, keywordStart, err))
 		if err != nil {
 			log.Printf("[Retriever] 关键词检索失败（降级继续）: %v", err)
 			keywordDocs = nil // 降级：仅使用向量检索结果
 		}
+	} else {
+		tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "keyword_recall", Summary: "keyword search unavailable", Metadata: map[string]any{"source": "keyword", "available": false}})
 	}
 
 	// 图谱检索（如果启用）
 	var graphDocs []*Document
 	var graphContextDoc *Document // 图谱上下文（实体/关系描述），不参与 RRF 竞争
 	if r.graphRetriever != nil {
+		graphStart := time.Now()
 		gDocs, gErr := r.graphRetriever.Retrieve(ctx, query)
+		tracing.Emit(ctx, graphRetrievalEvent(query, gDocs, graphStart, gErr))
 		if gErr != nil {
 			log.Printf("[Retriever] 图谱检索失败（降级继续）: %v", gErr)
 		} else {
@@ -162,9 +176,11 @@ func (r *CompositeRetriever) retrieveWithHybrid(ctx context.Context, query strin
 				})
 			}
 		}
+	} else {
+		tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "graph_recall", Summary: "graph retriever unavailable", Metadata: map[string]any{"source": "graph", "available": false}})
 	}
 
-	fused := r.rrfFuse(vectorDocs, keywordDocs, graphDocs, topK)
+	fused := r.rrfFuse(ctx, vectorDocs, keywordDocs, graphDocs, topK)
 
 	// 将图谱上下文作为补充信息追加到检索结果中（不占 topK 名额）
 	if graphContextDoc != nil {
@@ -173,6 +189,7 @@ func (r *CompositeRetriever) retrieveWithHybrid(ctx context.Context, query strin
 		}
 		graphContextDoc.Metadata["match_type"] = "graph_context"
 		fused = append(fused, graphContextDoc)
+		tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "graph_context", Summary: "graph context injected", Metadata: map[string]any{"content_chars": len(graphContextDoc.Content)}})
 		log.Printf("[Retriever] 已注入图谱上下文文档（%d 字符）", len(graphContextDoc.Content))
 	}
 
@@ -215,30 +232,45 @@ func (r *CompositeRetriever) WithKnowledgeBaseScope(ids []string) einoretriever.
 }
 
 func (r *CompositeRetriever) getQueryEmbedding(ctx context.Context, query string) ([]float32, error) {
+	started := time.Now()
 	if r.retrievalCache != nil {
 		queryHash := hashQuery(query)
 		modelID := r.embeddingModelID()
 		cachedVector, hit, err := r.retrievalCache.GetEmbedding(ctx, modelID, queryHash)
 		if err != nil {
 			log.Printf("[Retriever] 读取 embedding 缓存失败，降级到实时向量化: %v", err)
+			tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "embedding_cache", Level: "warning", Summary: "embedding cache read failed", Error: err.Error(), Metadata: map[string]any{"model": modelID, "query_hash": queryHash}})
 		} else if hit && len(cachedVector) > 0 {
 			log.Printf("[Cache][Embedding] hit model=%s", modelID)
+			tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "embedding", Summary: "cache hit", LatencyMs: time.Since(started).Milliseconds(), Metadata: map[string]any{"model": modelID, "query_hash": queryHash, "cache_hit": true, "dimensions": len(cachedVector)}})
 			return cachedVector, nil
 		} else {
 			log.Printf("[Cache][Embedding] miss model=%s", modelID)
+			tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "embedding_cache", Summary: "cache miss", Metadata: map[string]any{"model": modelID, "query_hash": queryHash, "cache_hit": false}})
 		}
 
 		vector, err := EmbedFloat32(ctx, r.embedding, query)
 		if err != nil {
+			tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "embedding", Level: "error", Error: err.Error(), LatencyMs: time.Since(started).Milliseconds(), Metadata: map[string]any{"model": modelID, "query_hash": queryHash, "cache_hit": false}})
 			return nil, err
 		}
 		if err := r.retrievalCache.SetEmbedding(ctx, modelID, queryHash, vector, r.embeddingCacheTTL()); err != nil {
 			log.Printf("[Retriever] 写入 embedding 缓存失败，继续使用实时结果: %v", err)
+			tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "embedding_cache", Level: "warning", Summary: "embedding cache write failed", Error: err.Error(), Metadata: map[string]any{"model": modelID, "query_hash": queryHash}})
 		}
+		tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "embedding", Summary: "generated", LatencyMs: time.Since(started).Milliseconds(), Metadata: map[string]any{"model": modelID, "query_hash": queryHash, "cache_hit": false, "dimensions": len(vector)}})
 		return vector, nil
 	}
 
-	return EmbedFloat32(ctx, r.embedding, query)
+	vector, err := EmbedFloat32(ctx, r.embedding, query)
+	metadata := map[string]any{"model": r.embeddingModelID(), "cache_enabled": false}
+	if err != nil {
+		tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "embedding", Level: "error", Error: err.Error(), LatencyMs: time.Since(started).Milliseconds(), Metadata: metadata})
+		return nil, err
+	}
+	metadata["dimensions"] = len(vector)
+	tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "embedding", Summary: "generated", LatencyMs: time.Since(started).Milliseconds(), Metadata: metadata})
+	return vector, nil
 }
 
 func (r *CompositeRetriever) embeddingModelID() string {
@@ -276,7 +308,7 @@ func toSchemaDocuments(docs []*Document) []*schema.Document {
 	return result
 }
 
-func (r *CompositeRetriever) rrfFuse(vectorDocs, keywordDocs, graphDocs []*Document, topK int) []*Document {
+func (r *CompositeRetriever) rrfFuse(ctx context.Context, vectorDocs, keywordDocs, graphDocs []*Document, topK int) []*Document {
 	const rrfK = 60.0
 
 	// 各检索源权重（向量通常最稳定，关键词补充精确匹配，图谱提供关系信号）
@@ -287,9 +319,10 @@ func (r *CompositeRetriever) rrfFuse(vectorDocs, keywordDocs, graphDocs []*Docum
 	}
 
 	type rankedDoc struct {
-		doc   *Document
-		score float64
-		hits  int
+		doc           *Document
+		score         float64
+		hits          int
+		contributions []map[string]any
 	}
 
 	ranked := make(map[string]*rankedDoc)
@@ -310,8 +343,16 @@ func (r *CompositeRetriever) rrfFuse(vectorDocs, keywordDocs, graphDocs []*Docum
 			} else if entry.doc.Content == "" && doc.Content != "" {
 				entry.doc = doc
 			}
-			entry.score += weight * 1.0 / (rrfK + float64(rank+1))
+			contribution := weight * 1.0 / (rrfK + float64(rank+1))
+			entry.score += contribution
 			entry.hits++
+			entry.contributions = append(entry.contributions, map[string]any{
+				"source":       source,
+				"rank":         rank + 1,
+				"weight":       weight,
+				"contribution": contribution,
+				"source_score": doc.Score,
+			})
 
 			if entry.doc.Metadata == nil {
 				entry.doc.Metadata = map[string]interface{}{}
@@ -357,11 +398,159 @@ func (r *CompositeRetriever) rrfFuse(vectorDocs, keywordDocs, graphDocs []*Docum
 	}
 
 	fused := make([]*Document, 0, topK)
+	breakdown := make([]map[string]any, 0, topK)
 	for i := 0; i < topK; i++ {
-		fused = append(fused, list[i].doc)
+		item := list[i]
+		if item.doc.Metadata == nil {
+			item.doc.Metadata = map[string]interface{}{}
+		}
+		item.doc.Metadata["rrf_score"] = item.score
+		item.doc.Metadata["rrf_hits"] = item.hits
+		item.doc.Metadata["rrf_contributions"] = item.contributions
+		fused = append(fused, item.doc)
+		breakdown = append(breakdown, map[string]any{
+			"rank":          i + 1,
+			"doc_id":        item.doc.ID,
+			"score":         item.score,
+			"hits":          item.hits,
+			"match_type":    item.doc.Metadata["match_type"],
+			"contributions": item.contributions,
+		})
 	}
 
+	tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "rrf", Summary: "RRF fusion", Metadata: map[string]any{
+		"rrf_k":          rrfK,
+		"top_k":          topK,
+		"source_weights": sourceWeights,
+		"input_counts": map[string]int{
+			"vector":  len(vectorDocs),
+			"keyword": len(keywordDocs),
+			"graph":   len(graphDocs),
+		},
+		"results": breakdown,
+	}})
+
 	return fused
+}
+
+func retrievalSourceEvent(source, query string, docs []*Document, started time.Time, err error) tracing.Event {
+	metadata := map[string]any{
+		"source":    source,
+		"query":     query,
+		"count":     len(docs),
+		"doc_ids":   documentIDs(docs, 10),
+		"top_docs":  documentTraceItems(docs, 10),
+		"available": true,
+	}
+	event := tracing.Event{Type: "retrieval", Stage: source + "_recall", Summary: fmt.Sprintf("%s recall", source), LatencyMs: time.Since(started).Milliseconds(), Metadata: metadata}
+	if err != nil {
+		event.Level = "error"
+		event.Error = err.Error()
+		metadata["error"] = err.Error()
+	}
+	return event
+}
+
+func graphRetrievalEvent(query string, docs []*schema.Document, started time.Time, err error) tracing.Event {
+	metadata := map[string]any{
+		"source":    "graph",
+		"query":     query,
+		"count":     len(docs),
+		"doc_ids":   schemaDocumentIDs(docs, 10),
+		"top_docs":  schemaDocumentTraceItems(docs, 10),
+		"available": true,
+	}
+	event := tracing.Event{Type: "retrieval", Stage: "graph_recall", Summary: "graph recall", LatencyMs: time.Since(started).Milliseconds(), Metadata: metadata}
+	if err != nil {
+		event.Level = "error"
+		event.Error = err.Error()
+		metadata["error"] = err.Error()
+	}
+	return event
+}
+
+func documentIDs(docs []*Document, limit int) []string {
+	ids := make([]string, 0, boundedDocLimit(len(docs), limit))
+	for _, doc := range docs {
+		if doc == nil || doc.ID == "" {
+			continue
+		}
+		ids = append(ids, doc.ID)
+		if len(ids) >= limit {
+			break
+		}
+	}
+	return ids
+}
+
+func schemaDocumentIDs(docs []*schema.Document, limit int) []string {
+	ids := make([]string, 0, boundedDocLimit(len(docs), limit))
+	for _, doc := range docs {
+		if doc == nil || doc.ID == "" {
+			continue
+		}
+		ids = append(ids, doc.ID)
+		if len(ids) >= limit {
+			break
+		}
+	}
+	return ids
+}
+
+func documentTraceItems(docs []*Document, limit int) []map[string]any {
+	items := make([]map[string]any, 0, boundedDocLimit(len(docs), limit))
+	for index, doc := range docs {
+		if doc == nil {
+			continue
+		}
+		items = append(items, map[string]any{
+			"rank":       index + 1,
+			"doc_id":     doc.ID,
+			"score":      doc.Score,
+			"source":     firstMetadataString(doc.Metadata, "source", "source_filename", "file_name", "wiki_path"),
+			"match_type": firstMetadataString(doc.Metadata, "match_type"),
+		})
+		if len(items) >= limit {
+			break
+		}
+	}
+	return items
+}
+
+func schemaDocumentTraceItems(docs []*schema.Document, limit int) []map[string]any {
+	items := make([]map[string]any, 0, boundedDocLimit(len(docs), limit))
+	for index, doc := range docs {
+		if doc == nil {
+			continue
+		}
+		items = append(items, map[string]any{
+			"rank":       index + 1,
+			"doc_id":     doc.ID,
+			"score":      doc.Score(),
+			"source":     firstMetadataString(doc.MetaData, "source", "source_filename", "file_name", "wiki_path"),
+			"match_type": firstMetadataString(doc.MetaData, "match_type"),
+		})
+		if len(items) >= limit {
+			break
+		}
+	}
+	return items
+}
+
+func boundedDocLimit(length, limit int) int {
+	if limit <= 0 || limit > length {
+		return length
+	}
+	return limit
+}
+
+func firstMetadataString(metadata map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := metadata[key].(string); ok && value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // RetrieveWithHybrid 混合检索（向量 + 关键词）
@@ -376,14 +565,18 @@ func (r *CompositeRetriever) RetrieveWithMode(ctx context.Context, query string,
 	if topK <= 0 {
 		topK = 10
 	}
+	tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "retrieval_mode", Summary: mode, Metadata: map[string]any{"mode": mode, "top_k": topK}})
 
 	switch mode {
 	case "semantic":
 		queryVector, err := r.getQueryEmbedding(ctx, query)
 		if err != nil {
+			tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "embedding", Level: "error", Error: err.Error(), Metadata: map[string]any{"query": query}})
 			return nil, fmt.Errorf("生成查询向量失败: %w", err)
 		}
+		started := time.Now()
 		docs, err := r.vectorDB.Search(ctx, queryVector, topK*2)
+		tracing.Emit(ctx, retrievalSourceEvent("vector", query, docs, started, err))
 		if err != nil {
 			return nil, fmt.Errorf("语义检索失败: %w", err)
 		}
@@ -396,9 +589,12 @@ func (r *CompositeRetriever) RetrieveWithMode(ctx context.Context, query string,
 		ks, ok := r.vectorDB.(keywordSearcher)
 		if !ok {
 			log.Printf("[Retriever] exact 模式不可用（无关键词检索器），降级为 auto")
+			tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "keyword_recall", Summary: "keyword search unavailable", Metadata: map[string]any{"source": "keyword", "available": false, "fallback": "auto"}})
 			return r.Retrieve(ctx, query)
 		}
+		started := time.Now()
 		docs, err := ks.SearchKeyword(ctx, query, topK*2)
+		tracing.Emit(ctx, retrievalSourceEvent("keyword", query, docs, started, err))
 		if err != nil {
 			return nil, fmt.Errorf("关键词检索失败: %w", err)
 		}
@@ -410,9 +606,13 @@ func (r *CompositeRetriever) RetrieveWithMode(ctx context.Context, query string,
 	case "graph":
 		if r.graphRetriever == nil {
 			log.Printf("[Retriever] graph 模式不可用（无图谱检索器），降级为 auto")
+			tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "graph_recall", Summary: "graph retriever unavailable", Metadata: map[string]any{"source": "graph", "available": false, "fallback": "auto"}})
 			return r.Retrieve(ctx, query)
 		}
-		return r.graphRetriever.Retrieve(ctx, query)
+		started := time.Now()
+		docs, err := r.graphRetriever.Retrieve(ctx, query)
+		tracing.Emit(ctx, graphRetrievalEvent(query, docs, started, err))
+		return docs, err
 
 	default: // "auto" 或其他
 		return r.Retrieve(ctx, query)

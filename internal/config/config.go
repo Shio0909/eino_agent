@@ -160,9 +160,10 @@ type DatabaseConfig struct {
 type RAGConfig struct {
 	// 检索配置
 	TopK                     int  `yaml:"top_k"`
-	EnableHybrid             bool `yaml:"enable_hybrid"`  // 混合检索
-	EnableRewrite            bool `yaml:"enable_rewrite"` // 查询重写
-	EnableRerank             bool `yaml:"enable_rerank"`  // 重排序
+	EnableHybrid             bool `yaml:"enable_hybrid"`          // 混合检索
+	EnableRewrite            bool `yaml:"enable_rewrite"`         // 查询重写
+	EnableQueryExpansion     bool `yaml:"enable_query_expansion"` // 低召回查询扩展
+	EnableRerank             bool `yaml:"enable_rerank"`          // 重排序
 	EmbeddingCacheTTLMinutes int  `yaml:"embedding_cache_ttl_minutes"`
 	RetrievalCacheTTLMinutes int  `yaml:"retrieval_cache_ttl_minutes"`
 
@@ -185,6 +186,7 @@ type AgentConfig struct {
 
 	// 工具配置
 	EnableKnowledgeTool bool   `yaml:"enable_knowledge_tool"`
+	EnableHyDE          bool   `yaml:"enable_hyde"`
 	EnableWebSearch     bool   `yaml:"enable_web_search"`
 	EnableCodeSearch    bool   `yaml:"enable_code_search"`
 	EnableCodeGraph     bool   `yaml:"enable_code_graph"`
@@ -480,7 +482,10 @@ func setDefaults(cfg *Config) {
 		cfg.RAG.ChunkOverlap = 50
 	}
 	if cfg.RAG.ChunkStrategy == "" {
-		cfg.RAG.ChunkStrategy = "auto"
+		cfg.RAG.ChunkStrategy = "semantic"
+	}
+	if cfg.RAG.SemanticSimilarityPct == 0 {
+		cfg.RAG.SemanticSimilarityPct = 0.25
 	}
 
 	if cfg.Agent.MaxSteps == 0 {

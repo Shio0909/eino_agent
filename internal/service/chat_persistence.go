@@ -50,13 +50,13 @@ func (s *ChatService) saveUserMessage(ctx context.Context, sessionID, content st
 	s.refreshSessionCache(ctx, sessionID, msg)
 }
 
-func (s *ChatService) saveAssistantMessage(ctx context.Context, sessionID, content string, tokensUsed int, latencyMs int64) {
-	s.saveAssistantMessageWithTrace(ctx, sessionID, content, tokensUsed, latencyMs, nil)
+func (s *ChatService) saveAssistantMessage(ctx context.Context, sessionID, content string, tokensUsed int, latencyMs int64) string {
+	return s.saveAssistantMessageWithTrace(ctx, sessionID, content, tokensUsed, latencyMs, nil)
 }
 
-func (s *ChatService) saveAssistantMessageWithTrace(ctx context.Context, sessionID, content string, tokensUsed int, latencyMs int64, trace []TraceStep) {
+func (s *ChatService) saveAssistantMessageWithTrace(ctx context.Context, sessionID, content string, tokensUsed int, latencyMs int64, trace []TraceStep) string {
 	if s.messageRepo == nil || sessionID == "" {
-		return
+		return ""
 	}
 
 	msg := &repository.Message{
@@ -75,15 +75,10 @@ func (s *ChatService) saveAssistantMessageWithTrace(ctx context.Context, session
 	}
 	if err := s.messageRepo.Create(ctx, msg); err != nil {
 		log.Printf("[ChatService] save assistant message failed: %v", err)
-		return
+		return ""
 	}
 
 	// 刷新 session.updated_at，确保长期记忆按活跃度排序
-	if s.sessionRepo != nil {
-		if err := s.sessionRepo.TouchUpdatedAt(ctx, sessionID); err != nil {
-			log.Printf("[ChatService] touch session updated_at failed (session=%s): %v", sessionID, err)
-		}
-	}
-
 	s.refreshSessionCache(ctx, sessionID, msg)
+	return msg.ID
 }

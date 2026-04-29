@@ -5,9 +5,11 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cloudwego/eino/components/prompt"
 	"github.com/cloudwego/eino/components/model"
+	"github.com/cloudwego/eino/components/prompt"
 	"github.com/cloudwego/eino/schema"
+
+	"eino_agent/internal/filter"
 )
 
 // LLMGenerator 基于 Eino ChatModel 的生成器
@@ -72,7 +74,7 @@ func (g *LLMGenerator) Generate(ctx context.Context, query string, ragContext st
 		return "", fmt.Errorf("generate: %w", err)
 	}
 
-	return resp.Content, nil
+	return filter.StripThinkTags(resp.Content), nil
 }
 
 // GenerateStream 流式生成回答

@@ -1,5 +1,5 @@
 import { api } from '../lib/api';
-import type { AuthResponse, ChatResponse, DocumentListResponse, GraphData, ImportStatus, KnowledgeBase, KnowledgeBaseListResponse, MCPStatus, Message, Session, SettingsResponse, User, WikiPage, WikiPageListResponse } from '../types/api';
+import type { AuthResponse, ChatResponse, DocumentListResponse, GraphData, ImportStatus, KnowledgeBase, KnowledgeBaseListResponse, MCPStatus, Message, RequestTrace, Session, SettingsResponse, User, WikiPage, WikiPageListResponse } from '../types/api';
 
 export const endpoints = {
   me: () => api.get<{ user: User }>('/auth/me'),
@@ -16,6 +16,8 @@ export const endpoints = {
   sessions: () => api.get<{ sessions: Session[] }>('/sessions'),
   createSession: (title: string, knowledgeBaseIds: string[]) => api.post<Session>('/sessions', { title, knowledge_base_ids: knowledgeBaseIds }),
   sessionMessages: (id: string) => api.get<{ messages: Message[] }>(`/sessions/${id}/messages`),
+  sessionTraces: (id: string) => api.get<{ traces: RequestTrace[]; total: number; page: number; page_size: number }>(`/sessions/${id}/traces`),
+  trace: (traceId: string) => api.get<RequestTrace>(`/traces/${encodeURIComponent(traceId)}`),
   chat: (input: Record<string, unknown>) => api.post<ChatResponse>('/chat', input),
   mcp: () => api.get<MCPStatus>('/mcp'),
   settings: () => api.get<SettingsResponse>('/settings'),

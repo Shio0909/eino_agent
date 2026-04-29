@@ -43,7 +43,11 @@ export function ChatPage({ onEvidence, mode, forceCitation }: ChatPageProps) {
       const nextMessages = response.messages ?? [];
       setMessages(nextMessages);
       const lastAssistant = [...nextMessages].reverse().find((message) => message.role === 'assistant');
-      onEvidence([], lastAssistant?.trace ?? [], false);
+      if (lastAssistant?.trace_id) {
+        endpoints.trace(lastAssistant.trace_id).then((traceResponse) => onEvidence([], traceResponse.steps ?? lastAssistant.trace ?? [], false)).catch(() => onEvidence([], lastAssistant.trace ?? [], false));
+      } else {
+        onEvidence([], lastAssistant?.trace ?? [], false);
+      }
     }).catch(() => setMessages([]));
   }, [onEvidence, selectedSessionId]);
 
@@ -84,6 +88,8 @@ export function ChatPage({ onEvidence, mode, forceCitation }: ChatPageProps) {
     setReferences([]);
     const streamReferences: ReferenceDocument[] = [];
     const trace: TraceStep[] = [];
+    const traceKeys = new Set<string>();
+    let currentTraceId: string | undefined;
     let hasAnswerContent = false;
 
     try {
@@ -106,20 +112,31 @@ export function ChatPage({ onEvidence, mode, forceCitation }: ChatPageProps) {
           });
           setReferences([...streamReferences]);
         }
-        if (event.trace_step) trace.push(event.trace_step);
         if (event.session_id && !selectedSessionId) setSelectedSessionId(event.session_id);
+        if (event.trace_id) currentTraceId = event.trace_id;
+        if (event.trace_snapshot?.length) {
+          trace.splice(0, trace.length, ...event.trace_snapshot);
+          traceKeys.clear();
+          event.trace_snapshot.forEach((step, index) => traceKeys.add(traceKey(step, index)));
+        } else if (event.trace_step) {
+          const key = traceKey(event.trace_step, trace.length);
+          if (!traceKeys.has(key)) {
+            traceKeys.add(key);
+            trace.push(event.trace_step);
+          }
+        }
         if (event.type === 'error') {
           hasAnswerContent = true;
-          updateAssistant((item) => ({ ...item, content: event.error || event.content || '请求失败', trace }));
+          updateAssistant((item) => ({ ...item, content: event.error || event.content || '请求失败', trace_id: currentTraceId, trace }));
         } else if (event.type === 'content' && event.content) {
           const appendAnswer = hasAnswerContent;
           hasAnswerContent = true;
           const content = event.content;
-          updateAssistant((item) => ({ ...item, content: appendAnswer ? `${item.content}${content}` : content, trace }));
+          updateAssistant((item) => ({ ...item, content: appendAnswer ? `${item.content}${content}` : content, trace_id: currentTraceId, trace }));
         } else if (event.trace_step) {
-          updateAssistant((item) => ({ ...item, trace }));
+          updateAssistant((item) => ({ ...item, trace_id: currentTraceId, trace }));
         } else if (!hasAnswerContent && (event.type === 'action' || event.type === 'observation')) {
-          updateAssistant((item) => ({ ...item, content: agentProgressText(event.type, event.tool_name), trace }));
+          updateAssistant((item) => ({ ...item, content: agentProgressText(event.type, event.tool_name), trace_id: currentTraceId, trace }));
         }
         onEvidence([...streamReferences], [...trace], true);
       }, controller.signal);
@@ -127,10 +144,20 @@ export function ChatPage({ onEvidence, mode, forceCitation }: ChatPageProps) {
     } catch (err) {
       updateAssistant((item) => ({ ...item, content: err instanceof Error ? err.message : '请求失败' }));
     } finally {
-      updateAssistant((item) => ({ ...item, ungrounded: streamReferences.length === 0 }));
+      updateAssistant((item) => ({ ...item, ungrounded: streamReferences.length === 0, trace_id: currentTraceId, trace }));
       setStreaming(false);
       onEvidence([...streamReferences], [...trace], false);
       abortRef.current = null;
+    }
+  };
+
+  const showTrace = async (message: Message) => {
+    if (!message.trace_id) return;
+    try {
+      const traceResponse = await endpoints.trace(message.trace_id);
+      onEvidence([], traceResponse.steps ?? message.trace ?? [], false);
+    } catch {
+      onEvidence([], message.trace ?? [], false);
     }
   };
 
@@ -172,6 +199,7 @@ export function ChatPage({ onEvidence, mode, forceCitation }: ChatPageProps) {
                 {message.role === 'assistant' ? (
                   <div className="prose prose-slate max-w-none text-sm leading-6 dark:prose-invert prose-headings:font-display prose-a:text-primary prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-li:my-0 prose-table:text-xs" dangerouslySetInnerHTML={{ __html: renderSafeMarkdown(message.content || (streaming ? '思考中…' : ''), { linkCitations: true, sourceIds: references.map((ref) => ref.id) }) }} />
                 ) : <p className="whitespace-pre-wrap text-sm leading-6">{message.content}</p>}
+                {message.role === 'assistant' && message.trace_id ? <button type="button" onClick={() => showTrace(message)} className="mt-2 text-xs font-semibold text-primary hover:underline">查看 Trace</button> : null}
               </div>
               {message.role === 'user' ? <User className="mt-3 h-5 w-5 text-accent" /> : null}
             </article>
@@ -191,6 +219,10 @@ function findLastAssistantIndex(messages: Message[]) {
     if (messages[index].role === 'assistant') return index;
   }
   return -1;
+}
+
+function traceKey(step: TraceStep, fallbackIndex: number) {
+  return `${step.trace_id ?? 'trace'}:${step.seq ?? fallbackIndex}:${step.stage ?? step.type}`;
 }
 
 function agentProgressText(type: string, toolName?: string) {

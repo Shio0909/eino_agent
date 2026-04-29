@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/adk/middlewares/skill"
@@ -150,9 +151,9 @@ func (s *ChatService) buildRuntimeAgentForRequest(
 
 	systemInstruction := s.buildAgentInstructionForRequest(req, runtimeSkill)
 	agent, err := react.NewAgent(ctx, &react.AgentConfig{
-		ToolsConfig:          compose.ToolsNodeConfig{Tools: tools},
-		MaxStep:              s.config.Agent.MaxSteps,
-		ToolCallingModel:     toolCallingModel,
+		ToolsConfig:           compose.ToolsNodeConfig{Tools: tools},
+		MaxStep:               s.config.Agent.MaxSteps,
+		ToolCallingModel:      toolCallingModel,
 		StreamToolCallChecker: allChunksStreamToolCallChecker,
 		MessageModifier: func(ctx context.Context, input []*schema.Message) []*schema.Message {
 			if len(input) == 0 {
@@ -209,13 +210,15 @@ func (t *eventTool) InvokableRun(ctx context.Context, argumentsInJSON string, op
 		return "", fmt.Errorf("tool %s is not invokable", t.name)
 	}
 
-	t.emit("action", argumentsInJSON, "")
+	started := time.Now()
+	t.emit("action", argumentsInJSON, "", 0, nil, map[string]any{"args_chars": len(argumentsInJSON)})
 	result, err := it.InvokableRun(ctx, argumentsInJSON, opts...)
+	metadata := map[string]any{"args_chars": len(argumentsInJSON), "output_chars": len(result)}
 	if err != nil {
-		t.emit("observation", argumentsInJSON, "error: "+err.Error())
+		t.emit("observation", argumentsInJSON, summarizeToolOutput("error: "+err.Error()), time.Since(started).Milliseconds(), err, metadata)
 		return "", err
 	}
-	t.emit("observation", argumentsInJSON, summarizeToolOutput(result))
+	t.emit("observation", argumentsInJSON, summarizeToolOutput(result), time.Since(started).Milliseconds(), nil, metadata)
 	return result, nil
 }
 
@@ -225,24 +228,43 @@ func (t *eventTool) StreamableRun(ctx context.Context, argumentsInJSON string, o
 		return nil, fmt.Errorf("tool %s is not streamable", t.name)
 	}
 
-	t.emit("action", argumentsInJSON, "")
+	started := time.Now()
+	t.emit("action", argumentsInJSON, "", 0, nil, map[string]any{"args_chars": len(argumentsInJSON), "streamable": true})
 	reader, err := st.StreamableRun(ctx, argumentsInJSON, opts...)
+	metadata := map[string]any{"args_chars": len(argumentsInJSON), "streamable": true}
 	if err != nil {
-		t.emit("observation", argumentsInJSON, "error: "+err.Error())
+		t.emit("observation", argumentsInJSON, summarizeToolOutput("error: "+err.Error()), time.Since(started).Milliseconds(), err, metadata)
 		return nil, err
 	}
+	t.emit("observation", argumentsInJSON, "stream started", time.Since(started).Milliseconds(), nil, metadata)
 	return reader, nil
 }
 
-func (t *eventTool) emit(eventType, input, content string) {
+func (t *eventTool) emit(eventType, input, content string, latencyMs int64, err error, metadata map[string]any) {
 	if t.sink == nil {
 		return
+	}
+	step := &TraceStep{
+		Type:      eventType,
+		Stage:     eventType,
+		Content:   content,
+		ToolName:  t.name,
+		ToolInput: input,
+		LatencyMs: latencyMs,
+		Metadata:  metadata,
+	}
+	if err != nil {
+		step.Level = "error"
+		step.Error = err.Error()
 	}
 	t.sink(StreamEvent{
 		Type:      eventType,
 		Content:   content,
 		ToolName:  t.name,
 		ToolInput: input,
+		LatencyMs: latencyMs,
+		Error:     step.Error,
+		TraceStep: step,
 	})
 }
 

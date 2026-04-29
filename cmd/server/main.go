@@ -263,7 +263,9 @@ func main() {
 	// 注入 LLM 审计日志仓储（需要 DB）
 	if db != nil {
 		chatService.SetAuditRepo(repository.NewLLMAuditRepository(db))
+		chatService.SetRequestTraceRepo(repository.NewRequestTraceRepository(db))
 		log.Println("[Audit] LLM 审计日志已启用")
+		log.Println("[Trace] 请求级 trace 已启用")
 	}
 	c.SetRetrievalCache(retrievalCache)
 	log.Println("[Retriever] 初始化检索器...")

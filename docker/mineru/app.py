@@ -19,10 +19,9 @@ import subprocess
 import tempfile
 import unicodedata
 from pathlib import Path
-from typing import List
 
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
 # ── 配置 ──
@@ -35,12 +34,8 @@ logger = logging.getLogger("mineru-service")
 
 # ── 数据模型 ──
 
-class ParsedChunk(BaseModel):
-    content: str
-    seq: int
-
 class ParseResponse(BaseModel):
-    chunks: List[ParsedChunk]
+    content: str
 
 # ── MinerU 延迟初始化 ──
 # 延迟导入，避免未安装时直接崩溃；启动时才真正加载模型
@@ -78,10 +73,8 @@ def health():
 @app.post("/parse/file", response_model=ParseResponse)
 async def parse_file(
     file: UploadFile = File(...),
-    chunk_size: int   = Form(500),
-    chunk_overlap: int = Form(50),
 ):
-    """接收文件字节，通过 MinerU 解析为文本 chunks。"""
+    """接收文件字节，通过 MinerU 解析为 Markdown/文本。"""
     raw = await file.read()
     if not raw:
         raise HTTPException(status_code=400, detail="上传文件为空")
@@ -95,10 +88,7 @@ async def parse_file(
         logger.exception(f"解析失败: {filename}")
         raise HTTPException(status_code=500, detail=f"解析失败: {exc}") from exc
 
-    chunks = _chunk_text(text, chunk_size, chunk_overlap)
-    return ParseResponse(
-        chunks=[ParsedChunk(content=c, seq=i) for i, c in enumerate(chunks)]
-    )
+    return ParseResponse(content=text)
 
 # ── 文本提取 ──
 
@@ -221,37 +211,6 @@ def _clean_markdown(text: str) -> str:
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)  # 链接 → 锚文本
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
-
-
-def _chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
-    """按 Unicode 字符（rune）进行固定大小分块，与 Go 实现保持一致。"""
-    text = text.strip()
-    if not text:
-        return []
-
-    runes = list(text)          # Python str 是 Unicode 码点列表
-    if chunk_size <= 0:
-        chunk_size = 500
-    if chunk_overlap < 0:
-        chunk_overlap = 0
-    if chunk_overlap >= chunk_size:
-        chunk_overlap = chunk_size // 5
-
-    step = chunk_size - chunk_overlap
-    if step <= 0:
-        step = chunk_size
-
-    chunks: List[str] = []
-    start = 0
-    while start < len(runes):
-        end   = min(start + chunk_size, len(runes))
-        chunk = "".join(runes[start:end]).strip()
-        if chunk:
-            chunks.append(chunk)
-        if end == len(runes):
-            break
-        start += step
-    return chunks
 
 
 if __name__ == "__main__":

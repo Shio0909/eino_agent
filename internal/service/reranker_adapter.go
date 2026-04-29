@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
+	"time"
 
 	"eino_agent/internal/container"
+	"eino_agent/internal/tracing"
 )
 
 // rerankerAdapter adapts container.RerankerProvider to pipeline.Reranker interface.
@@ -19,6 +22,7 @@ func NewRerankerAdapter(provider container.RerankerProvider) *rerankerAdapter {
 }
 
 func (a *rerankerAdapter) Rerank(ctx context.Context, query string, passages []string) ([]int, error) {
+	started := time.Now()
 	// Convert passages to container.Document slice
 	docs := make([]*container.Document, len(passages))
 	for i, p := range passages {
@@ -28,6 +32,7 @@ func (a *rerankerAdapter) Rerank(ctx context.Context, query string, passages []s
 	// Call the underlying provider (returns top docs sorted by score)
 	ranked, err := a.provider.Rerank(ctx, query, docs, len(passages))
 	if err != nil {
+		tracing.Emit(ctx, tracing.Event{Type: "rerank", Stage: "rerank_scores", Level: "error", Error: err.Error(), LatencyMs: time.Since(started).Milliseconds(), Metadata: map[string]any{"passage_count": len(passages)}})
 		return nil, err
 	}
 
@@ -63,8 +68,25 @@ func (a *rerankerAdapter) Rerank(ctx context.Context, query string, passages []s
 	})
 
 	result := make([]int, len(items))
+	traceItems := make([]map[string]any, 0, len(items))
 	for i, it := range items {
 		result[i] = it.idx
+		traceItems = append(traceItems, map[string]any{
+			"rank":           i + 1,
+			"original_index": it.idx,
+			"score":          it.score,
+			"preview":        previewPassage(passages[it.idx]),
+		})
 	}
+	tracing.Emit(ctx, tracing.Event{Type: "rerank", Stage: "rerank_scores", Summary: "rerank score mapping", LatencyMs: time.Since(started).Milliseconds(), Metadata: map[string]any{"query": query, "passage_count": len(passages), "scores": traceItems}})
 	return result, nil
+}
+
+func previewPassage(passage string) string {
+	trimmed := strings.TrimSpace(passage)
+	runes := []rune(trimmed)
+	if len(runes) > 160 {
+		return string(runes[:160]) + "..."
+	}
+	return trimmed
 }

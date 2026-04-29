@@ -78,7 +78,7 @@ func (h *Handler) MCPImportURL(ctx context.Context, kbID, rawURL, title string) 
 		return knowledge.ID, 0, fmt.Errorf("网页解析失败: %w", err)
 	}
 
-	chunkCount, err := h.storeParsedChunks(ctx, kbID, knowledge.ID, title, result.Chunks)
+	chunkCount, err := h.storeParsedResult(ctx, kbID, knowledge.ID, title, result)
 	if err != nil {
 		h.markKnowledgeFailed(ctx, knowledge.ID, chunkCount, err)
 		return knowledge.ID, chunkCount, fmt.Errorf("向量化失败: %w", err)

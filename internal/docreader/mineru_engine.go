@@ -9,7 +9,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -29,7 +28,8 @@ type mineruChunk struct {
 
 // mineruResponse 对应 FastAPI 服务的 ParseResponse。
 type mineruResponse struct {
-	Chunks []mineruChunk `json:"chunks"`
+	Content string        `json:"content"`
+	Chunks  []mineruChunk `json:"chunks"`
 }
 
 func newMineruEngine(cfg *Config) Engine {
@@ -63,12 +63,6 @@ func (e *mineruEngine) ParseBytes(ctx context.Context, content []byte, fileName,
 	if _, err = fw.Write(content); err != nil {
 		return nil, fmt.Errorf("mineru: write content: %w", err)
 	}
-	if err = mw.WriteField("chunk_size", strconv.Itoa(opts.ChunkSize)); err != nil {
-		return nil, fmt.Errorf("mineru: write chunk_size: %w", err)
-	}
-	if err = mw.WriteField("chunk_overlap", strconv.Itoa(opts.ChunkOverlap)); err != nil {
-		return nil, fmt.Errorf("mineru: write chunk_overlap: %w", err)
-	}
 	mw.Close()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.endpoint+"/parse/file", &body)
@@ -93,18 +87,18 @@ func (e *mineruEngine) ParseBytes(ctx context.Context, content []byte, fileName,
 		return nil, fmt.Errorf("mineru: decode response: %w", err)
 	}
 
-	chunks := make([]ParsedChunk, 0, len(svcResp.Chunks))
-	for _, c := range svcResp.Chunks {
-		if strings.TrimSpace(c.Content) == "" {
-			continue
+	parsedContent := strings.TrimSpace(svcResp.Content)
+	if parsedContent == "" && len(svcResp.Chunks) > 0 {
+		parts := make([]string, 0, len(svcResp.Chunks))
+		for _, c := range svcResp.Chunks {
+			if strings.TrimSpace(c.Content) != "" {
+				parts = append(parts, c.Content)
+			}
 		}
-		chunks = append(chunks, ParsedChunk{
-			Content: c.Content,
-			Seq:     c.Seq,
-		})
+		parsedContent = strings.TrimSpace(strings.Join(parts, "\n\n"))
 	}
 
-	return &ParseResult{Chunks: chunks}, nil
+	return &ParseResult{Content: parsedContent}, nil
 }
 
 // ParseURL 先下载 URL 内容，再调用 ParseBytes 解析。

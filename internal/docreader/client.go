@@ -233,8 +233,9 @@ type ImageInfo struct {
 
 // ParseResult 解析结果。
 type ParseResult struct {
-	Chunks []ParsedChunk `json:"chunks"`
-	Error  string        `json:"error,omitempty"`
+	Content string        `json:"content,omitempty"`
+	Chunks  []ParsedChunk `json:"chunks"`
+	Error   string        `json:"error,omitempty"`
 }
 
 // ParseOptions 解析选项。

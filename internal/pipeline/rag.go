@@ -11,10 +11,13 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/cloudwego/eino/components/retriever"
 	"github.com/cloudwego/eino/schema"
+
+	"eino_agent/internal/tracing"
 )
 
 // RAGPipeline RAG 流水线
@@ -32,6 +35,8 @@ type RAGPipeline struct {
 type Config struct {
 	// 是否启用查询重写
 	EnableRewrite bool
+	// 是否启用低召回查询扩展
+	EnableQueryExpansion bool
 	// 是否启用重排序
 	EnableRerank bool
 	// 检索结果数量
@@ -44,6 +49,17 @@ type Config struct {
 	SystemPrompt string
 	// 外部降级策略
 	Fallback FallbackConfig
+	// 查询扩展策略
+	QueryExpansion QueryExpansionConfig
+}
+
+type QueryExpansionConfig struct {
+	Enabled         bool
+	MinDocs         int
+	MinContextChars int
+	MinScore        float64
+	MaxQueries      int
+	MaxTotalDocs    int
 }
 
 type FallbackConfig struct {
@@ -112,12 +128,13 @@ type ExternalFallbackProvider interface {
 // DefaultConfig 返回默认配置
 func DefaultConfig() *Config {
 	return &Config{
-		EnableRewrite: true,
-		EnableRerank:  true,
-		TopK:          10,
-		RerankTopK:    5,
-		ModelID:       "gpt-4o-mini",
-		SystemPrompt:  "你是一个专业的知识库问答助手。请基于参考资料尽可能完整地回答，允许总结和归纳。禁止编造具体信息。每个要点附带[来源X]标注。",
+		EnableRewrite:        true,
+		EnableQueryExpansion: true,
+		EnableRerank:         true,
+		TopK:                 10,
+		RerankTopK:           5,
+		ModelID:              "gpt-4o-mini",
+		SystemPrompt:         "你是一个专业的知识库问答助手。请基于参考资料尽可能完整地回答，允许总结和归纳。禁止编造具体信息。每个要点附带[来源X]标注。",
 	}
 }
 
@@ -207,11 +224,13 @@ type RAGResponse struct {
 }
 
 type RetrievalTrace struct {
-	Retrieved    []TraceChunk        `json:"retrieved,omitempty"`
-	RerankBefore []TraceChunk        `json:"rerank_before,omitempty"`
-	RerankAfter  []TraceChunk        `json:"rerank_after,omitempty"`
-	Context      []TraceChunk        `json:"context,omitempty"`
-	Fallback     []FallbackGraphStep `json:"fallback,omitempty"`
+	Retrieved        []TraceChunk        `json:"retrieved,omitempty"`
+	Expansion        []TraceChunk        `json:"expansion,omitempty"`
+	ExpansionQueries []string            `json:"expansion_queries,omitempty"`
+	RerankBefore     []TraceChunk        `json:"rerank_before,omitempty"`
+	RerankAfter      []TraceChunk        `json:"rerank_after,omitempty"`
+	Context          []TraceChunk        `json:"context,omitempty"`
+	Fallback         []FallbackGraphStep `json:"fallback,omitempty"`
 }
 
 type TraceChunk struct {
@@ -266,6 +285,23 @@ func (p *RAGPipeline) Run(ctx context.Context, req *RAGRequest) (*RAGResponse, e
 	if err != nil {
 		return nil, fmt.Errorf("retrieve: %w", err)
 	}
+	resp.Trace.Retrieved = traceChunksFromDocs(docs)
+
+	if p.shouldExpandQuery(docs) {
+		expansionStart := time.Now()
+		expandedDocs, queries, err := p.expandAndRetrieve(ctx, req.Query, query, docs)
+		log.Printf("[Timing][Pipeline] stage=query_expansion duration_ms=%d queries=%d added_docs=%d", time.Since(expansionStart).Milliseconds(), len(queries), len(expandedDocs)-len(docs))
+		if err != nil {
+			resp.Metadata["query_expansion_error"] = err.Error()
+		} else if len(queries) > 0 {
+			resp.Metadata["query_expansion"] = "true"
+			resp.Metadata["query_expansion_queries"] = strings.Join(queries, " | ")
+			resp.Trace.ExpansionQueries = queries
+			resp.Trace.Expansion = traceChunksFromDocs(expandedDocs[len(docs):])
+			docs = expandedDocs
+		}
+	}
+
 	fallbackOutput, err := p.runFallbackGraph(ctx, query, docs)
 	if err != nil {
 		return nil, err
@@ -323,6 +359,12 @@ func (p *RAGPipeline) Run(ctx context.Context, req *RAGRequest) (*RAGResponse, e
 		}
 	}
 	log.Printf("[Timing][Pipeline] stage=build_context duration_ms=%d top_k=%d", time.Since(contextStart).Milliseconds(), topK)
+	tracing.Emit(ctx, tracing.Event{Type: "context", Stage: "context_build", Summary: "final prompt context", LatencyMs: time.Since(contextStart).Milliseconds(), Metadata: map[string]any{
+		"chunks":          resp.Trace.Context,
+		"count":           len(resp.Trace.Context),
+		"context_chars":   len(contextBuilder),
+		"context_preview": compactText(contextBuilder, 500),
+	}})
 
 	// Step 5: 生成回答
 	if p.generator == nil {
@@ -339,14 +381,17 @@ func (p *RAGPipeline) Run(ctx context.Context, req *RAGRequest) (*RAGResponse, e
 		resp.Fallback.State = StateRefuseOrClarify
 		resp.Answer = "⚠️ 未在当前知识库或已启用的外部来源中找到足够依据，请补充资料或放宽检索范围。"
 		log.Printf("[Timing][Pipeline] stage=refuse duration_ms=%d", time.Since(generateStart).Milliseconds())
+		tracing.Emit(ctx, tracing.Event{Type: "llm", Stage: string(StateRefuseOrClarify), Summary: "refused due to missing sources", LatencyMs: time.Since(generateStart).Milliseconds(), Metadata: map[string]any{"source_count": len(resp.Sources), "token_unavailable": true}})
 		return resp, nil
 	}
 	resp.Fallback.State = StateGenerate
 	answer, err := p.generator.Generate(ctx, generationQuery, contextBuilder)
 	log.Printf("[Timing][Pipeline] stage=generate duration_ms=%d context_chars=%d", time.Since(generateStart).Milliseconds(), len(contextBuilder))
 	if err != nil {
+		tracing.Emit(ctx, tracing.Event{Type: "llm", Stage: "generate", Level: "error", Error: err.Error(), LatencyMs: time.Since(generateStart).Milliseconds(), Metadata: map[string]any{"context_chars": len(contextBuilder), "token_unavailable": true}})
 		return nil, fmt.Errorf("generate: %w", err)
 	}
+	tracing.Emit(ctx, tracing.Event{Type: "llm", Stage: "generate", Summary: "answer generated", LatencyMs: time.Since(generateStart).Milliseconds(), Metadata: map[string]any{"context_chars": len(contextBuilder), "answer_chars": len(answer), "token_unavailable": true}})
 	resp.Answer = answer
 	log.Printf("[Timing][Pipeline] stage=total duration_ms=%d", time.Since(startTime).Milliseconds())
 
@@ -435,6 +480,18 @@ func boundedTopK(length, topK int) int {
 	return length
 }
 
+func compactText(text string, limit int) string {
+	trimmed := strings.TrimSpace(text)
+	if limit <= 0 {
+		return trimmed
+	}
+	runes := []rune(trimmed)
+	if len(runes) > limit {
+		return string(runes[:limit]) + "..."
+	}
+	return trimmed
+}
+
 // RunStream 流式执行 RAG 流水线
 // 【Eino 特点】原生支持流式输出，与 Eino 的 StreamReader 无缝集成
 func (p *RAGPipeline) RunStream(ctx context.Context, req *RAGRequest) (<-chan StreamChunk, error) {
@@ -462,6 +519,16 @@ func (p *RAGPipeline) RunStream(ctx context.Context, req *RAGRequest) (<-chan St
 		if err != nil {
 			ch <- StreamChunk{Type: ChunkTypeError, Content: err.Error()}
 			return
+		}
+		ch <- StreamChunk{Type: ChunkTypeTrace, Metadata: map[string]any{"stage": "retrieved_initial", "chunks": traceChunksFromDocs(docs), "count": len(docs)}}
+		if p.shouldExpandQuery(docs) {
+			expandedDocs, queries, err := p.expandAndRetrieve(ctx, req.Query, query, docs)
+			if err != nil {
+				ch <- StreamChunk{Type: ChunkTypeTrace, Metadata: map[string]any{"stage": "query_expansion_error", "error": err.Error()}}
+			} else if len(queries) > 0 {
+				ch <- StreamChunk{Type: ChunkTypeTrace, Metadata: map[string]any{"stage": "query_expansion", "queries": queries, "chunks": traceChunksFromDocs(expandedDocs[len(docs):]), "count": len(expandedDocs) - len(docs)}}
+				docs = expandedDocs
+			}
 		}
 		fallbackOutput, err := p.runFallbackGraph(ctx, query, docs)
 		if err != nil {
@@ -521,7 +588,9 @@ func (p *RAGPipeline) RunStream(ctx context.Context, req *RAGRequest) (<-chan St
 		}
 
 		contextCount := boundedTopK(len(rankedDocs), p.config.RerankTopK)
-		ch <- StreamChunk{Type: ChunkTypeTrace, Metadata: map[string]any{"stage": "context_build", "chunks": traceChunksFromDocs(rankedDocs[:contextCount]), "count": contextCount}}
+		contextChunks := traceChunksFromDocs(rankedDocs[:contextCount])
+		ch <- StreamChunk{Type: ChunkTypeTrace, Metadata: map[string]any{"stage": "context_build", "chunks": contextChunks, "count": contextCount, "context_chars": len(contextBuilder), "context_preview": compactText(contextBuilder, 500)}}
+		tracing.Emit(ctx, tracing.Event{Type: "context", Stage: "context_build", Summary: "final prompt context", Metadata: map[string]any{"chunks": contextChunks, "count": contextCount, "context_chars": len(contextBuilder), "context_preview": compactText(contextBuilder, 500)}})
 
 		// 流式生成
 		if p.generator == nil {
@@ -535,21 +604,27 @@ func (p *RAGPipeline) RunStream(ctx context.Context, req *RAGRequest) (<-chan St
 		}
 
 		if len(rankedDocs) == 0 && p.fallbackConfig().RefuseWhenNoSources {
-			ch <- StreamChunk{Type: ChunkTypeTrace, Metadata: map[string]any{"stage": string(StateRefuseOrClarify)}}
+			ch <- StreamChunk{Type: ChunkTypeTrace, Metadata: map[string]any{"stage": string(StateRefuseOrClarify), "token_unavailable": true, "source_count": 0}}
+			tracing.Emit(ctx, tracing.Event{Type: "llm", Stage: string(StateRefuseOrClarify), Summary: "refused due to missing sources", Metadata: map[string]any{"source_count": 0, "token_unavailable": true}})
 			ch <- StreamChunk{Type: ChunkTypeContent, Content: "⚠️ 未在当前知识库或已启用的外部来源中找到足够依据，请补充资料或放宽检索范围。"}
 			ch <- StreamChunk{Type: ChunkTypeDone}
 			return
 		}
 
+		generateStart := time.Now()
 		stream, err := p.generator.GenerateStream(ctx, generationQuery, contextBuilder)
 		if err != nil {
+			tracing.Emit(ctx, tracing.Event{Type: "llm", Stage: "generate", Level: "error", Error: err.Error(), LatencyMs: time.Since(generateStart).Milliseconds(), Metadata: map[string]any{"context_chars": len(contextBuilder), "token_unavailable": true}})
 			ch <- StreamChunk{Type: ChunkTypeError, Content: err.Error()}
 			return
 		}
 
+		answerChars := 0
 		for chunk := range stream {
+			answerChars += len(chunk)
 			ch <- StreamChunk{Type: ChunkTypeContent, Content: chunk}
 		}
+		tracing.Emit(ctx, tracing.Event{Type: "llm", Stage: "generate", Summary: "answer streamed", LatencyMs: time.Since(generateStart).Milliseconds(), Metadata: map[string]any{"context_chars": len(contextBuilder), "answer_chars": answerChars, "token_unavailable": true}})
 
 		ch <- StreamChunk{Type: ChunkTypeDone}
 	}()

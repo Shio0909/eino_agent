@@ -46,6 +46,9 @@ export function EvidenceRail({ references, trace, streaming, options = defaultOp
   const rerankBefore = asChunks(rerankSteps.find((step) => Array.isArray(step.metadata?.before))?.metadata?.before);
   const rerankAfter = asChunks([...rerankSteps].reverse().find((step) => Array.isArray(step.metadata?.after))?.metadata?.after);
   const contextChunks = asChunks(contextStep?.metadata?.chunks);
+  const firstTrace = trace[0];
+  const completeStep = [...trace].reverse().find((step) => step.stage === 'complete');
+  const errorStep = trace.find((step) => step.error || step.level === 'error');
 
   return (
     <aside className="glass-panel flex h-full min-h-0 flex-col rounded-[2rem] p-5">
@@ -57,6 +60,18 @@ export function EvidenceRail({ references, trace, streaming, options = defaultOp
         {streaming ? <Badge tone="warning">streaming</Badge> : <Badge tone="muted">ready</Badge>}
       </div>
       <div className="mt-5 min-h-0 flex-1 space-y-4 overflow-auto pr-1">
+        {trace.length > 0 ? (
+          <section className="rounded-3xl border border-border/70 bg-surface/35 p-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge tone={errorStep ? 'warning' : 'primary'}>{errorStep ? 'error' : 'trace'}</Badge>
+              {firstTrace?.trace_id ? <span className="font-mono text-[11px] text-muted">{firstTrace.trace_id}</span> : null}
+              {completeStep?.metadata?.mode ? <Badge>{String(completeStep.metadata.mode)}</Badge> : null}
+              {completeStep?.latency_ms ? <Badge>{completeStep.latency_ms}ms</Badge> : null}
+              <Badge>{trace.length} steps</Badge>
+            </div>
+            {errorStep?.error ? <p className="mt-2 text-xs font-semibold text-warning">{errorStep.error}</p> : null}
+          </section>
+        ) : null}
         <section className="rounded-3xl border border-border/70 bg-surface/35 p-3">
           <h4 className="mb-2 flex items-center gap-2 text-sm font-semibold"><Activity className="h-4 w-4" />LLM 调用 / 思考链</h4>
           <div className="space-y-3">
@@ -188,8 +203,12 @@ function TraceCard({ step }: { step: TraceStep }) {
       <div className="flex items-center gap-2">
         {step.tool_name ? <Wrench className="h-4 w-4 text-accent" /> : <Link2 className="h-4 w-4 text-primary" />}
         <span className="text-sm font-semibold">{traceTitle(step)}</span>
+        {step.seq ? <Badge>#{step.seq}</Badge> : null}
+        {step.level === 'error' ? <Badge tone="warning">error</Badge> : null}
         {step.latency_ms ? <Badge>{step.latency_ms}ms</Badge> : null}
       </div>
+      {step.summary ? <p className="mt-2 text-xs font-semibold text-muted">{step.summary}</p> : null}
+      {step.error ? <p className="mt-2 text-xs font-semibold text-warning">{step.error}</p> : null}
       {step.tool_name ? <p className="mt-2 font-mono text-xs text-muted">{step.tool_name}</p> : null}
       {parsed.length > 0 ? (
         <div className="mt-2 space-y-2">

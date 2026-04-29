@@ -30,7 +30,8 @@ type KnowledgeTool struct {
 	maxContentPerDoc int                // 每篇文档最大字符数
 	maxTotalContent  int                // 总内容最大字符数
 	lastDocs         []*schema.Document // 缓存最近一次检索结果，供 Agent 模式回填 sources
-	lightModel       model.ChatModel    // 轻量模型（用于冲突检测，可为 nil）
+	searched         bool
+	lightModel       model.ChatModel // 轻量模型（用于冲突检测，可为 nil）
 }
 
 // KnowledgeToolInput 知识库工具输入
@@ -136,6 +137,7 @@ func (t *KnowledgeTool) InvokableRun(ctx context.Context, input string, opts ...
 		return "", fmt.Errorf("retrieve (mode=%s): %w", mode, err)
 	}
 
+	t.searched = true
 	// 缓存检索结果，供 ChatService 回填 sources 时直接使用
 	t.lastDocs = append(t.lastDocs, docs...)
 
@@ -199,6 +201,11 @@ func (t *KnowledgeTool) LastDocs() []*schema.Document {
 // ResetDocs 重置缓存的文档（每次请求开始时调用）
 func (t *KnowledgeTool) ResetDocs() {
 	t.lastDocs = nil
+	t.searched = false
+}
+
+func (t *KnowledgeTool) HasSearched() bool {
+	return t.searched
 }
 
 // detectConflicts 使用 lightModel 检测检索结果中的信息冲突

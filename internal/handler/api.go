@@ -63,14 +63,15 @@ type Handler struct {
 	chatModelFactory func(context.Context) (model.ChatModel, error)
 
 	// Repositories
-	kbRepo        repository.KnowledgeBaseRepository
-	accessRepo    repository.AccessControlRepository
-	knowledgeRepo repository.KnowledgeRepository
-	chunkRepo     repository.ChunkRepository
-	wikiRepo      repository.WikiPageRepository
-	embeddingRepo repository.EmbeddingRepository
-	sessionRepo   repository.SessionRepository
-	messageRepo   repository.MessageRepository
+	kbRepo           repository.KnowledgeBaseRepository
+	accessRepo       repository.AccessControlRepository
+	knowledgeRepo    repository.KnowledgeRepository
+	chunkRepo        repository.ChunkRepository
+	wikiRepo         repository.WikiPageRepository
+	embeddingRepo    repository.EmbeddingRepository
+	sessionRepo      repository.SessionRepository
+	messageRepo      repository.MessageRepository
+	requestTraceRepo repository.RequestTraceRepository
 }
 
 // SetMCPManager 设置 MCP 管理器
@@ -198,7 +199,9 @@ func NewHandler(
 		h.embeddingRepo = repository.NewEmbeddingRepository(db)
 		h.sessionRepo = repository.NewSessionRepository(db)
 		h.messageRepo = repository.NewMessageRepository(db)
+		h.requestTraceRepo = repository.NewRequestTraceRepository(db)
 		h.chatService.SetRepositories(h.sessionRepo, h.messageRepo)
+		h.chatService.SetRequestTraceRepo(h.requestTraceRepo)
 	}
 
 	return h
@@ -257,6 +260,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		}
 
 		// 会话管理
+		protected.GET("/traces/:trace_id", h.GetTrace)
+
 		sessions := protected.Group("/sessions")
 		{
 			sessions.GET("", h.ListSessions)
@@ -264,6 +269,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			sessions.GET("/:id", h.GetSession)
 			sessions.DELETE("/:id", h.DeleteSession)
 			sessions.GET("/:id/messages", h.GetSessionMessages)
+			sessions.GET("/:id/traces", h.ListSessionTraces)
 		}
 
 		// 模型管理
@@ -485,6 +491,7 @@ type ChatResponse struct {
 	Answer     string              `json:"answer"`
 	References []ReferenceDocument `json:"references,omitempty"`
 	SessionID  string              `json:"session_id,omitempty"`
+	TraceID    string              `json:"trace_id,omitempty"`
 	TokensUsed int                 `json:"tokens_used,omitempty"`
 	LatencyMs  int64               `json:"latency_ms"`
 	Trace      []service.TraceStep `json:"trace,omitempty"`
@@ -518,14 +525,19 @@ func (h *Handler) toMessageResponses(messages []*repository.Message) []messageRe
 
 func traceStepFromMap(m map[string]any) service.TraceStep {
 	step := service.TraceStep{
+		TraceID:   stringValue(m["trace_id"]),
 		Type:      stringValue(m["type"]),
 		Stage:     stringValue(m["stage"]),
+		Level:     stringValue(m["level"]),
+		Summary:   stringValue(m["summary"]),
 		Content:   stringValue(m["content"]),
 		ToolName:  stringValue(m["tool_name"]),
 		ToolInput: stringValue(m["tool_input"]),
 		DocID:     stringValue(m["doc_id"]),
+		Error:     stringValue(m["error"]),
 		Metadata:  mapValue(m["metadata"]),
 	}
+	step.Seq = intValue(m["seq"])
 	step.LatencyMs = int64Value(m["latency_ms"])
 	step.TokenCount = intValue(m["token_count"])
 	return step
@@ -643,6 +655,7 @@ func (h *Handler) Chat(c *gin.Context) {
 		Answer:     resp.Answer,
 		References: h.toReferences(resp.Sources),
 		SessionID:  resp.SessionID,
+		TraceID:    resp.TraceID,
 		LatencyMs:  time.Since(startTime).Milliseconds(),
 		Trace:      resp.Trace,
 	})
@@ -729,6 +742,9 @@ func (h *Handler) ChatStream(c *gin.Context) {
 			if event.SessionID != "" {
 				data["session_id"] = event.SessionID
 			}
+			if event.TraceID != "" {
+				data["trace_id"] = event.TraceID
+			}
 			if event.Error != "" {
 				data["error"] = event.Error
 			}
@@ -755,6 +771,9 @@ func (h *Handler) ChatStream(c *gin.Context) {
 			}
 			if event.TraceStep != nil {
 				data["trace_step"] = event.TraceStep
+			}
+			if len(event.TraceSnapshot) > 0 {
+				data["trace_snapshot"] = event.TraceSnapshot
 			}
 			c.SSEvent("message", data)
 			return true
@@ -1355,7 +1374,7 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 		}
 
 		// 向量化并存储
-		chunkCount, err := h.storeParsedChunks(c.Request.Context(), kbID, knowledge.ID, header.Filename, result.Chunks)
+		chunkCount, err := h.storeParsedResult(c.Request.Context(), kbID, knowledge.ID, header.Filename, result)
 		if err != nil {
 			log.Printf("[Upload] 向量化失败（文档已解析 %d 块）: %v", chunkCount, err)
 			h.markKnowledgeFailed(c.Request.Context(), knowledge.ID, chunkCount, err)
@@ -1493,7 +1512,7 @@ func (h *Handler) UploadDocumentURL(c *gin.Context) {
 		return
 	}
 
-	chunkCount, err := h.storeParsedChunks(c.Request.Context(), kbID, knowledge.ID, title, result.Chunks)
+	chunkCount, err := h.storeParsedResult(c.Request.Context(), kbID, knowledge.ID, title, result)
 	if err != nil {
 		log.Printf("[UploadURL] 向量化失败（URL 已解析 %d 块）: %v", chunkCount, err)
 		h.markKnowledgeFailed(c.Request.Context(), knowledge.ID, chunkCount, err)
@@ -1758,15 +1777,19 @@ func (h *Handler) uploadWikiDocumentURL(c *gin.Context, kb *repository.Knowledge
 	}
 
 	var content strings.Builder
-	for _, chunk := range result.Chunks {
-		text := strings.TrimSpace(chunk.Content)
-		if text == "" {
-			continue
+	if strings.TrimSpace(result.Content) != "" {
+		content.WriteString(strings.TrimSpace(result.Content))
+	} else {
+		for _, chunk := range result.Chunks {
+			text := strings.TrimSpace(chunk.Content)
+			if text == "" {
+				continue
+			}
+			if content.Len() > 0 {
+				content.WriteString("\n\n")
+			}
+			content.WriteString(text)
 		}
-		if content.Len() > 0 {
-			content.WriteString("\n\n")
-		}
-		content.WriteString(text)
 	}
 	if content.Len() == 0 {
 		err := fmt.Errorf("网页解析结果为空")
@@ -1967,6 +1990,16 @@ func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeI
 	return len(chunks), nil
 }
 
+func (h *Handler) storeParsedResult(ctx context.Context, kbID, knowledgeID, sourceFilename string, result *docreader.ParseResult) (int, error) {
+	if result == nil {
+		return 0, nil
+	}
+	if strings.TrimSpace(result.Content) != "" {
+		return h.processPlainTextDocument(ctx, kbID, knowledgeID, sourceFilename, []byte(result.Content))
+	}
+	return h.storeParsedChunks(ctx, kbID, knowledgeID, sourceFilename, result.Chunks)
+}
+
 func (h *Handler) storeParsedChunks(ctx context.Context, kbID, knowledgeID, sourceFilename string, chunks []docreader.ParsedChunk) (int, error) {
 	if err := h.processAndStoreChunks(ctx, kbID, knowledgeID, sourceFilename, chunks); err != nil {
 		return len(chunks), err
@@ -2035,7 +2068,7 @@ func (h *Handler) processQueuedFileImport(ctx context.Context, task importqueue.
 		if err != nil {
 			return 0, fmt.Errorf("文档解析失败: %w", err)
 		}
-		return h.storeParsedChunks(ctx, task.KnowledgeBaseID, task.KnowledgeID, task.FileName, result.Chunks)
+		return h.storeParsedResult(ctx, task.KnowledgeBaseID, task.KnowledgeID, task.FileName, result)
 	}
 
 	content, err := os.ReadFile(task.FilePath)
@@ -2054,7 +2087,7 @@ func (h *Handler) processQueuedURLImport(ctx context.Context, task importqueue.T
 		if err != nil {
 			return 0, fmt.Errorf("网页解析失败: %w", err)
 		}
-		return h.storeParsedChunks(ctx, task.KnowledgeBaseID, task.KnowledgeID, task.Title, result.Chunks)
+		return h.storeParsedResult(ctx, task.KnowledgeBaseID, task.KnowledgeID, task.Title, result)
 	}
 
 	// docreader 不可用时，直接 HTTP 抓取并按纯文本处理
@@ -3060,6 +3093,69 @@ func (h *Handler) GetSessionMessages(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"messages": h.toMessageResponses(messages)})
+}
+
+func (h *Handler) GetTrace(c *gin.Context) {
+	if h.requestTraceRepo == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "数据库未连接"})
+		return
+	}
+	traceID := strings.TrimSpace(c.Param("trace_id"))
+	if traceID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少 trace_id"})
+		return
+	}
+	trace, err := h.requestTraceRepo.GetByTraceID(c.Request.Context(), traceID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if trace == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "trace 不存在"})
+		return
+	}
+	if trace.TenantID != h.getTenantID(c) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "无权访问该 trace"})
+		return
+	}
+	if h.getUserRole(c) != "admin" && trace.UserID != h.getUserID(c) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "无权访问该 trace"})
+		return
+	}
+	c.JSON(http.StatusOK, trace)
+}
+
+func (h *Handler) ListSessionTraces(c *gin.Context) {
+	if h.requestTraceRepo == nil {
+		c.JSON(http.StatusOK, gin.H{"traces": []any{}, "total": 0, "message": "数据库未连接"})
+		return
+	}
+	sessionID := c.Param("id")
+	if h.sessionRepo != nil {
+		if _, ok := h.ensureSessionAccess(c, sessionID); !ok {
+			return
+		}
+	}
+	page, pageSize := parsePagination(c, 20, 100)
+	traces, total, err := h.requestTraceRepo.List(c.Request.Context(), repository.RequestTraceFilter{
+		TenantID:  h.getTenantID(c),
+		UserID:    userTraceFilter(h, c),
+		SessionID: sessionID,
+		Limit:     pageSize,
+		Offset:    (page - 1) * pageSize,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"traces": traces, "total": total, "page": page, "page_size": pageSize})
+}
+
+func userTraceFilter(h *Handler, c *gin.Context) string {
+	if h.getUserRole(c) == "admin" {
+		return ""
+	}
+	return h.getUserID(c)
 }
 
 // ============================================================================

@@ -16,6 +16,7 @@ func TestListMigrationFilesReturnsAllUpMigrations(t *testing.T) {
 		"000005_add_embed_fingerprint.up.sql",
 		"000006_add_content_hash.up.sql",
 		"000007_add_kb_access_control.up.sql",
+		"000008_create_request_traces.up.sql",
 	}
 	if len(files) != len(want) {
 		t.Fatalf("got %d migration files, want %d: %#v", len(files), len(want), files)
