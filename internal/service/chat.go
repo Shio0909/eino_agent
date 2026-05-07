@@ -3,6 +3,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"sort"
@@ -18,6 +19,7 @@ import (
 	"github.com/cloudwego/eino/flow/agent/react"
 	"github.com/cloudwego/eino/schema"
 
+	"eino_agent/internal/approval"
 	cachepkg "eino_agent/internal/cache"
 	"eino_agent/internal/codegraph"
 	"eino_agent/internal/config"
@@ -53,6 +55,7 @@ type ChatService struct {
 	mcpTools        []tool.BaseTool      // MCP 远程工具
 	skillMiddleware *adk.AgentMiddleware // Eino 原生 skill 中间件
 	promptManager   *promptmgr.Manager
+	approvalManager *approval.Manager
 
 	// 持久化
 	sessionRepo      repository.SessionRepository
@@ -104,6 +107,10 @@ func (s *ChatService) SetSessionCache(sessionCache cachepkg.SessionCache) {
 // SetMCPTools 设置 MCP 工具（在 InitWithComponents 之前调用）
 func (s *ChatService) SetMCPTools(tools []tool.BaseTool) {
 	s.mcpTools = tools
+}
+
+func (s *ChatService) SetApprovalManager(manager *approval.Manager) {
+	s.approvalManager = manager
 }
 
 // SetReranker 设置重排序器（在 InitWithComponents 之前调用）
@@ -352,14 +359,160 @@ func (s *ChatService) buildRuntimeInstruction(ctx context.Context, req *ChatRequ
 		parts = append(parts, memoryInst)
 	}
 
-	// Skills 已迁移至 Eino 原生 skill 中间件（渐进式披露），
-	// 不再在运行时指令中手动注入 skill prompt。
+	if codeQueryInstruction(req.Message) != "" && req.UseAgent {
+		parts = append(parts, codeQueryInstruction(req.Message))
+	}
 
 	if len(parts) == 0 {
 		return ""
 	}
 
 	return strings.Join(parts, "\n\n")
+}
+
+func codeQueryInstruction(message string) string {
+	lower := strings.ToLower(message)
+	keywords := []string{"code", "function", "tool_call", "function_call", "源码", "代码", "函数", "实现", "调用链", "工具调用", "deer-flow", "pydantic-ai", "normalize", "path_not_found"}
+	matched := false
+	for _, keyword := range keywords {
+		if strings.Contains(lower, strings.ToLower(keyword)) {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return ""
+	}
+	return "【代码查询约束】这是代码实现类问题。必须优先使用 code_search，最多执行 4 次 code_search 调用：第 1 次 grep 精确运行时/函数关键词，第 2-3 次 read 最相关文件，第 4 次仅在路径错误时 find 或 grep 纠错。当前项目使用 repo=\"eino_agent\" 或留空；deer-flow、pydantic-ai 等测试仓库必须显式填写 repo。除非用户明确问构建或格式化配置，不要优先读取 Makefile、go.mod、package.json、prettier、eslint、配置文件。已有足够文件证据后必须停止调用工具并直接回答。"
+}
+
+func (s *ChatService) agenticProjectContextRecoveryInstruction(ctx context.Context, req *ChatRequest) string {
+	if decision, ok := s.agenticProjectContextRecoveryDecision(ctx, req); ok {
+		return agenticProjectContextRecoveryText(decision.WebSearchEnabled)
+	}
+	return ""
+}
+
+type agenticProjectContextRecoveryDecision struct {
+	InitialStatus     string
+	InitialCandidates int
+	WebSearchEnabled  bool
+}
+
+func (s *ChatService) agenticProjectContextRecoveryDecision(ctx context.Context, req *ChatRequest) (agenticProjectContextRecoveryDecision, bool) {
+	if req == nil || !req.UseAgent || !pipeline.IsProjectOverviewQuery(req.Message) || s.retriever == nil {
+		return agenticProjectContextRecoveryDecision{}, false
+	}
+	docs, err := s.getRuntimeRetriever(req).Retrieve(ctx, req.Message)
+	if err != nil {
+		return agenticProjectContextRecoveryDecision{}, false
+	}
+	gate := pipeline.EvaluateEvidenceGate(req.Message, docs)
+	if gate.Status != "insufficient_project_context" {
+		return agenticProjectContextRecoveryDecision{}, false
+	}
+	webSearchEnabled := false
+	if s.config != nil {
+		webSearchEnabled = s.config.Agent.EnableWebSearch
+	}
+	return agenticProjectContextRecoveryDecision{InitialStatus: gate.Status, InitialCandidates: gate.CandidateCount, WebSearchEnabled: webSearchEnabled}, true
+}
+
+func agenticProjectContextRecoveryText(webSearchEnabled bool) string {
+	steps := "1. 先用 knowledge_search 对原问题执行 auto 检索；2. 改用 exact/semantic 模式检索 `README`、`架构`、`项目介绍`、`Eino Agent`、`RAG Pipeline Agentic MCP code_search` 等关键词；3. 如果仍缺证据，使用 query_decompose 拆成项目定位、核心模块、整体架构等子问题后分别检索；4. 再尝试 HyDE 风格检索：把用户问题改写成一段可能存在于项目说明中的假设文档摘要，并用该摘要关键词检索。"
+	if webSearchEnabled {
+		steps += "5. 知识库策略全部失败后，才允许使用 web_search 或其他外部工具补充，并在答案中明确标注外部来源不是知识库证据。"
+	} else {
+		steps += "5. 若未配置外部搜索工具，知识库策略全部失败后进入最终 insufficient_project_context，回答无法基于当前知识库说明项目整体情况。"
+	}
+	return "【Agentic 项目上下文恢复状态】预检发现这是项目概述/整体架构类问题，且首轮召回缺少有效项目上下文证据。不要直接套用 pipeline 的固定拒答；这在 agentic 模式只是中间状态。必须按顺序尝试恢复：" + steps + " 只有拿到能说明项目定位、模块或架构的证据后才作答；否则输出：⚠️ 当前知识库没有可用于说明项目整体情况的有效项目描述。"
+}
+
+func isAgenticProjectContextRecoveryActive(instruction string) bool {
+	return strings.Contains(instruction, "【Agentic 项目上下文恢复状态】")
+}
+
+func (s *ChatService) runAgenticProjectContextRecovery(ctx context.Context, req *ChatRequest, sessionID, traceID string, trace *traceCollector, decision agenticProjectContextRecoveryDecision) (*ChatResponse, bool) {
+	if req == nil || s.retriever == nil {
+		return nil, false
+	}
+	runtimeRetriever := s.getRuntimeRetriever(req)
+	if runtimeRetriever == nil {
+		return nil, false
+	}
+	trace.add(TraceStep{Type: "guardrail", Stage: "agentic_project_context_recovery", Summary: "initial retrieval lacks project context; deterministic recovery started", Metadata: map[string]any{"status": decision.InitialStatus, "initial_candidates": decision.InitialCandidates, "terminal": false}})
+	queries := agenticProjectContextRecoveryQueries(req.Message)
+	seen := make(map[string]struct{}, len(queries))
+	for _, attempt := range queries {
+		key := attempt.Mode + "\x00" + attempt.Query
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		started := time.Now()
+		docs, err := retrieveForRecoveryMode(ctx, runtimeRetriever, attempt.Query, attempt.Mode)
+		metadata := map[string]any{"query": attempt.Query, "mode": attempt.Mode, "doc_count": len(docs)}
+		if err != nil {
+			metadata["error"] = err.Error()
+			trace.add(TraceStep{Type: "error", Stage: "agentic_project_context_recovery", Error: err.Error(), LatencyMs: time.Since(started).Milliseconds(), Metadata: metadata})
+			continue
+		}
+		gate := pipeline.EvaluateEvidenceGate(req.Message, docs)
+		metadata["gate_status"] = gate.Status
+		trace.add(TraceStep{Type: "retrieval", Stage: "agentic_project_context_recovery", LatencyMs: time.Since(started).Milliseconds(), Metadata: metadata})
+		if gate.Status == "ok" {
+			sources := sourcesFromDocuments(docs, s.config.RAG.TopK)
+			answer := summarizeRecoveredProjectContext(sources)
+			return &ChatResponse{Answer: answer, Sources: sources, SessionID: sessionID, TraceID: traceID, Trace: trace.snapshot()}, true
+		}
+	}
+	return nil, false
+}
+
+type projectContextRecoveryQuery struct {
+	Query string
+	Mode  string
+}
+
+func agenticProjectContextRecoveryQueries(original string) []projectContextRecoveryQuery {
+	return []projectContextRecoveryQuery{
+		{Query: original, Mode: "auto"},
+		{Query: "README 架构 项目介绍 Eino Agent", Mode: "exact"},
+		{Query: "Eino Agent RAG Pipeline Agentic MCP code_search 项目整体架构", Mode: "semantic"},
+		{Query: "项目定位 核心模块 整体架构 检索增强生成 工具调用", Mode: "auto"},
+		{Query: "本项目是一个基于 Go 和 Eino 的 RAG 知识库系统，包含 Pipeline、Agentic、MCP、Code Search、GraphRAG、文档导入和 trace 观测能力。", Mode: "semantic"},
+	}
+}
+
+func retrieveForRecoveryMode(ctx context.Context, runtimeRetriever retriever.Retriever, query, mode string) ([]*schema.Document, error) {
+	if mode != "" && mode != "auto" {
+		if mr, ok := runtimeRetriever.(interface {
+			RetrieveWithMode(context.Context, string, string) ([]*schema.Document, error)
+		}); ok {
+			return mr.RetrieveWithMode(ctx, query, mode)
+		}
+	}
+	return runtimeRetriever.Retrieve(ctx, query)
+}
+
+func summarizeRecoveredProjectContext(sources []Source) string {
+	if len(sources) == 0 {
+		return "⚠️ 当前知识库没有可用于说明项目整体情况的有效项目描述。"
+	}
+	var sb strings.Builder
+	sb.WriteString("基于恢复检索找到的项目上下文证据：")
+	for i, source := range sources {
+		label := fmt.Sprintf("来源%d", i+1)
+		sourceName := metadataStringValue(source.Metadata, "source")
+		if sourceName == "" {
+			sourceName = metadataStringValue(source.Metadata, "source_filename")
+		}
+		if sourceName != "" {
+			label += " " + sourceName
+		}
+		sb.WriteString(fmt.Sprintf("\n- [%s] %s", label, truncateText(source.Content, 220)))
+	}
+	return sb.String()
 }
 
 type retrievalScope struct {
@@ -613,6 +766,52 @@ func (s *ChatService) buildMemoryInstruction(ctx context.Context, req *ChatReque
 	return strings.Join(parts, "\n\n")
 }
 
+// buildQueryContext 从近期会话消息提取简短上文摘要，供 Pipeline 查询重写使用。
+// 只取最近 2-3 条用户消息的前 ~40 字符连接，不做 LLM 调用。
+func (s *ChatService) buildQueryContext(ctx context.Context, req *ChatRequest, sessionID string) string {
+	if sessionID == "" || s.messageRepo == nil {
+		return ""
+	}
+	turns := s.config.Agent.QueryContextTurns
+	if turns <= 0 {
+		turns = 3
+	}
+	msgs, err := s.messageRepo.ListBySession(ctx, sessionID, turns*2)
+	if err != nil || len(msgs) == 0 {
+		return ""
+	}
+
+	var keywords []string
+	seen := map[string]struct{}{}
+	recent := msgs
+	if len(recent) > turns*2 {
+		recent = recent[len(recent)-turns*2:]
+	}
+	for _, m := range recent {
+		if m.Role != "user" {
+			continue
+		}
+		snippet := strings.TrimSpace(m.Content)
+		if len([]rune(snippet)) > 40 {
+			snippet = string([]rune(snippet)[:40])
+		}
+		if _, ok := seen[snippet]; ok || snippet == "" {
+			continue
+		}
+		seen[snippet] = struct{}{}
+		keywords = append(keywords, snippet)
+	}
+	if len(keywords) == 0 {
+		return ""
+	}
+
+	result := "用户刚才在讨论: " + strings.Join(keywords, "、")
+	if len([]rune(result)) > 120 {
+		result = string([]rune(result)[:120])
+	}
+	return result
+}
+
 func formatMemoryMessages(messages []*repository.Message, maxChars int) string {
 	if len(messages) == 0 {
 		return ""
@@ -671,6 +870,18 @@ func appendInstructionToMessage(message, instruction string) string {
 	return fmt.Sprintf("%s\n\n请遵循以下回答要求：\n%s", message, instruction)
 }
 
+func appendInstructionPart(instruction, part string) string {
+	instruction = strings.TrimSpace(instruction)
+	part = strings.TrimSpace(part)
+	if part == "" {
+		return instruction
+	}
+	if instruction == "" {
+		return part
+	}
+	return instruction + "\n\n" + part
+}
+
 // Source 来源信息
 type Source struct {
 	Content  string                 `json:"content"`
@@ -711,6 +922,117 @@ func sourcesFromDocuments(docs []*schema.Document, maxN int) []Source {
 	}
 
 	return sources
+}
+
+// Retrieve returns retrieved documents/pages only; it does not call the chat model, rewrite queries, or synthesize answers.
+func (s *ChatService) Retrieve(ctx context.Context, req *RetrieveRequest) (*RetrieveResponse, error) {
+	query := strings.TrimSpace(req.Query)
+	if query == "" {
+		return &RetrieveResponse{Query: req.Query}, nil
+	}
+
+	chatReq := &ChatRequest{
+		Message:           query,
+		KnowledgeBaseIDs:  req.KnowledgeBaseIDs,
+		DocumentIDs:       req.DocumentIDs,
+		RestrictRetrieval: true,
+	}
+	runtimeRetriever := s.getRuntimeRetriever(chatReq)
+	if runtimeRetriever == nil {
+		return &RetrieveResponse{Query: query}, nil
+	}
+
+	docs, err := runtimeRetriever.Retrieve(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	maxN := req.TopK
+	if maxN <= 0 {
+		maxN = s.config.RAG.TopK
+	}
+	if maxN <= 0 {
+		maxN = 5
+	}
+
+	results := retrieveResultsFromDocuments(docs, maxN)
+	return &RetrieveResponse{Query: query, Total: len(results), Results: results}, nil
+}
+
+func retrieveResultsFromDocuments(docs []*schema.Document, maxN int) []RetrieveResult {
+	if maxN <= 0 {
+		maxN = 5
+	}
+	results := make([]RetrieveResult, 0, maxN)
+	seen := make(map[string]struct{}, maxN)
+	for _, doc := range docs {
+		if doc == nil {
+			continue
+		}
+		docID := strings.TrimSpace(doc.ID)
+		if docID == "" {
+			continue
+		}
+		if _, ok := seen[docID]; ok {
+			continue
+		}
+		results = append(results, retrieveResultFromDocument(doc))
+		seen[docID] = struct{}{}
+		if len(results) >= maxN {
+			break
+		}
+	}
+	return results
+}
+
+func retrieveResultFromDocument(doc *schema.Document) RetrieveResult {
+	metadata := doc.MetaData
+	return RetrieveResult{
+		ID:              doc.ID,
+		Type:            inferRetrieveResultType(metadata),
+		Title:           firstMetadataString(metadata, "wiki_title", "title", "document_name", "filename"),
+		Content:         doc.Content,
+		Snippet:         truncateText(strings.TrimSpace(doc.Content), 500),
+		KnowledgeBaseID: metadataStringValue(metadata, "knowledge_base_id"),
+		KnowledgeID:     firstMetadataString(metadata, "knowledge_id", "document_id", "doc_id"),
+		WikiPath:        metadataStringValue(metadata, "wiki_path"),
+		WikiPageType:    metadataStringValue(metadata, "wiki_page_type"),
+		MatchType:       metadataStringValue(metadata, "match_type"),
+		Metadata:        metadata,
+	}
+}
+
+func inferRetrieveResultType(metadata map[string]interface{}) string {
+	if metadataStringValue(metadata, "wiki_path") != "" {
+		return "wiki_page"
+	}
+	if metadataStringValue(metadata, "chunk_id") != "" {
+		return "document_chunk"
+	}
+	return "document"
+}
+
+func firstMetadataString(metadata map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if value := metadataStringValue(metadata, key); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func metadataStringValue(metadata map[string]interface{}, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	value, ok := metadata[key]
+	if !ok || value == nil {
+		return ""
+	}
+	if s, ok := value.(string); ok {
+		return strings.TrimSpace(s)
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
 }
 
 func (s *ChatService) buildSourcesFromRetriever(ctx context.Context, runtimeRetriever retriever.Retriever, query string, maxN int) []Source {
@@ -770,6 +1092,109 @@ func (s *ChatService) prepareChatContext(ctx context.Context, req *ChatRequest) 
 		messageWithInst:    messageWithInst,
 		runtimeRetriever:   runtimeRetriever,
 	}
+}
+
+func (s *ChatService) tryCodeSearchFastPath(ctx context.Context, req *ChatRequest, sessionID, traceID string, trace *traceCollector) (*ChatResponse, bool) {
+	if req == nil || !shouldUseCodeSearchFastPath(req.Message) || s.config.Agent.CodeSearchReposDir == "" {
+		return nil, false
+	}
+	pattern := codeSearchPatternFromMessage(req.Message)
+	if pattern == "" {
+		return nil, false
+	}
+	repo := codeSearchRepoFromMessage(req.Message)
+	codeTool := internalTool.NewCodeSearchTool(s.config.Agent.CodeSearchReposDir)
+	input := fmt.Sprintf(`{"action":"grep","repo":%q,"pattern":%q,"file_glob":"*.go"}`, repo, pattern)
+	trace.add(TraceStep{Type: "action", Stage: "code_search_fast_path", ToolName: "code_search", ToolInput: input})
+	out, err := codeTool.InvokableRun(ctx, input)
+	if err != nil {
+		trace.add(TraceStep{Type: "error", Stage: "code_search_fast_path", Error: err.Error()})
+		return nil, false
+	}
+	trace.add(TraceStep{Type: "observation", Stage: "code_search_fast_path", ToolName: "code_search", Content: out})
+	answer, sources := summarizeCodeSearchJSON(out)
+	return &ChatResponse{
+		Answer:    answer,
+		Sources:   sources,
+		SessionID: sessionID,
+		TraceID:   traceID,
+		Trace:     trace.snapshot(),
+	}, true
+}
+
+func shouldUseCodeSearchFastPath(message string) bool {
+	lower := strings.ToLower(message)
+	return strings.Contains(lower, "code_search") || strings.Contains(lower, "代码") || strings.Contains(lower, "源码") || strings.Contains(lower, "函数") || strings.Contains(lower, "工具调用")
+}
+
+func codeSearchRepoFromMessage(message string) string {
+	lower := strings.ToLower(message)
+	for _, repo := range []string{"deer-flow", "pydantic-ai", "eino_agent"} {
+		if strings.Contains(lower, repo) {
+			return repo
+		}
+	}
+	return "eino_agent"
+}
+
+func codeSearchPatternFromMessage(message string) string {
+	lower := strings.ToLower(message)
+	candidates := []string{"normalizeReadPath", "path_not_found", "isPathInside", "tool_call", "function_call", "ToolNode", "bind_tools"}
+	selected := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		if strings.Contains(lower, strings.ToLower(candidate)) {
+			selected = append(selected, candidate)
+		}
+	}
+	if len(selected) == 0 && strings.Contains(lower, "工具调用") {
+		selected = append(selected, "tool_call", "function_call", "ToolNode", "bind_tools")
+	}
+	return strings.Join(selected, "|")
+}
+
+func summarizeCodeSearchJSON(output string) (string, []Source) {
+	var payload struct {
+		Summary string `json:"summary"`
+		Results []struct {
+			File    string `json:"file"`
+			Line    int    `json:"line"`
+			Content string `json:"content"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(output), &payload); err != nil || len(payload.Results) == 0 {
+		return "⚠️ code_search 没有返回足够代码证据。", nil
+	}
+	var sb strings.Builder
+	sources := make([]Source, 0, len(payload.Results))
+	sb.WriteString("基于 code_search 的代码证据：")
+	for i, result := range payload.Results {
+		line := ""
+		if result.Line > 0 {
+			line = fmt.Sprintf(":%d", result.Line)
+		}
+		path := result.File + line
+		content := strings.TrimSpace(result.Content)
+		sb.WriteString(fmt.Sprintf("\n- `%s`：%s", path, content))
+		sources = append(sources, Source{
+			Content: content,
+			DocID:   fmt.Sprintf("code:%s", path),
+			Metadata: map[string]any{
+				"source":      result.File,
+				"line":        result.Line,
+				"source_type": "code",
+				"rank":        i + 1,
+			},
+		})
+	}
+	return sb.String(), sources
+}
+
+func isAgentMaxStepsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "exceeds max steps") || strings.Contains(msg, "max steps")
 }
 
 func addPipelineRetrievalTrace(trace *traceCollector, details pipeline.RetrievalTrace) {
@@ -834,6 +1259,20 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 
 	// Agentic 模式
 	if req.UseAgent && s.config.Agent.Enabled {
+		if recoveryDecision, ok := s.agenticProjectContextRecoveryDecision(ctx, req); ok {
+			if recoveryResp, recovered := s.runAgenticProjectContextRecovery(ctx, req, cc.sessionID, traceID, trace, recoveryDecision); recovered {
+				resp = recoveryResp
+				mode = "agentic_project_context_recovery"
+				goto finalizeChat
+			}
+			cc.runtimeInstruction = appendInstructionPart(cc.runtimeInstruction, agenticProjectContextRecoveryText(recoveryDecision.WebSearchEnabled))
+			cc.messageWithInst = appendInstructionToMessage(req.Message, cc.runtimeInstruction)
+		}
+		if fastResp, ok := s.tryCodeSearchFastPath(ctx, req, cc.sessionID, traceID, trace); ok {
+			resp = fastResp
+			mode = "agentic_code_search_fast_path"
+			goto finalizeChat
+		}
 		mode = "agentic"
 		modeStart := time.Now()
 		trace.add(TraceStep{Type: "status", Stage: "agent_start", Metadata: map[string]any{"max_steps": s.config.Agent.MaxSteps}})
@@ -849,7 +1288,12 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 		defer llmCancel()
 		respMsg, agentErr := runtimeAgent.Generate(llmCtx, messages)
 		if agentErr != nil {
-			return nil, fmt.Errorf("agent chat: %w", agentErr)
+			if isAgentMaxStepsError(agentErr) {
+				trace.add(TraceStep{Type: "guardrail", Stage: "agent_max_steps", Error: agentErr.Error(), Metadata: map[string]any{"max_steps": s.config.Agent.MaxSteps}})
+				respMsg = &schema.Message{Content: "⚠️ Agentic 查询超过最大工具步数，已停止继续调用工具。请缩小问题范围、指定 repo 和目标文件，或先用 code_search 获取候选证据。"}
+			} else {
+				return nil, fmt.Errorf("agent chat: %w", agentErr)
+			}
 		}
 
 		answer := ""
@@ -925,7 +1369,12 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 			runtimePipeline = s.buildRuntimePipeline(cc.runtimeRetriever)
 		}
 
-		pipeResp, pipeErr := runtimePipeline.Run(ctx, &pipeline.RAGRequest{
+		rewriteCtx := ctx
+		if qc := s.buildQueryContext(ctx, req, cc.sessionID); qc != "" {
+			rewriteCtx = pipeline.WithQueryHistory(ctx, qc)
+		}
+
+		pipeResp, pipeErr := runtimePipeline.Run(rewriteCtx, &pipeline.RAGRequest{
 			Query:                 req.Message,
 			SessionID:             cc.sessionID,
 			GenerationInstruction: cc.runtimeInstruction,
@@ -977,6 +1426,7 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 		return nil, fmt.Errorf("no chat handler available")
 	}
 
+finalizeChat:
 	// 保存助手消息
 	latencyMs := time.Since(startTime).Milliseconds()
 	trace.add(TraceStep{Type: "status", Stage: "complete", LatencyMs: latencyMs, Metadata: map[string]any{"mode": mode, "source_count": len(resp.Sources)}})
@@ -1055,8 +1505,17 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 		// Agentic 模式
 		if req.UseAgent && s.config.Agent.Enabled {
 			mode := "agentic"
+			if recoveryDecision, ok := s.agenticProjectContextRecoveryDecision(ctx, req); ok {
+				recoveryInstruction := agenticProjectContextRecoveryText(recoveryDecision.WebSearchEnabled)
+				trace.add(TraceStep{Type: "guardrail", Stage: "agentic_project_context_recovery", Summary: "initial retrieval lacks project context; agentic recovery enabled", Metadata: map[string]any{"status": recoveryDecision.InitialStatus, "initial_candidates": recoveryDecision.InitialCandidates, "terminal": false}})
+				cc.runtimeInstruction = appendInstructionPart(cc.runtimeInstruction, recoveryInstruction)
+				cc.messageWithInst = appendInstructionToMessage(req.Message, cc.runtimeInstruction)
+			}
 			trace.add(TraceStep{Type: "status", Stage: "agent_start", Metadata: map[string]any{"max_steps": s.config.Agent.MaxSteps}})
-			eventSink := func(ev StreamEvent) { trySend(ev) }
+			eventSink := func(ev StreamEvent) {
+				trace.addEvent(ev)
+				trySend(ev)
+			}
 			runtimeAgent, kt, createErr := s.buildRuntimeAgentForRequest(ctx, cc.runtimeRetriever, req, eventSink)
 			if createErr != nil {
 				finishError(mode, "agent_create", createErr.Error())
@@ -1141,7 +1600,12 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 				runtimePipeline = s.buildRuntimePipeline(cc.runtimeRetriever)
 			}
 
-			stream, err := runtimePipeline.RunStream(ctx, &pipeline.RAGRequest{
+			rewriteCtx := ctx
+			if qc := s.buildQueryContext(ctx, req, cc.sessionID); qc != "" {
+				rewriteCtx = pipeline.WithQueryHistory(ctx, qc)
+			}
+
+			stream, err := runtimePipeline.RunStream(rewriteCtx, &pipeline.RAGRequest{
 				Query:                 req.Message,
 				SessionID:             cc.sessionID,
 				GenerationInstruction: cc.runtimeInstruction,
