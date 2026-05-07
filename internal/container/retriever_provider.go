@@ -147,8 +147,11 @@ func (r *CompositeRetriever) retrieveWithHybrid(ctx context.Context, query strin
 	}
 
 	// 图谱检索（如果启用）
-	var graphDocs []*Document
-	var graphContextDoc *Document // 图谱上下文（实体/关系描述），不参与 RRF 竞争
+	// 图谱不参与 RRF 融合，而是作为独立的强信号源：
+	//   - 图谱命中的 chunk ID 如果在 RRF 结果中存在，给对应文档加分（多信号确认）
+	//   - graph_context（实体/关系摘要）直接注入最终结果，作为 LLM 的附加上下文
+	var graphChunkIDs map[string]struct{}
+	var graphContextDoc *Document
 	if r.graphRetriever != nil {
 		graphStart := time.Now()
 		gDocs, gErr := r.graphRetriever.Retrieve(ctx, query)
@@ -156,11 +159,12 @@ func (r *CompositeRetriever) retrieveWithHybrid(ctx context.Context, query strin
 		if gErr != nil {
 			log.Printf("[Retriever] 图谱检索失败（降级继续）: %v", gErr)
 		} else {
+			graphChunkIDs = make(map[string]struct{})
 			for _, d := range gDocs {
 				if d == nil {
 					continue
 				}
-				// graph-context 是实体/关系的摘要文档，从 RRF 中分离出来直接注入
+				// graph-context 是实体/关系的摘要文档，直接注入最终结果
 				if d.ID == "graph-context" && strings.TrimSpace(d.Content) != "" {
 					graphContextDoc = &Document{
 						ID:       d.ID,
@@ -169,18 +173,37 @@ func (r *CompositeRetriever) retrieveWithHybrid(ctx context.Context, query strin
 					}
 					continue
 				}
-				graphDocs = append(graphDocs, &Document{
-					ID:       d.ID,
-					Content:  d.Content,
-					Metadata: d.MetaData,
-				})
+				// 收集图谱命中的 chunk ID（不填充 Content，由向量/关键词检索结果补充）
+				if d.ID != "" {
+					graphChunkIDs[d.ID] = struct{}{}
+				}
 			}
 		}
 	} else {
 		tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "graph_recall", Summary: "graph retriever unavailable", Metadata: map[string]any{"source": "graph", "available": false}})
 	}
 
-	fused := r.rrfFuse(ctx, vectorDocs, keywordDocs, graphDocs, topK)
+	fused := r.rrfFuse(ctx, vectorDocs, keywordDocs, topK)
+
+	// 图谱信号增强：RRF 结果中与图谱命中重叠的文档获得得分加成（多源确认信号）
+	if len(graphChunkIDs) > 0 {
+		for _, doc := range fused {
+			if _, ok := graphChunkIDs[doc.ID]; ok {
+				doc.Score = clampScore(doc.Score * 1.2)
+				if doc.Metadata == nil {
+					doc.Metadata = map[string]interface{}{}
+				}
+				if mt, _ := doc.Metadata["match_type"].(string); mt == "vector" || mt == "keyword" {
+					doc.Metadata["match_type"] = "hybrid"
+				}
+				doc.Metadata["graph_boost"] = true
+			}
+		}
+		// 重新按得分排序
+		sort.Slice(fused, func(i, j int) bool {
+			return fused[i].Score > fused[j].Score
+		})
+	}
 
 	// 将图谱上下文作为补充信息追加到检索结果中（不占 topK 名额）
 	if graphContextDoc != nil {
@@ -189,7 +212,6 @@ func (r *CompositeRetriever) retrieveWithHybrid(ctx context.Context, query strin
 		}
 		graphContextDoc.Metadata["match_type"] = "graph_context"
 		fused = append(fused, graphContextDoc)
-		tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "graph_context", Summary: "graph context injected", Metadata: map[string]any{"content_chars": len(graphContextDoc.Content)}})
 		log.Printf("[Retriever] 已注入图谱上下文文档（%d 字符）", len(graphContextDoc.Content))
 	}
 
@@ -308,14 +330,13 @@ func toSchemaDocuments(docs []*Document) []*schema.Document {
 	return result
 }
 
-func (r *CompositeRetriever) rrfFuse(ctx context.Context, vectorDocs, keywordDocs, graphDocs []*Document, topK int) []*Document {
+func (r *CompositeRetriever) rrfFuse(ctx context.Context, vectorDocs, keywordDocs []*Document, topK int) []*Document {
 	const rrfK = 60.0
 
-	// 各检索源权重（向量通常最稳定，关键词补充精确匹配，图谱提供关系信号）
+	// 各检索源权重（向量通常最稳定，关键词补充精确匹配）
 	sourceWeights := map[string]float64{
 		"vector":  1.0,
 		"keyword": 0.8,
-		"graph":   0.6,
 	}
 
 	type rankedDoc struct {
@@ -367,7 +388,6 @@ func (r *CompositeRetriever) rrfFuse(ctx context.Context, vectorDocs, keywordDoc
 
 	add(vectorDocs, "vector")
 	add(keywordDocs, "keyword")
-	add(graphDocs, "graph")
 
 	list := make([]*rankedDoc, 0, len(ranked))
 	for _, item := range ranked {
@@ -425,7 +445,6 @@ func (r *CompositeRetriever) rrfFuse(ctx context.Context, vectorDocs, keywordDoc
 		"input_counts": map[string]int{
 			"vector":  len(vectorDocs),
 			"keyword": len(keywordDocs),
-			"graph":   len(graphDocs),
 		},
 		"results": breakdown,
 	}})
@@ -542,6 +561,16 @@ func boundedDocLimit(length, limit int) int {
 		return length
 	}
 	return limit
+}
+
+func clampScore(s float64) float64 {
+	if s > 1.0 {
+		return 1.0
+	}
+	if s < 0 {
+		return 0
+	}
+	return s
 }
 
 func firstMetadataString(metadata map[string]interface{}, keys ...string) string {

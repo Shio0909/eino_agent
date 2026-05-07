@@ -17,7 +17,7 @@ func TestRRFFusePrefersHybridHits(t *testing.T) {
 		{ID: "C", Content: "charlie", Metadata: map[string]interface{}{}},
 	}
 
-	fused := r.rrfFuse(context.Background(), vectorDocs, keywordDocs, nil, 3)
+	fused := r.rrfFuse(context.Background(), vectorDocs, keywordDocs, 3)
 	if len(fused) != 3 {
 		t.Fatalf("expected 3 docs, got %d", len(fused))
 	}
@@ -44,7 +44,7 @@ func TestRRFFuseRespectsTopK(t *testing.T) {
 		{ID: "E", Content: "echo"},
 	}
 
-	fused := r.rrfFuse(context.Background(), vectorDocs, keywordDocs, nil, 2)
+	fused := r.rrfFuse(context.Background(), vectorDocs, keywordDocs, 2)
 	if len(fused) != 2 {
 		t.Fatalf("expected 2 docs, got %d", len(fused))
 	}
