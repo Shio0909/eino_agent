@@ -13,9 +13,9 @@ type traceTestRetriever struct{}
 
 func (traceTestRetriever) Retrieve(context.Context, string, ...retriever.Option) ([]*schema.Document, error) {
 	return []*schema.Document{
-		{ID: "chunk-a", Content: "alpha content", MetaData: map[string]any{"source": "doc-a.md", "match_type": "vector"}},
-		{ID: "chunk-b", Content: "beta content", MetaData: map[string]any{"source": "doc-b.md", "match_type": "hybrid"}},
-		{ID: "chunk-c", Content: "gamma content", MetaData: map[string]any{"source": "doc-c.md", "match_type": "keyword"}},
+		{ID: "chunk-a", Content: "alpha content explains the project architecture with enough factual details for retrieval evidence", MetaData: map[string]any{"source": "doc-a.md", "match_type": "vector"}},
+		{ID: "chunk-b", Content: "beta content describes the runtime pipeline and gives enough context for grounded answers", MetaData: map[string]any{"source": "doc-b.md", "match_type": "hybrid"}},
+		{ID: "chunk-c", Content: "gamma content documents the code search flow and provides concrete implementation evidence", MetaData: map[string]any{"source": "doc-c.md", "match_type": "keyword"}},
 	}, nil
 }
 
@@ -70,6 +70,88 @@ func TestRAGPipelineReturnsRetrievalTrace(t *testing.T) {
 	gotContext := docIDs(resp.Trace.Context)
 	if want := []string{"chunk-c", "chunk-a"}; !reflect.DeepEqual(gotContext, want) {
 		t.Fatalf("context = %#v, want %#v", gotContext, want)
+	}
+}
+
+type lowQualityRetriever struct{}
+
+func (lowQualityRetriever) Retrieve(context.Context, string, ...retriever.Option) ([]*schema.Document, error) {
+	return []*schema.Document{
+		{ID: "junk-a", Content: "example", MetaData: map[string]any{"source": "junk-a.md"}},
+		{ID: "junk-b", Content: `astro-wu23bvmt"><a href="https://github">provided by this API</a>`, MetaData: map[string]any{"source": "junk-b.md"}},
+	}, nil
+}
+
+func TestRAGPipelineBlocksLowQualityEvidence(t *testing.T) {
+	p := NewRAGPipeline(&Config{EnableRewrite: false, EnableRerank: false, RerankTopK: 2},
+		WithRetriever(lowQualityRetriever{}),
+		WithGenerator(traceTestGenerator{}),
+	)
+
+	resp, err := p.Run(context.Background(), &RAGRequest{Query: "这个项目是什么"})
+	if err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if len(resp.Sources) != 0 {
+		t.Fatalf("sources len = %d, want 0", len(resp.Sources))
+	}
+	if got := resp.Metadata["retrieval_gate"]; got != string(evidenceGateInsufficientProjectContext) {
+		t.Fatalf("retrieval_gate = %q, want %q", got, evidenceGateInsufficientProjectContext)
+	}
+}
+
+type irrelevantRetriever struct{}
+
+func (irrelevantRetriever) Retrieve(context.Context, string, ...retriever.Option) ([]*schema.Document, error) {
+	return []*schema.Document{
+		{ID: "doc-a", Content: "This document describes the Eino Agent architecture, retrieval pipeline, code search implementation, and trace observability in detail.", MetaData: map[string]any{"source": "architecture.md"}},
+	}, nil
+}
+
+func TestRAGPipelineBlocksIrrelevantEvidence(t *testing.T) {
+	p := NewRAGPipeline(&Config{EnableRewrite: false, EnableRerank: false, RerankTopK: 1},
+		WithRetriever(irrelevantRetriever{}),
+		WithGenerator(traceTestGenerator{}),
+	)
+
+	resp, err := p.Run(context.Background(), &RAGRequest{Query: "2026 上海 天气 股票 涨跌"})
+	if err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if len(resp.Sources) != 0 {
+		t.Fatalf("sources len = %d, want 0", len(resp.Sources))
+	}
+	if got := resp.Metadata["retrieval_gate"]; got != string(evidenceGateIrrelevantEvidence) {
+		t.Fatalf("retrieval_gate = %q, want %q", got, evidenceGateIrrelevantEvidence)
+	}
+}
+
+type projectMetadataOnlyRetriever struct{}
+
+func (projectMetadataOnlyRetriever) Retrieve(context.Context, string, ...retriever.Option) ([]*schema.Document, error) {
+	return []*schema.Document{
+		{ID: "meta-a", Content: "Instruction Description table schema fields for a generic dataset entry with no concrete system content", MetaData: map[string]any{"source": "metadata.md"}},
+	}, nil
+}
+
+func TestRAGPipelineBlocksProjectOverviewWithoutProjectContext(t *testing.T) {
+	p := NewRAGPipeline(&Config{EnableRewrite: false, EnableRerank: false, RerankTopK: 1},
+		WithRetriever(projectMetadataOnlyRetriever{}),
+		WithGenerator(traceTestGenerator{}),
+	)
+
+	resp, err := p.Run(context.Background(), &RAGRequest{Query: "请说明这个项目是什么"})
+	if err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if len(resp.Sources) != 0 {
+		t.Fatalf("sources len = %d, want 0", len(resp.Sources))
+	}
+	if got := resp.Metadata["retrieval_gate"]; got != string(evidenceGateInsufficientProjectContext) {
+		t.Fatalf("retrieval_gate = %q, want %q", got, evidenceGateInsufficientProjectContext)
+	}
+	if resp.Answer == "answer" {
+		t.Fatal("expected fixed state-machine answer, got generator output")
 	}
 }
 

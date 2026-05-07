@@ -13,6 +13,7 @@ import (
 	"log"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/cloudwego/eino/components/retriever"
 	"github.com/cloudwego/eino/schema"
@@ -226,28 +227,42 @@ func (p *RAGPipeline) Run(ctx context.Context, req *RAGRequest) (*RAGResponse, e
 	}
 
 	// Step 4: 构建上下文
-	rankedDocs := reorderDocs(docs, rerankedIdx)
+	gate := evaluateEvidenceGate(query, reorderDocs(docs, rerankedIdx))
+	rankedDocs := gate.Docs
 	resp.Trace.RerankAfter = traceChunksFromDocs(rankedDocs)
+	if gate.Status != evidenceGateOK {
+		resp.Metadata["grounding_status"] = "insufficient_evidence"
+		resp.Metadata["retrieval_gate"] = string(gate.Status)
+		resp.Answer = gate.Answer
+		tracing.Emit(ctx, tracing.Event{
+			Type:    "guardrail",
+			Stage:   "retrieval_gate",
+			Summary: gate.Summary,
+			Metadata: map[string]any{
+				"query":      query,
+				"candidates": len(docs),
+				"status":     string(gate.Status),
+			},
+		})
+		return resp, nil
+	}
 	topK := p.config.RerankTopK
-	if topK > len(rerankedIdx) {
-		topK = len(rerankedIdx)
+	if topK > len(rankedDocs) {
+		topK = len(rankedDocs)
 	}
 
 	contextStart := time.Now()
 	var contextBuilder string
 	for i := 0; i < topK; i++ {
-		idx := rerankedIdx[i]
-		if idx < len(docs) {
-			doc := docs[idx]
-			contextBuilder += fmt.Sprintf("[来源%d] %s\n\n", i+1, doc.Content)
-			resp.Sources = append(resp.Sources, Source{
-				Content:  doc.Content,
-				DocID:    doc.ID,
-				Score:    float64(topK - i), // 简单的位置分数
-				Metadata: doc.MetaData,
-			})
-			resp.Trace.Context = append(resp.Trace.Context, traceChunkFromDoc(doc, i+1))
-		}
+		doc := rankedDocs[i]
+		contextBuilder += fmt.Sprintf("[来源%d] %s\n\n", i+1, doc.Content)
+		resp.Sources = append(resp.Sources, Source{
+			Content:  doc.Content,
+			DocID:    doc.ID,
+			Score:    float64(topK - i),
+			Metadata: doc.MetaData,
+		})
+		resp.Trace.Context = append(resp.Trace.Context, traceChunkFromDoc(doc, i+1))
 	}
 	log.Printf("[Timing][Pipeline] stage=build_context duration_ms=%d top_k=%d", time.Since(contextStart).Milliseconds(), topK)
 	tracing.Emit(ctx, tracing.Event{
@@ -304,6 +319,197 @@ func extractPassages(docs []*schema.Document) []string {
 		passages[i] = doc.Content
 	}
 	return passages
+}
+
+type evidenceGateStatus string
+
+const (
+	evidenceGateOK                         evidenceGateStatus = "ok"
+	evidenceGateLowQualityEvidence         evidenceGateStatus = "low_quality_evidence"
+	evidenceGateIrrelevantEvidence         evidenceGateStatus = "irrelevant_evidence"
+	evidenceGateInsufficientProjectContext evidenceGateStatus = "insufficient_project_context"
+)
+
+type EvidenceGateDecision struct {
+	Status         string
+	Answer         string
+	Summary        string
+	CandidateCount int
+	EvidenceCount  int
+}
+
+type evidenceGateResult struct {
+	Status  evidenceGateStatus
+	Docs    []*schema.Document
+	Answer  string
+	Summary string
+}
+
+func EvaluateEvidenceGate(query string, docs []*schema.Document) EvidenceGateDecision {
+	gate := evaluateEvidenceGate(query, docs)
+	return EvidenceGateDecision{
+		Status:         string(gate.Status),
+		Answer:         gate.Answer,
+		Summary:        gate.Summary,
+		CandidateCount: len(docs),
+		EvidenceCount:  len(gate.Docs),
+	}
+}
+
+func IsProjectOverviewQuery(query string) bool {
+	return isProjectOverviewQuery(query)
+}
+
+func evaluateEvidenceGate(query string, docs []*schema.Document) evidenceGateResult {
+	filtered := make([]*schema.Document, 0, len(docs))
+	lowQualityCount := 0
+	irrelevantCount := 0
+	strictRelevance := isStrictOutOfScopeQuery(query)
+	for _, doc := range docs {
+		if doc == nil || isLowQualityEvidence(doc.Content) {
+			lowQualityCount++
+			continue
+		}
+		if strictRelevance && !isEvidenceRelevant(query, doc.Content) {
+			irrelevantCount++
+			continue
+		}
+		filtered = append(filtered, doc)
+	}
+
+	if isProjectOverviewQuery(query) && !hasProjectContextEvidence(filtered) {
+		return evidenceGateResult{
+			Status:  evidenceGateInsufficientProjectContext,
+			Answer:  "⚠️ 当前知识库没有可用于说明项目整体情况的有效项目描述。请先导入 README、架构文档、复习文档或项目说明后再提问。",
+			Summary: "blocked project overview without project context evidence",
+		}
+	}
+	if len(filtered) > 0 {
+		return evidenceGateResult{Status: evidenceGateOK, Docs: filtered}
+	}
+	status := evidenceGateLowQualityEvidence
+	summary := "blocked low-quality retrieval evidence"
+	if irrelevantCount > 0 && lowQualityCount == 0 {
+		status = evidenceGateIrrelevantEvidence
+		summary = "blocked irrelevant retrieval evidence"
+	}
+	return evidenceGateResult{
+		Status:  status,
+		Answer:  "⚠️ 未在当前知识库中找到足够依据，以下内容不是知识库证据支持的回答。",
+		Summary: summary,
+	}
+}
+
+func isProjectOverviewQuery(query string) bool {
+	lower := strings.ToLower(query)
+	return strings.Contains(lower, "这个项目") || strings.Contains(lower, "项目是什么") || strings.Contains(lower, "项目介绍") || strings.Contains(lower, "整体架构") || strings.Contains(lower, "project overview")
+}
+
+func hasProjectContextEvidence(docs []*schema.Document) bool {
+	for _, doc := range docs {
+		if doc == nil {
+			continue
+		}
+		lower := strings.ToLower(doc.Content)
+		metadataText := strings.ToLower(fmt.Sprint(doc.MetaData))
+		if strings.Contains(lower, "eino agent") || strings.Contains(lower, "eino_agent") || strings.Contains(metadataText, "readme") || strings.Contains(metadataText, "终极复习文档") {
+			return true
+		}
+		hasProjectMarker := strings.Contains(lower, "本项目") || strings.Contains(lower, "这个项目") || strings.Contains(lower, "项目概述") || strings.Contains(lower, "项目定位") || strings.Contains(lower, "整体架构")
+		hasSystemMarker := strings.Contains(lower, "eino") || strings.Contains(lower, "pipeline") || strings.Contains(lower, "agentic") || strings.Contains(lower, "mcp") || strings.Contains(lower, "code_search") || strings.Contains(lower, "graphrag")
+		if hasProjectMarker && hasSystemMarker {
+			return true
+		}
+	}
+	return false
+}
+
+func isLowQualityEvidence(content string) bool {
+	text := strings.TrimSpace(content)
+	if len([]rune(text)) < 40 {
+		return true
+	}
+
+	lower := strings.ToLower(text)
+	badSignals := 0
+	for _, signal := range []string{
+		"example",
+		"provided by this api",
+		"<a href=",
+		"<div",
+		"astro-",
+		"lorem ipsum",
+	} {
+		if strings.Contains(lower, signal) {
+			badSignals++
+		}
+	}
+	if badSignals >= 2 {
+		return true
+	}
+
+	letters := 0
+	markup := 0
+	for _, r := range text {
+		if r == '<' || r == '>' || r == '/' || r == '=' {
+			markup++
+		}
+		if unicode.IsLetter(r) || unicode.Is(unicode.Han, r) {
+			letters++
+		}
+	}
+	return letters < 20 || markup > letters/2
+}
+
+func isStrictOutOfScopeQuery(query string) bool {
+	lower := strings.ToLower(query)
+	for _, signal := range []string{"天气", "股票", "股价", "涨跌", "彩票", "实时", "今天", "明天", "weather", "stock", "price today"} {
+		if strings.Contains(lower, signal) {
+			return true
+		}
+	}
+	return false
+}
+
+func isEvidenceRelevant(query, content string) bool {
+	queryTerms := meaningfulTerms(query)
+	if len(queryTerms) == 0 {
+		return true
+	}
+	lowerContent := strings.ToLower(content)
+	matches := 0
+	for _, term := range queryTerms {
+		if strings.Contains(lowerContent, term) {
+			matches++
+		}
+	}
+	if matches > 0 {
+		return true
+	}
+	return len(queryTerms) <= 1
+}
+
+func meaningfulTerms(text string) []string {
+	lower := strings.ToLower(text)
+	fields := strings.FieldsFunc(lower, func(r rune) bool {
+		return !(unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.Is(unicode.Han, r))
+	})
+	terms := make([]string, 0, len(fields))
+	stopwords := map[string]struct{}{
+		"请": {}, "基于": {}, "知识库": {}, "回答": {}, "说明": {}, "什么": {}, "这个": {}, "项目": {}, "必须": {}, "给出": {}, "引用": {}, "来源": {},
+		"the": {}, "and": {}, "for": {}, "with": {}, "this": {}, "that": {}, "what": {}, "how": {}, "why": {}, "please": {}, "answer": {},
+	}
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if len([]rune(field)) < 2 {
+			continue
+		}
+		if _, ok := stopwords[field]; ok {
+			continue
+		}
+		terms = append(terms, field)
+	}
+	return terms
 }
 
 func reorderDocs(docs []*schema.Document, indices []int) []*schema.Document {
