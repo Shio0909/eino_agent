@@ -41,9 +41,13 @@ export interface DocumentItem {
   filename?: string;
   source?: string;
   status?: string;
+  parse_status?: string;
   stage?: string;
   parse_error?: string;
   chunk_count?: number;
+  enrichment_status?: string;
+  enrichment_error?: string;
+  enriched_chunk_count?: number;
   created_at?: string;
   updated_at?: string;
   metadata?: Record<string, unknown>;
@@ -61,6 +65,10 @@ export interface ImportStatus {
   stage?: string;
   chunk_count?: number;
   error?: string;
+  enrichment_status?: string;
+  enrichment_error?: string;
+  enriched_chunk_count?: number;
+  enrichment_updated_at?: string;
   created_at?: string;
   updated_at?: string;
 }
@@ -94,6 +102,7 @@ export interface Message {
   trace_id?: string;
   trace?: TraceStep[];
   ungrounded?: boolean;
+  approvals?: Approval[];
   agent_steps?: unknown;
   created_at?: string;
 }
@@ -144,6 +153,12 @@ export interface StreamEvent {
   resolved_mode?: string;
   tool_name?: string;
   tool_input?: string;
+  approval_id?: string;
+  approval_status?: string;
+  action?: string;
+  risk_level?: string;
+  reason?: string;
+  expires_at?: string;
   sources?: ReferenceDocument[];
   latency_ms?: number;
   source_count?: number;
@@ -151,6 +166,35 @@ export interface StreamEvent {
   metadata?: Record<string, unknown>;
   trace_step?: TraceStep;
   trace_snapshot?: TraceStep[];
+}
+
+export interface Approval {
+  approval_id: string;
+  tenant_id?: number;
+  user_id?: string;
+  session_id?: string;
+  trace_id?: string;
+  source?: string;
+  action?: string;
+  tool_name?: string;
+  tool_input?: string;
+  reason?: string;
+  risk_level?: string;
+  status: string;
+  action_hash?: string;
+  created_at?: string;
+  expires_at?: string;
+  decided_at?: string;
+  decision_reason?: string;
+  decider_user_id?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface ApprovalDecisionResponse {
+  type: 'approval_decision';
+  approval_id: string;
+  status: string;
+  decision: 'approve' | 'reject';
 }
 
 export interface RequestTrace {

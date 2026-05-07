@@ -31,12 +31,12 @@ export function KnowledgePage() {
 
   useEffect(() => {
     if (!message || docItems.length === 0) return;
-    const hasProcessing = docItems.some((doc) => !['completed', 'failed'].includes(doc.status ?? ''));
-    const hasFailed = docItems.some((doc) => doc.status === 'failed');
+    const hasProcessing = docItems.some((doc) => !['completed', 'failed'].includes(documentStatus(doc)));
+    const hasFailed = docItems.some((doc) => documentStatus(doc) === 'failed');
     if (hasFailed) {
       setMessage({ text: '导入失败，请查看文档状态或后端日志。', tone: 'error' });
     } else if (!hasProcessing) {
-      setMessage({ text: '文档已完成解析、切块和入库。', tone: 'success' });
+      setMessage({ text: '文档已完成解析、切块和基础入库；上下文增强会在后台继续处理。', tone: 'success' });
     }
   }, [docItems, message]);
 
@@ -52,7 +52,7 @@ export function KnowledgePage() {
 
   const upload = async (file?: File) => {
     if (!file || !selected?.id) return;
-    setMessage({ text: selected.mode === 'wiki' ? 'Wiki 模式：文件已提交，LLM 编译中…' : '文件已提交，正在解析、切块、上下文增强并入库…', tone: 'warning' });
+    setMessage({ text: selected.mode === 'wiki' ? 'Wiki 模式：文件已提交，LLM 编译中…' : '文件已提交，正在解析、切块并写入基础索引；上下文增强将在后台继续…', tone: 'warning' });
     await endpoints.uploadDocument(selected.id, file);
     documents.refetch();
     refetch();
@@ -61,7 +61,7 @@ export function KnowledgePage() {
   const importUrl = async (event: FormEvent) => {
     event.preventDefault();
     if (!url.trim() || !selected?.id) return;
-    setMessage({ text: selected.mode === 'wiki' ? 'URL 已提交，Wiki 页面编译中…' : 'URL 已提交，正在导入、切块、上下文增强并入库…', tone: 'warning' });
+    setMessage({ text: selected.mode === 'wiki' ? 'URL 已提交，Wiki 页面编译中…' : 'URL 已提交，正在导入、切块并写入基础索引；上下文增强将在后台继续…', tone: 'warning' });
     await endpoints.importUrl(selected.id, url, title || url);
     setUrl('');
     setTitle('');
@@ -134,7 +134,12 @@ export function KnowledgePage() {
                     {(docItems).map((doc) => (
                       <tr key={doc.id} className="border-t border-border/70">
                         <td className="px-4 py-3 font-medium">{doc.title || doc.filename || doc.source || doc.id}</td>
-                        <td className="px-4 py-3"><Badge tone={statusTone(doc.status)}>{doc.stage || doc.status || 'unknown'}</Badge></td>
+                        <td className="px-4 py-3">
+                          <div className="flex flex-col gap-1">
+                            <Badge tone={statusTone(documentStatus(doc))}>{doc.stage || documentStatus(doc) || 'unknown'}</Badge>
+                            {doc.enrichment_status ? <Badge tone={statusTone(doc.enrichment_status)}>增强 {doc.enrichment_status}</Badge> : null}
+                          </div>
+                        </td>
                         <td className="px-4 py-3 text-muted">{doc.chunk_count ?? 0}</td>
                         <td className="px-4 py-3 text-muted">{formatDate(doc.updated_at)}</td>
                       </tr>
@@ -188,6 +193,10 @@ export function KnowledgePage() {
       </div>
     </div>
   );
+}
+
+function documentStatus(doc: { status?: string; parse_status?: string }) {
+  return doc.status || doc.parse_status || '';
 }
 
 function messageToneClass(tone: 'warning' | 'success' | 'error') {

@@ -9,7 +9,7 @@ import { Button } from '../components/ui/Button';
 import { Badge } from '../components/ui/Badge';
 import { Card } from '../components/ui/Card';
 import { Textarea } from '../components/ui/Textarea';
-import type { Message, ReferenceDocument, TraceStep } from '../types/api';
+import type { Approval, Message, ReferenceDocument, StreamEvent, TraceStep } from '../types/api';
 
 interface ChatPageProps {
   onEvidence: (references: ReferenceDocument[], trace: TraceStep[], streaming: boolean) => void;
@@ -133,6 +133,10 @@ export function ChatPage({ onEvidence, mode, forceCitation }: ChatPageProps) {
           hasAnswerContent = true;
           const content = event.content;
           updateAssistant((item) => ({ ...item, content: appendAnswer ? `${item.content}${content}` : content, trace_id: currentTraceId, trace }));
+        } else if (event.type === 'approval_required' && event.approval_id) {
+          updateAssistant((item) => ({ ...item, content: item.content || '等待人工审批…', approvals: upsertApproval(item.approvals, approvalFromEvent(event)), trace_id: currentTraceId, trace }));
+        } else if ((event.type === 'approval_resolved' || event.type === 'approval_rejected' || event.type === 'approval_expired') && event.approval_id) {
+          updateAssistant((item) => ({ ...item, approvals: upsertApproval(item.approvals, approvalFromEvent(event)), trace_id: currentTraceId, trace }));
         } else if (event.trace_step) {
           updateAssistant((item) => ({ ...item, trace_id: currentTraceId, trace }));
         } else if (!hasAnswerContent && (event.type === 'action' || event.type === 'observation')) {
@@ -158,6 +162,16 @@ export function ChatPage({ onEvidence, mode, forceCitation }: ChatPageProps) {
       onEvidence([], traceResponse.steps ?? message.trace ?? [], false);
     } catch {
       onEvidence([], message.trace ?? [], false);
+    }
+  };
+
+  const submitApproval = async (approvalId: string, decision: 'approve' | 'reject') => {
+    setMessages((current) => updateApprovalStatus(current, approvalId, decision === 'approve' ? 'submitting_approve' : 'submitting_reject'));
+    try {
+      const response = await api.submitApprovalDecision(approvalId, decision);
+      setMessages((current) => updateApprovalStatus(current, approvalId, response.status));
+    } catch (err) {
+      setMessages((current) => updateApprovalStatus(current, approvalId, 'pending', err instanceof Error ? err.message : '审批提交失败'));
     }
   };
 
@@ -199,6 +213,7 @@ export function ChatPage({ onEvidence, mode, forceCitation }: ChatPageProps) {
                 {message.role === 'assistant' ? (
                   <div className="prose prose-slate max-w-none text-sm leading-6 dark:prose-invert prose-headings:font-display prose-a:text-primary prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-li:my-0 prose-table:text-xs" dangerouslySetInnerHTML={{ __html: renderSafeMarkdown(message.content || (streaming ? '思考中…' : ''), { linkCitations: true, sourceIds: references.map((ref) => ref.id) }) }} />
                 ) : <p className="whitespace-pre-wrap text-sm leading-6">{message.content}</p>}
+                {message.role === 'assistant' && message.approvals?.length ? <div className="mt-3 space-y-2">{message.approvals.map((approval) => <ApprovalCard key={approval.approval_id} approval={approval} onDecision={submitApproval} />)}</div> : null}
                 {message.role === 'assistant' && message.trace_id ? <button type="button" onClick={() => showTrace(message)} className="mt-2 text-xs font-semibold text-primary hover:underline">查看 Trace</button> : null}
               </div>
               {message.role === 'user' ? <User className="mt-3 h-5 w-5 text-accent" /> : null}
@@ -228,4 +243,84 @@ function traceKey(step: TraceStep, fallbackIndex: number) {
 function agentProgressText(type: string, toolName?: string) {
   if (type === 'action') return `正在调用 ${toolName ?? '工具'} 检索证据…`;
   return `已收到 ${toolName ?? '工具'} 结果，正在整理回答…`;
+}
+
+
+function approvalFromEvent(event: StreamEvent): Approval {
+  return {
+    approval_id: event.approval_id ?? '',
+    session_id: event.session_id,
+    trace_id: event.trace_id,
+    action: event.action,
+    tool_name: event.tool_name,
+    tool_input: event.tool_input,
+    reason: event.reason,
+    risk_level: event.risk_level,
+    status: event.approval_status ?? approvalStatusFromEventType(event.type),
+    expires_at: event.expires_at,
+    metadata: event.metadata,
+  };
+}
+
+function approvalStatusFromEventType(type: string) {
+  if (type === 'approval_resolved') return 'approved';
+  if (type === 'approval_rejected') return 'rejected';
+  if (type === 'approval_expired') return 'expired';
+  return 'pending';
+}
+
+function upsertApproval(current: Approval[] | undefined, next: Approval) {
+  const approvals = current ?? [];
+  const index = approvals.findIndex((item) => item.approval_id === next.approval_id);
+  if (index === -1) return [...approvals, next];
+  return approvals.map((item, itemIndex) => itemIndex === index ? { ...item, ...next } : item);
+}
+
+function updateApprovalStatus(messages: Message[], approvalId: string, status: string, error?: string) {
+  return messages.map((message) => {
+    if (!message.approvals?.some((approval) => approval.approval_id === approvalId)) return message;
+    return {
+      ...message,
+      approvals: message.approvals.map((approval) => approval.approval_id === approvalId ? { ...approval, status, decision_reason: error ?? approval.decision_reason } : approval),
+    };
+  });
+}
+
+function ApprovalCard({ approval, onDecision }: { approval: Approval; onDecision: (approvalId: string, decision: 'approve' | 'reject') => void }) {
+  const pending = approval.status === 'pending';
+  const submitting = approval.status.startsWith('submitting_');
+  return (
+    <div className="rounded-2xl border border-warning/40 bg-warning/10 p-3 text-sm">
+      <div className="flex flex-wrap items-center gap-2">
+        <Badge tone={approval.status === 'approved' ? 'success' : approval.status === 'rejected' || approval.status === 'expired' ? 'error' : 'warning'}>{approvalStatusLabel(approval.status)}</Badge>
+        <span className="font-semibold">{approval.action ?? approval.tool_name ?? '高风险工具'}</span>
+      </div>
+      <p className="mt-2 text-muted">{approval.reason || '该动作需要人工确认后才会执行。'}</p>
+      {approval.tool_input ? <pre className="mt-2 max-h-32 overflow-auto rounded-xl bg-surface/80 p-2 text-xs text-muted">{approval.tool_input}</pre> : null}
+      {approval.decision_reason ? <p className="mt-2 text-xs text-error">{approval.decision_reason}</p> : null}
+      {pending || submitting ? (
+        <div className="mt-3 flex gap-2">
+          <Button type="button" className="px-3 py-1.5" disabled={submitting} onClick={() => onDecision(approval.approval_id, 'approve')}>批准</Button>
+          <Button type="button" variant="danger" className="px-3 py-1.5" disabled={submitting} onClick={() => onDecision(approval.approval_id, 'reject')}>拒绝</Button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function approvalStatusLabel(status: string) {
+  switch (status) {
+    case 'approved':
+      return '已批准';
+    case 'rejected':
+      return '已拒绝';
+    case 'expired':
+      return '已过期';
+    case 'submitting_approve':
+      return '批准中';
+    case 'submitting_reject':
+      return '拒绝中';
+    default:
+      return '待审批';
+  }
 }

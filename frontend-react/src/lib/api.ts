@@ -1,4 +1,4 @@
-import type { StreamEvent } from '../types/api';
+import type { ApprovalDecisionResponse, StreamEvent } from '../types/api';
 
 type Fetcher = typeof fetch;
 
@@ -67,6 +67,10 @@ export class ApiClient {
     body.append('file', file);
     Object.entries(fields).forEach(([key, value]) => body.append(key, value));
     return this.post<T>(path, body);
+  }
+
+  submitApprovalDecision(approvalId: string, decision: 'approve' | 'reject', reason?: string) {
+    return this.post<ApprovalDecisionResponse>(`/approvals/${approvalId}/decision`, { decision, reason });
   }
 
   async stream(path: string, body: unknown, onEvent: (event: StreamEvent) => void, signal?: AbortSignal) {
