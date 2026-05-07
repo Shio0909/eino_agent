@@ -17,6 +17,7 @@ func TestCodeSearchTool_DeerFlow(t *testing.T) {
 	}
 
 	cs := NewCodeSearchTool(reposDir)
+	cs.maxCalls = 20
 	ctx := context.Background()
 
 	// Test 1: find Python files
@@ -90,12 +91,53 @@ func TestCodeSearchTool_DeerFlow(t *testing.T) {
 		if len(result.Results) == 0 || result.Results[0].Content == "" {
 			t.Error("expected non-empty file content")
 		}
-		// 只打前200字符
 		content := result.Results[0].Content
 		if len(content) > 200 {
 			content = content[:200] + "..."
 		}
 		t.Logf("Content preview: %s", content)
+	})
+
+	t.Run("read_with_repo_prefix", func(t *testing.T) {
+		out, err := cs.InvokableRun(ctx, `{"action":"read","path":"deer-flow/README.md","repo":"deer-flow"}`)
+		if err != nil {
+			t.Fatalf("read failed: %v", err)
+		}
+		var result codeSearchOutput
+		if err := json.Unmarshal([]byte(out), &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if len(result.Results) == 0 || result.Results[0].File != "README.md" || result.Results[0].Content == "" {
+			t.Fatalf("expected normalized README.md result, got %+v", result.Results)
+		}
+	})
+
+	t.Run("read_with_repos_dir_prefix", func(t *testing.T) {
+		out, err := cs.InvokableRun(ctx, `{"action":"read","path":"data/test_repos/deer-flow/README.md","repo":"deer-flow"}`)
+		if err != nil {
+			t.Fatalf("read failed: %v", err)
+		}
+		var result codeSearchOutput
+		if err := json.Unmarshal([]byte(out), &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if len(result.Results) == 0 || result.Results[0].File != "README.md" || result.Results[0].Content == "" {
+			t.Fatalf("expected normalized README.md result, got %+v", result.Results)
+		}
+	})
+
+	t.Run("read_missing_file_retryable", func(t *testing.T) {
+		out, err := cs.InvokableRun(ctx, `{"action":"read","path":"missing/nope.py","repo":"deer-flow"}`)
+		if err != nil {
+			t.Fatalf("expected retryable result, got error: %v", err)
+		}
+		var result codeSearchOutput
+		if err := json.Unmarshal([]byte(out), &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if !result.Retryable || result.ErrorCode != "path_not_found" {
+			t.Fatalf("expected retryable path_not_found, got %+v", result)
+		}
 	})
 
 	// Test 5: grep for function definitions
@@ -121,6 +163,39 @@ func TestCodeSearchTool_DeerFlow(t *testing.T) {
 			t.Error("expected path traversal to be blocked")
 		} else {
 			t.Logf("Correctly blocked: %v", err)
+		}
+	})
+}
+
+func TestCodeSearchTool_CurrentProjectScope(t *testing.T) {
+	cs := NewCodeSearchTool(filepath.Join("..", "..", "data", "test_repos"))
+	ctx := context.Background()
+
+	t.Run("default_repo_searches_workspace", func(t *testing.T) {
+		out, err := cs.InvokableRun(ctx, `{"action":"grep","pattern":"normalizeReadPath|path_not_found|isPathInside","file_glob":"*.go"}`)
+		if err != nil {
+			t.Fatalf("grep failed: %v", err)
+		}
+		var result codeSearchOutput
+		if err := json.Unmarshal([]byte(out), &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if len(result.Results) == 0 {
+			t.Fatalf("expected current project matches, got %+v", result)
+		}
+	})
+
+	t.Run("repo_name_resolves_workspace", func(t *testing.T) {
+		out, err := cs.InvokableRun(ctx, `{"action":"read","repo":"eino_agent","path":"internal/tool/code_search.go"}`)
+		if err != nil {
+			t.Fatalf("read failed: %v", err)
+		}
+		var result codeSearchOutput
+		if err := json.Unmarshal([]byte(out), &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if len(result.Results) == 0 || result.Results[0].File != "internal/tool/code_search.go" || result.Results[0].Content == "" {
+			t.Fatalf("expected current project file, got %+v", result.Results)
 		}
 	})
 }

@@ -35,9 +35,12 @@ type codeSearchInput struct {
 }
 
 type codeSearchOutput struct {
-	Action  string             `json:"action"`
-	Results []codeSearchResult `json:"results"`
-	Summary string             `json:"summary"`
+	Action     string             `json:"action"`
+	Results    []codeSearchResult `json:"results"`
+	Summary    string             `json:"summary"`
+	Retryable  bool               `json:"retryable,omitempty"`
+	ErrorCode  string             `json:"error_code,omitempty"`
+	Suggestion string             `json:"suggestion,omitempty"`
 }
 
 type codeSearchResult struct {
@@ -47,7 +50,7 @@ type codeSearchResult struct {
 }
 
 func NewCodeSearchTool(reposDir string) *CodeSearchTool {
-	return &CodeSearchTool{reposDir: reposDir, maxCalls: 6}
+	return &CodeSearchTool{reposDir: reposDir, maxCalls: 20}
 }
 
 func (t *CodeSearchTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
@@ -73,7 +76,7 @@ func (t *CodeSearchTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
 			},
 			"repo": {
 				Type: schema.String,
-				Desc: "指定仓库目录名（如 deer-flow）。留空则搜索所有仓库",
+				Desc: "指定仓库目录名。当前项目可用 eino_agent 或留空；测试仓库如 deer-flow、pydantic-ai 必须显式填写对应 repo。",
 			},
 			"file_glob": {
 				Type: schema.String,
@@ -259,20 +262,13 @@ func (t *CodeSearchTool) doRead(ctx context.Context, params codeSearchInput) (co
 		return codeSearchOutput{}, fmt.Errorf("path is required for read action")
 	}
 
-	// 修正 LLM 常见错误：path 中包含 repo 名前缀时自动去除
-	cleanPath := filepath.FromSlash(params.Path)
-	if params.Repo != "" {
-		prefix := params.Repo + string(filepath.Separator)
-		cleanPath = strings.TrimPrefix(cleanPath, prefix)
-	}
-
+	cleanPath := t.normalizeReadPath(params.Repo, params.Path)
 	searchDir := t.resolveDir(params.Repo)
-	fullPath := filepath.Join(searchDir, cleanPath)
+	fullPath := filepath.Join(searchDir, filepath.FromSlash(cleanPath))
 
-	// 安全检查：路径不能逃逸出 reposDir
 	absPath, _ := filepath.Abs(fullPath)
-	absRepos, _ := filepath.Abs(t.reposDir)
-	if !strings.HasPrefix(absPath, absRepos) {
+	absSearchDir, _ := filepath.Abs(searchDir)
+	if !isPathInside(absPath, absSearchDir) {
 		return codeSearchOutput{}, fmt.Errorf("path traversal not allowed")
 	}
 
@@ -300,13 +296,20 @@ func (t *CodeSearchTool) doRead(ctx context.Context, params codeSearchInput) (co
 		return codeSearchOutput{
 			Action:  "read",
 			Results: results,
-			Summary: fmt.Sprintf("Listed directory: %s (%d entries)", params.Path, len(results)),
+			Summary: fmt.Sprintf("Listed directory: %s (%d entries)", cleanPath, len(results)),
 		}, nil
 	}
 
 	data, err := os.ReadFile(fullPath)
 	if err != nil {
-		return codeSearchOutput{}, fmt.Errorf("read file: %w", err)
+		return codeSearchOutput{
+			Action:     "read",
+			Results:    nil,
+			Summary:    fmt.Sprintf("File not found or unreadable: %s", cleanPath),
+			Retryable:  true,
+			ErrorCode:  "path_not_found",
+			Suggestion: "Use action=find or grep to locate the file, then call read with a path relative to the repo root.",
+		}, nil
 	}
 
 	content := string(data)
@@ -319,18 +322,129 @@ func (t *CodeSearchTool) doRead(ctx context.Context, params codeSearchInput) (co
 	return codeSearchOutput{
 		Action: "read",
 		Results: []codeSearchResult{
-			{File: params.Path, Content: content},
+			{File: cleanPath, Content: content},
 		},
-		Summary: fmt.Sprintf("Read file: %s (%d bytes)", params.Path, len(data)),
+		Summary: fmt.Sprintf("Read file: %s (%d bytes)", cleanPath, len(data)),
 	}, nil
 }
 
 // resolveDir 解析搜索目录
 func (t *CodeSearchTool) resolveDir(repo string) string {
-	if repo != "" {
-		return filepath.Join(t.reposDir, repo)
+	if repo == "" {
+		if root, ok := workspaceRoot(); ok && isPathInsideAbs(t.reposDir, root) {
+			return root
+		}
+		return t.reposDir
 	}
-	return t.reposDir
+
+	cleanRepo := filepath.Clean(filepath.FromSlash(strings.TrimSpace(repo)))
+	if filepath.IsAbs(cleanRepo) {
+		return cleanRepo
+	}
+
+	if dir, ok := t.resolveNamedRepo(cleanRepo); ok {
+		return dir
+	}
+
+	return filepath.Join(t.reposDir, cleanRepo)
+}
+
+func (t *CodeSearchTool) resolveNamedRepo(repo string) (string, bool) {
+	repoName := filepath.Base(repo)
+	if repoName == "." || repoName == string(filepath.Separator) {
+		return "", false
+	}
+
+	cwd, err := os.Getwd()
+	if err == nil {
+		if dir, ok := findAncestorNamed(cwd, repoName); ok {
+			return dir, true
+		}
+	}
+
+	reposDirAbs, err := filepath.Abs(t.reposDir)
+	if err == nil {
+		if dir, ok := findAncestorNamed(reposDirAbs, repoName); ok {
+			return dir, true
+		}
+	}
+
+	return "", false
+}
+
+func workspaceRoot() (string, bool) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", false
+	}
+	return findGitRoot(cwd)
+}
+
+func findGitRoot(startDir string) (string, bool) {
+	dir := filepath.Clean(startDir)
+	for {
+		if info, err := os.Stat(filepath.Join(dir, ".git")); err == nil && info.IsDir() {
+			return dir, true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", false
+		}
+		dir = parent
+	}
+}
+
+func isPathInsideAbs(path, root string) bool {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	return isPathInside(absPath, absRoot)
+}
+
+func findAncestorNamed(startDir, name string) (string, bool) {
+	dir := filepath.Clean(startDir)
+	for {
+		if filepath.Base(dir) == name {
+			return dir, true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", false
+		}
+		dir = parent
+	}
+}
+
+func (t *CodeSearchTool) normalizeReadPath(repo, inputPath string) string {
+	cleaned := filepath.ToSlash(filepath.Clean(filepath.FromSlash(strings.TrimSpace(inputPath))))
+	cleaned = strings.TrimPrefix(cleaned, "./")
+
+	if repo != "" {
+		repoName := strings.Trim(strings.TrimSpace(repo), `/\\`)
+		parts := strings.Split(cleaned, "/")
+		for i, part := range parts {
+			if part == repoName {
+				return strings.Join(parts[i+1:], "/")
+			}
+		}
+	}
+
+	reposDir := filepath.ToSlash(filepath.Clean(filepath.FromSlash(t.reposDir)))
+	reposDir = strings.TrimPrefix(reposDir, "./")
+	return strings.TrimPrefix(cleaned, reposDir+"/")
+}
+
+func isPathInside(path, root string) bool {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 // buildGrepArgs 构建 ripgrep 参数
@@ -338,9 +452,9 @@ func (t *CodeSearchTool) buildGrepArgs(params codeSearchInput) []string {
 	args := []string{
 		"--no-heading",
 		"--line-number",
-		"--max-count=5",    // 每个文件最多5个匹配
+		"--max-count=5",     // 每个文件最多5个匹配
 		"--max-filesize=1M", // 跳过大文件
-		"-i",               // 忽略大小写
+		"-i",                // 忽略大小写
 	}
 
 	// 排除常见无用目录
