@@ -1,11 +1,11 @@
 ---
 name: rag-evaluation
 description: |
-  Test and benchmark RAG systems with proper metrics and evaluation frameworks.
-  Use this skill when evaluating RAG quality, measuring retrieval performance,
-  using RAGAS metrics, or building RAG test suites.
+  Evaluate RAG systems offline with golden datasets, retrieval metrics,
+  faithfulness, RAGAS-style scoring, regression tests, and CI quality gates.
+  Use corrective-rag for online per-query grading, fallback, and refusal logic.
   Activate when: RAG evaluation, RAG testing, RAGAS, retrieval metrics,
-  faithfulness, relevance, context precision, RAG benchmarking.
+  faithfulness, context precision, context recall, RAG benchmarking, golden dataset.
 ---
 
 # RAG Evaluation & Testing

@@ -1,11 +1,11 @@
 ---
 name: hybrid-retrieval
 description: |
-  Implement hybrid search combining vector and keyword retrieval for RAG systems.
-  Use this skill when building RAG retrieval, combining semantic search with BM25,
-  implementing reciprocal rank fusion (RRF), or optimizing retrieval accuracy.
-  Activate when: vector search, keyword search, BM25, semantic search, hybrid RAG,
-  retrieval optimization, search relevance, reranking.
+  Implement sparse+dense retrieval for RAG: BM25/FTS, vector search fusion,
+  reciprocal rank fusion (RRF), weight tuning, reranking, and query-type routing.
+  Use rag-and-vector-search for embedding/index basics and rag-evaluation for offline metrics.
+  Activate when: BM25, keyword search, full-text search, sparse retrieval,
+  hybrid RAG, RRF, retrieval fusion, reranking, search relevance.
 ---
 
 # Hybrid Retrieval for RAG

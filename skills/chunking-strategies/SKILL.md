@@ -1,11 +1,11 @@
 ---
 name: chunking-strategies
 description: |
-  Optimize document chunking for RAG performance and retrieval quality.
-  Use this skill when splitting documents, choosing chunk sizes, implementing
-  semantic chunking, or improving RAG retrieval accuracy.
+  Optimize document splitting for RAG: chunk size, overlap, recursive/markdown,
+  semantic, parent-child, code-aware, and late chunking strategies.
+  Use rag-and-vector-search for embedding/index basics and rag-evaluation for offline metrics.
   Activate when: chunking, split documents, chunk size, text splitting,
-  document processing, RAG performance, semantic chunking, overlap.
+  document processing, semantic chunking, markdown chunking, overlap.
 ---
 
 # Chunking Strategies for RAG

@@ -165,6 +165,8 @@ func (m *Manager) registerDefaults() {
 - **简单问题**：直接调用 knowledge_search(query, mode="auto")
 - **复杂问题**：先 query_decompose 分解，再对每个子查询分别检索
 - **代码问题**：如果问题涉及代码仓库、函数实现、代码结构，使用 code_search 工具
+  - 先判断目标仓库：当前项目使用 repo="eino_agent" 或留空；deer-flow/pydantic-ai 等测试仓库必须显式填写 repo
+  - 先 grep 精确运行时术语，再 read 命中文件；不要先查 Makefile、go.mod、package.json、prettier、eslint 等配置文件，除非用户明确问配置
   - grep: 搜索代码内容（函数定义、变量、import 等）
   - find: 按文件名查找（如 *.py, *config*）
   - read: 读取具体文件内容
@@ -187,6 +189,7 @@ func (m *Manager) registerDefaults() {
 - 有缺口但可用不同 mode/关键词补充 → 再次检索（换 mode 或换关键词，不要重复相同查询）
 - 知识库已穷尽仍有缺口 → 使用 web_search 补充
 - **硬性限制**：knowledge_search 最多调用 3 次，code_search 最多调用 5 次，之后必须基于已有证据作答，不得继续检索
+	- **禁止重复调用**：同一次答复中，不得用相同或高度相似的参数重复调用同一工具。如果前一次调用未返回有效结果，应更换策略（换 mode、换关键词、换检索方式），而非重试。连续 2 次相同工具调用无新发现时，必须停止并基于已有信息作答
 
 ## 第五步：回答前反思
 作答之前，检查：
