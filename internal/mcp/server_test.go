@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
+	"time"
 
 	mcpProto "github.com/mark3labs/mcp-go/mcp"
 
 	einoTool "github.com/cloudwego/eino/components/tool"
 
+	"eino_agent/internal/approval"
 	"eino_agent/internal/codegraph"
 	"eino_agent/internal/config"
 	"eino_agent/internal/database/repository"
@@ -21,15 +24,23 @@ import (
 // ---- Mock ----
 
 type mockChatProvider struct {
-	resp *service.ChatResponse
-	err  error
+	resp         *service.ChatResponse
+	err          error
+	retrieveResp *service.RetrieveResponse
+	retrieveErr  error
 	// 记录最后一次调用的请求
-	lastReq *service.ChatRequest
+	lastReq         *service.ChatRequest
+	lastRetrieveReq *service.RetrieveRequest
 }
 
 func (m *mockChatProvider) Chat(_ context.Context, req *service.ChatRequest) (*service.ChatResponse, error) {
 	m.lastReq = req
 	return m.resp, m.err
+}
+
+func (m *mockChatProvider) Retrieve(_ context.Context, req *service.RetrieveRequest) (*service.RetrieveResponse, error) {
+	m.lastRetrieveReq = req
+	return m.retrieveResp, m.retrieveErr
 }
 
 type mockKBRepo struct {
@@ -79,6 +90,32 @@ func (m *mockGraphRAGProvider) GetGraphForVis(_ context.Context, _ string, _ int
 	return m.graph, m.err
 }
 
+type mockMCPWriter struct {
+	importCalled bool
+}
+
+func (m *mockMCPWriter) MCPCreateKB(_ context.Context, name, desc, mode string) (*repository.KnowledgeBase, error) {
+	return &repository.KnowledgeBase{ID: "kb-created", Name: name, Description: desc, Mode: mode}, nil
+}
+func (m *mockMCPWriter) MCPImportURL(_ context.Context, _ string, _ string, _ string) (string, int, error) {
+	m.importCalled = true
+	return "doc-imported", 3, nil
+}
+func (m *mockMCPWriter) MCPDeleteKB(_ context.Context, _ string) error { return nil }
+func (m *mockMCPWriter) MCPListDocuments(_ context.Context, _ string) ([]map[string]any, error) {
+	return nil, nil
+}
+func (m *mockMCPWriter) MCPDeleteDocument(_ context.Context, _ string, _ string) error { return nil }
+func (m *mockMCPWriter) MCPCloneCodeRepo(_ context.Context, _ string, name string) (string, error) {
+	if name == "" {
+		return "repo", nil
+	}
+	return name, nil
+}
+func (m *mockMCPWriter) MCPIndexCodeRepo(_ context.Context, name string) (map[string]any, error) {
+	return map[string]any{"files": 1, "name": name}, nil
+}
+
 type mockCodeGraphRepo struct {
 	callers  []codegraph.CodeRelation
 	callees  []codegraph.CodeRelation
@@ -121,9 +158,10 @@ func (m *mockCodeGraphRepo) GetRepoOverview(_ context.Context, _ string) (*codeg
 
 func newTestServer(chat chatProvider, kbRepo repository.KnowledgeBaseRepository) *Server {
 	s := &Server{
-		config:  &config.Config{},
-		chatSvc: chat,
-		kbRepo:  kbRepo,
+		config:          &config.Config{},
+		chatSvc:         chat,
+		kbRepo:          kbRepo,
+		approvalManager: approval.NewManager(1 * time.Minute),
 	}
 	s.mcpSrv = nil // 测试中不需要真实 MCP Server
 	return s
@@ -194,10 +232,10 @@ func TestHandleKnowledgeSearch_WhitespaceQuery(t *testing.T) {
 
 func TestHandleKnowledgeSearch_Success(t *testing.T) {
 	mock := &mockChatProvider{
-		resp: &service.ChatResponse{
-			Answer: "Go 是一种编译型语言。",
-			Sources: []service.Source{
-				{DocID: "doc-1", Content: "Go 语言由 Google 开发"},
+		retrieveResp: &service.RetrieveResponse{
+			Query: "什么是 Go 语言",
+			Results: []service.RetrieveResult{
+				{ID: "doc-1", Content: "Go 语言由 Google 开发", Snippet: "Go 语言由 Google 开发"},
 			},
 		},
 	}
@@ -215,24 +253,37 @@ func TestHandleKnowledgeSearch_Success(t *testing.T) {
 	if text == "" {
 		t.Fatal("expected non-empty result text")
 	}
-
-	// 检查请求参数传递正确
-	if mock.lastReq.Message != "什么是 Go 语言" {
-		t.Errorf("message = %q, want %q", mock.lastReq.Message, "什么是 Go 语言")
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(text), &parsed); err != nil {
+		t.Fatalf("result should be JSON: %v\ntext: %s", err, text)
 	}
-	if !mock.lastReq.ForceCitation {
-		t.Error("expected ForceCitation = true")
+	if parsed["query"] != "什么是 Go 语言" {
+		t.Errorf("query = %v, want 什么是 Go 语言", parsed["query"])
+	}
+	if parsed["answer"] != nil {
+		t.Fatalf("knowledge_search must not return generated answer: %v", parsed["answer"])
+	}
+
+	if mock.lastReq != nil {
+		t.Fatal("knowledge_search must not call Chat/LLM generation")
+	}
+	if mock.lastRetrieveReq == nil {
+		t.Fatal("expected Retrieve to be called")
+	}
+	if mock.lastRetrieveReq.Query != "什么是 Go 语言" {
+		t.Errorf("query = %q, want %q", mock.lastRetrieveReq.Query, "什么是 Go 语言")
 	}
 }
 
 func TestHandleKnowledgeSearch_RendersWikiSourceMetadata(t *testing.T) {
 	mock := &mockChatProvider{
-		resp: &service.ChatResponse{
-			Answer: "Go Slice 扩容会按容量区间增长。",
-			Sources: []service.Source{
+		retrieveResp: &service.RetrieveResponse{
+			Query: "Go Slice 扩容规则",
+			Results: []service.RetrieveResult{
 				{
-					DocID:   "page-1",
+					ID:      "page-1",
 					Content: "# Go语言Slice原理详解\n\n当往切片追加元素时，如果切片容量不足，会自动扩容。",
+					Snippet: "当往切片追加元素时，如果切片容量不足，会自动扩容。",
 					Metadata: map[string]interface{}{
 						"knowledge_base_id": "kb-go",
 						"wiki_path":         "slice-principles.md",
@@ -254,18 +305,84 @@ func TestHandleKnowledgeSearch_RendersWikiSourceMetadata(t *testing.T) {
 	}
 
 	text := getToolResultText(t, result)
-	for _, want := range []string{
-		"Go语言Slice原理详解",
-		"source_id: page-1",
-		"knowledge_base_id: kb-go",
-		"wiki_path: slice-principles.md",
-		"wiki_page_type: topic",
-		"match_type: fts",
-		"snippet:",
-	} {
-		if !contains(text, want) {
-			t.Errorf("result text should contain %q\ntext: %s", want, text)
-		}
+	var parsed struct {
+		Results []struct {
+			ID              string         `json:"id"`
+			Title           string         `json:"title"`
+			Content         string         `json:"content"`
+			Snippet         string         `json:"snippet"`
+			KnowledgeBaseID string         `json:"knowledge_base_id"`
+			WikiPath        string         `json:"wiki_path"`
+			WikiPageType    string         `json:"wiki_page_type"`
+			MatchType       string         `json:"match_type"`
+			Metadata        map[string]any `json:"metadata"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(text), &parsed); err != nil {
+		t.Fatalf("failed to parse JSON: %v\ntext: %s", err, text)
+	}
+	if len(parsed.Results) != 1 {
+		t.Fatalf("results len = %d, want 1", len(parsed.Results))
+	}
+	got := parsed.Results[0]
+	if got.Title != "Go语言Slice原理详解" {
+		t.Errorf("title = %q, want Go语言Slice原理详解", got.Title)
+	}
+	if got.ID != "page-1" || got.KnowledgeBaseID != "kb-go" || got.WikiPath != "slice-principles.md" {
+		t.Errorf("unexpected result metadata: %+v", got)
+	}
+	if got.MatchType != "fts" || got.WikiPageType != "topic" {
+		t.Errorf("unexpected match/page metadata: %+v", got)
+	}
+}
+
+func TestHandleKnowledgeSearch_BoundsContentForMCP(t *testing.T) {
+	longContent := strings.Repeat("Go Slice 扩容规则。", 400)
+	mock := &mockChatProvider{
+		retrieveResp: &service.RetrieveResponse{
+			Query: "Go Slice 扩容",
+			Results: []service.RetrieveResult{
+				{
+					ID:      "page-1",
+					Content: longContent,
+					Metadata: map[string]interface{}{
+						"knowledge_base_id": "kb-go",
+						"wiki_path":         "slice-principles.md",
+					},
+				},
+			},
+		},
+	}
+	s := newTestServer(mock, &mockKBRepo{})
+
+	result, err := s.handleKnowledgeSearch(context.Background(), makeCallToolRequest(map[string]any{
+		"query": "Go Slice 扩容",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	text := getToolResultText(t, result)
+	var parsed struct {
+		Results []struct {
+			Content string `json:"content"`
+			Snippet string `json:"snippet"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(text), &parsed); err != nil {
+		t.Fatalf("failed to parse JSON: %v\ntext: %s", err, text)
+	}
+	if len(parsed.Results) != 1 {
+		t.Fatalf("results len = %d, want 1", len(parsed.Results))
+	}
+	if len([]rune(parsed.Results[0].Content)) > 4003 {
+		t.Fatalf("content length = %d, want bounded by 4000", len([]rune(parsed.Results[0].Content)))
+	}
+	if parsed.Results[0].Content == longContent {
+		t.Fatal("content should be bounded for MCP output")
+	}
+	if parsed.Results[0].Snippet == "" || len([]rune(parsed.Results[0].Snippet)) > 503 {
+		t.Fatalf("snippet length = %d, want non-empty bounded snippet", len([]rune(parsed.Results[0].Snippet)))
 	}
 }
 
@@ -284,22 +401,22 @@ func TestHandleKnowledgeSearch_WithKBIDs(t *testing.T) {
 	}
 	assertToolSuccess(t, result)
 
-	if len(mock.lastReq.KnowledgeBaseIDs) != 3 {
-		t.Fatalf("KnowledgeBaseIDs len = %d, want 3", len(mock.lastReq.KnowledgeBaseIDs))
-	}
-	if !mock.lastReq.RestrictRetrieval {
-		t.Fatal("expected RestrictRetrieval = true")
+	if len(mock.lastRetrieveReq.KnowledgeBaseIDs) != 3 {
+		t.Fatalf("KnowledgeBaseIDs len = %d, want 3", len(mock.lastRetrieveReq.KnowledgeBaseIDs))
 	}
 	want := []string{"kb-1", "kb-2", "kb-3"}
-	for i, id := range mock.lastReq.KnowledgeBaseIDs {
+	for i, id := range mock.lastRetrieveReq.KnowledgeBaseIDs {
 		if id != want[i] {
 			t.Errorf("KnowledgeBaseIDs[%d] = %q, want %q", i, id, want[i])
 		}
 	}
+	if mock.lastReq != nil {
+		t.Fatal("knowledge_search must not call Chat/LLM generation")
+	}
 }
 
 func TestHandleKnowledgeSearch_RejectsOutOfScopeKBID(t *testing.T) {
-	mock := &mockChatProvider{resp: &service.ChatResponse{Answer: "answer"}}
+	mock := &mockChatProvider{retrieveResp: &service.RetrieveResponse{Query: "test"}}
 	s := newTestServer(mock, &mockKBRepo{})
 	ctx := context.WithValue(context.Background(), ctxKeyScope, mcpScope{
 		knowledgeBaseIDs: []string{"kb-allowed"},
@@ -314,13 +431,13 @@ func TestHandleKnowledgeSearch_RejectsOutOfScopeKBID(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	assertToolError(t, result, "不在当前 MCP 凭据授权范围内")
-	if mock.lastReq != nil {
-		t.Fatal("chat service should not be called for out-of-scope KB")
+	if mock.lastReq != nil || mock.lastRetrieveReq != nil {
+		t.Fatal("search service should not be called for out-of-scope KB")
 	}
 }
 
 func TestHandleKnowledgeSearch_UsesScopedKBIDsWhenRequestOmitsScope(t *testing.T) {
-	mock := &mockChatProvider{resp: &service.ChatResponse{Answer: "answer"}}
+	mock := &mockChatProvider{retrieveResp: &service.RetrieveResponse{Query: "test"}}
 	s := newTestServer(mock, &mockKBRepo{})
 	ctx := context.WithValue(context.Background(), ctxKeyScope, mcpScope{
 		knowledgeBaseIDs: []string{"kb-allowed"},
@@ -334,14 +451,17 @@ func TestHandleKnowledgeSearch_UsesScopedKBIDsWhenRequestOmitsScope(t *testing.T
 		t.Fatalf("unexpected error: %v", err)
 	}
 	assertToolSuccess(t, result)
-	if len(mock.lastReq.KnowledgeBaseIDs) != 1 || mock.lastReq.KnowledgeBaseIDs[0] != "kb-allowed" {
-		t.Fatalf("KnowledgeBaseIDs = %#v, want [kb-allowed]", mock.lastReq.KnowledgeBaseIDs)
+	if len(mock.lastRetrieveReq.KnowledgeBaseIDs) != 1 || mock.lastRetrieveReq.KnowledgeBaseIDs[0] != "kb-allowed" {
+		t.Fatalf("KnowledgeBaseIDs = %#v, want [kb-allowed]", mock.lastRetrieveReq.KnowledgeBaseIDs)
+	}
+	if mock.lastReq != nil {
+		t.Fatal("knowledge_search must not call Chat/LLM generation")
 	}
 }
 
-func TestHandleKnowledgeSearch_ChatError(t *testing.T) {
+func TestHandleKnowledgeSearch_RetrieveError(t *testing.T) {
 	mock := &mockChatProvider{
-		err: fmt.Errorf("LLM timeout"),
+		retrieveErr: fmt.Errorf("retriever timeout"),
 	}
 	s := newTestServer(mock, &mockKBRepo{})
 
@@ -352,13 +472,16 @@ func TestHandleKnowledgeSearch_ChatError(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	assertToolError(t, result, "检索失败")
+	if mock.lastReq != nil {
+		t.Fatal("knowledge_search must not call Chat/LLM generation")
+	}
 }
 
 func TestHandleKnowledgeSearch_NoSources(t *testing.T) {
 	mock := &mockChatProvider{
-		resp: &service.ChatResponse{
-			Answer:  "没有找到相关文档。",
-			Sources: nil,
+		retrieveResp: &service.RetrieveResponse{
+			Query:   "一个不存在的话题",
+			Results: nil,
 		},
 	}
 	s := newTestServer(mock, &mockKBRepo{})
@@ -371,8 +494,12 @@ func TestHandleKnowledgeSearch_NoSources(t *testing.T) {
 	}
 
 	text := getToolResultText(t, result)
-	if text != "没有找到相关文档。" {
-		t.Errorf("text = %q, want exact answer without sources section", text)
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(text), &parsed); err != nil {
+		t.Fatalf("result should be JSON: %v\ntext: %s", err, text)
+	}
+	if parsed["total"] != float64(0) {
+		t.Errorf("total = %v, want 0", parsed["total"])
 	}
 }
 
@@ -538,6 +665,19 @@ func TestHandleListKnowledgeBases_DBError(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	assertToolError(t, result, "获取知识库列表失败")
+}
+
+func TestShouldExposeAnswerTool_DefaultFalse(t *testing.T) {
+	if shouldExposeAnswerTool(&config.Config{}) {
+		t.Fatal("answer tool should be disabled by default")
+	}
+}
+
+func TestShouldExposeAnswerTool_ExplicitTrue(t *testing.T) {
+	cfg := &config.Config{MCPExport: config.MCPExportConfig{EnableAnswerTool: true}}
+	if !shouldExposeAnswerTool(cfg) {
+		t.Fatal("answer tool should be enabled when explicitly configured")
+	}
 }
 
 // ---- NewServer 测试 ----
@@ -842,6 +982,144 @@ func TestHandleCodeGraphQuery_UnknownAction(t *testing.T) {
 	assertToolError(t, result, "未知操作")
 }
 
+func TestHandleImportURLReturnsApprovalRequiredWhenConfigured(t *testing.T) {
+	writer := &mockMCPWriter{}
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	s.config.MCPExport.EnableAdminTools = true
+	s.config.MCPExport.RequireApprovalForAdminTools = true
+	s.kbWriter = writer
+
+	ctx := context.WithValue(context.Background(), ctxKeyScope, mcpScope{tenantID: 1, userID: "agent-1", allowAdminTools: true})
+	result, err := s.handleImportURL(ctx, makeCallToolRequest(map[string]any{
+		"knowledge_base_id": "kb-1",
+		"url":               "https://example.com/doc",
+		"title":             "doc",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertToolSuccess(t, result)
+	parsed := parseToolResultJSON(t, result)
+	if parsed["type"] != "approval_required" || parsed["status"] != "pending" || parsed["approval_id"] == "" {
+		t.Fatalf("unexpected approval response: %#v", parsed)
+	}
+	if writer.importCalled {
+		t.Fatal("import should not run before approval")
+	}
+}
+
+func TestHandleImportURLExecutesAfterApprovalIDRetry(t *testing.T) {
+	writer := &mockMCPWriter{}
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	s.config.MCPExport.EnableAdminTools = true
+	s.config.MCPExport.RequireApprovalForAdminTools = true
+	s.kbWriter = writer
+
+	ctx := context.WithValue(context.Background(), ctxKeyScope, mcpScope{tenantID: 1, userID: "agent-1", allowAdminTools: true})
+	result, err := s.handleImportURL(ctx, makeCallToolRequest(map[string]any{
+		"knowledge_base_id": "kb-1",
+		"url":               "https://example.com/doc",
+		"title":             "doc",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	approvalID, _ := parseToolResultJSON(t, result)["approval_id"].(string)
+	if approvalID == "" {
+		t.Fatal("approval_id is empty")
+	}
+	if err := s.approvalManager.Decide(context.Background(), approvalID, approval.Decision{Decision: approval.DecisionApprove, DeciderUserID: "human-1"}); err != nil {
+		t.Fatalf("Decide returned error: %v", err)
+	}
+
+	result, err = s.handleImportURL(ctx, makeCallToolRequest(map[string]any{
+		"knowledge_base_id": "kb-1",
+		"url":               "https://example.com/doc",
+		"title":             "doc",
+		"approval_id":       approvalID,
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertToolSuccess(t, result)
+	if !writer.importCalled {
+		t.Fatal("import should run after approved approval_id retry")
+	}
+}
+
+func TestHandleImportURLRejectsMismatchedApprovalIDRetry(t *testing.T) {
+	writer := &mockMCPWriter{}
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	s.config.MCPExport.EnableAdminTools = true
+	s.config.MCPExport.RequireApprovalForAdminTools = true
+	s.kbWriter = writer
+
+	ctx := context.WithValue(context.Background(), ctxKeyScope, mcpScope{tenantID: 1, userID: "agent-1", allowAdminTools: true})
+	result, err := s.handleImportURL(ctx, makeCallToolRequest(map[string]any{
+		"knowledge_base_id": "kb-1",
+		"url":               "https://example.com/doc-a",
+		"title":             "doc",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	approvalID, _ := parseToolResultJSON(t, result)["approval_id"].(string)
+	if err := s.approvalManager.Decide(context.Background(), approvalID, approval.Decision{Decision: approval.DecisionApprove}); err != nil {
+		t.Fatalf("Decide returned error: %v", err)
+	}
+
+	result, err = s.handleImportURL(ctx, makeCallToolRequest(map[string]any{
+		"knowledge_base_id": "kb-1",
+		"url":               "https://example.com/doc-b",
+		"title":             "doc",
+		"approval_id":       approvalID,
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertToolError(t, result, "approval action does not match request")
+	if writer.importCalled {
+		t.Fatal("import should not run with mismatched approval")
+	}
+}
+
+func TestHandleApprovalStatusAndDecision(t *testing.T) {
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	s.config.MCPExport.EnableAdminTools = true
+	approvalReq := approval.Request{TenantID: 1, Source: "mcp", Action: "import_url", ToolName: "import_url", ToolInput: `{"url":"https://example.com"}`}
+	item, err := s.approvalManager.Create(context.Background(), approvalReq)
+	if err != nil {
+		t.Fatalf("Create returned error: %v", err)
+	}
+
+	statusResult, err := s.handleApprovalStatus(context.Background(), makeCallToolRequest(map[string]any{"approval_id": item.ID}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := parseToolResultJSON(t, statusResult)["status"]; got != string(approval.StatusPending) {
+		t.Fatalf("status = %v, want pending", got)
+	}
+
+	ctx := context.WithValue(context.Background(), ctxKeyScope, mcpScope{allowAdminTools: true})
+	decisionResult, err := s.handleSubmitApprovalDecision(ctx, makeCallToolRequest(map[string]any{
+		"approval_id": item.ID,
+		"decision":    "approve",
+		"reason":      "verified",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertToolSuccess(t, decisionResult)
+
+	statusResult, err = s.handleApprovalStatus(context.Background(), makeCallToolRequest(map[string]any{"approval_id": item.ID}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := parseToolResultJSON(t, statusResult)["status"]; got != string(approval.StatusApproved) {
+		t.Fatalf("status = %v, want approved", got)
+	}
+}
+
 // ---- 认证中间件测试 ----
 
 func TestExtractAPIKey_BearerToken(t *testing.T) {
@@ -988,6 +1266,16 @@ func getToolResultText(t *testing.T, result *mcpProto.CallToolResult) string {
 	}
 	t.Fatalf("expected TextContent, got %T", content)
 	return ""
+}
+
+func parseToolResultJSON(t *testing.T, result *mcpProto.CallToolResult) map[string]any {
+	t.Helper()
+	text := getToolResultText(t, result)
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(text), &parsed); err != nil {
+		t.Fatalf("result should be JSON: %v\ntext: %s", err, text)
+	}
+	return parsed
 }
 
 func contains(s, substr string) bool {

@@ -16,18 +16,22 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	mcpProto "github.com/mark3labs/mcp-go/mcp"
 	mcpServer "github.com/mark3labs/mcp-go/server"
 
 	einoTool "github.com/cloudwego/eino/components/tool"
 
+	"eino_agent/internal/approval"
 	"eino_agent/internal/codegraph"
 	"eino_agent/internal/config"
 	"eino_agent/internal/database/repository"
 	"eino_agent/internal/graphrag"
 	"eino_agent/internal/service"
 )
+
+const maxMCPResultContentRunes = 4000
 
 // contextKey 用于在 context 中传递认证信息
 type contextKey string
@@ -53,9 +57,10 @@ type mcpScope struct {
 	allowAdminTools  bool
 }
 
-// chatProvider 定义 MCP Server 需要的聊天能力（用于解耦和测试）
+// chatProvider 定义 MCP Server 需要的聊天与检索能力（用于解耦和测试）
 type chatProvider interface {
 	Chat(ctx context.Context, req *service.ChatRequest) (*service.ChatResponse, error)
+	Retrieve(ctx context.Context, req *service.RetrieveRequest) (*service.RetrieveResponse, error)
 }
 
 // codeSearchProvider 定义代码搜索能力
@@ -81,16 +86,17 @@ type kbWriteProvider interface {
 
 // Server 封装 MCP Server，暴露项目核心能力
 type Server struct {
-	mcpSrv    *mcpServer.MCPServer
-	config    *config.Config
-	chatSvc   chatProvider
-	kbRepo    repository.KnowledgeBaseRepository
-	kbWriter  kbWriteProvider               // 可选：知识库写入（创建 KB、导入 URL）
-	codeTool  codeSearchProvider            // 可选：代码搜索工具
-	graphRAG  graphRAGProvider              // 可选：GraphRAG 服务
-	codeGraph codegraph.CodeGraphRepository // 可选：代码知识图谱
-	apiKeySet map[string]struct{}           // 已配置的 API Key 集合，为空则不验证
-	scopes    map[string]mcpScope           // API Key 对应的访问范围
+	mcpSrv          *mcpServer.MCPServer
+	config          *config.Config
+	chatSvc         chatProvider
+	kbRepo          repository.KnowledgeBaseRepository
+	kbWriter        kbWriteProvider               // 可选：知识库写入（创建 KB、导入 URL）
+	codeTool        codeSearchProvider            // 可选：代码搜索工具
+	graphRAG        graphRAGProvider              // 可选：GraphRAG 服务
+	codeGraph       codegraph.CodeGraphRepository // 可选：代码知识图谱
+	approvalManager *approval.Manager             // HITL 审批运行时
+	apiKeySet       map[string]struct{}           // 已配置的 API Key 集合，为空则不验证
+	scopes          map[string]mcpScope           // API Key 对应的访问范围
 }
 
 func buildAPIKeyScopes(cfg config.MCPExportConfig) (map[string]struct{}, map[string]mcpScope) {
@@ -125,10 +131,14 @@ func buildAPIKeyScopes(cfg config.MCPExportConfig) (map[string]struct{}, map[str
 
 // NewServer 创建 MCP Server
 func NewServer(cfg *config.Config, chatSvc *service.ChatService, kbRepo repository.KnowledgeBaseRepository) *Server {
+	if cfg == nil {
+		cfg = &config.Config{}
+	}
 	s := &Server{
-		config:  cfg,
-		chatSvc: chatSvc,
-		kbRepo:  kbRepo,
+		config:          cfg,
+		chatSvc:         chatSvc,
+		kbRepo:          kbRepo,
+		approvalManager: approval.NewManager(approvalTTL(cfg)),
 	}
 
 	opts := []mcpServer.ServerOption{
@@ -176,6 +186,13 @@ func (s *Server) SetCodeGraph(repo codegraph.CodeGraphRepository) { s.codeGraph 
 // SetKBWriter 注入知识库写入能力（可选）
 func (s *Server) SetKBWriter(w kbWriteProvider) { s.kbWriter = w }
 
+// SetApprovalManager 注入 HITL 审批运行时（可选）
+func (s *Server) SetApprovalManager(manager *approval.Manager) {
+	if manager != nil {
+		s.approvalManager = manager
+	}
+}
+
 // Init 注册所有工具并初始化 MCP Server（在设置好所有可选依赖后调用）
 func (s *Server) Init() {
 	s.registerTools()
@@ -189,7 +206,7 @@ func (s *Server) registerTools() {
 	s.mcpSrv.AddTool(
 		mcpProto.NewTool(
 			"knowledge_search",
-			mcpProto.WithDescription("在知识库中检索与查询相关的文档片段。支持语义检索（向量）和全文检索（wiki）。返回最相关的文档内容及其来源。"),
+			mcpProto.WithDescription("在知识库中检索与查询相关的文档片段或 wiki 页面。只返回结构化上下文和来源 metadata，不生成最终答案；外部 LLM 应基于返回内容自行回答。"),
 			mcpProto.WithString("query",
 				mcpProto.Required(),
 				mcpProto.Description("检索查询文本"),
@@ -204,27 +221,29 @@ func (s *Server) registerTools() {
 		s.handleKnowledgeSearch,
 	)
 
-	// 2. chat — 完整 RAG 问答
-	s.mcpSrv.AddTool(
-		mcpProto.NewTool(
-			"chat",
-			mcpProto.WithDescription("基于知识库的智能问答。自动检索相关文档，结合 LLM 生成有引用的回答。支持 Pipeline（线性 RAG）和 Agentic（ReAct Agent + 工具调用）两种模式。"),
-			mcpProto.WithString("message",
-				mcpProto.Required(),
-				mcpProto.Description("用户问题"),
+	// 2. chat — 完整 RAG 问答（慢路径，会调用后端 LLM）
+	if shouldExposeAnswerTool(s.config) {
+		s.mcpSrv.AddTool(
+			mcpProto.NewTool(
+				"chat",
+				mcpProto.WithDescription("基于知识库的完整 RAG 问答，会在本服务内部调用后端 LLM 生成最终答案，延迟和成本较高。外部 AI 客户端默认应优先使用 knowledge_search 获取上下文后自行回答。"),
+				mcpProto.WithString("message",
+					mcpProto.Required(),
+					mcpProto.Description("用户问题"),
+				),
+				mcpProto.WithString("session_id",
+					mcpProto.Description("会话 ID，用于多轮对话。留空则创建临时会话。"),
+				),
+				mcpProto.WithString("knowledge_base_ids",
+					mcpProto.Description("知识库 ID 列表，逗号分隔。指定后只基于这些知识库问答。"),
+				),
+				mcpProto.WithBoolean("use_agent",
+					mcpProto.Description("是否使用 Agentic 模式（ReAct Agent + 工具调用）。默认 false 使用 Pipeline 模式。"),
+				),
 			),
-			mcpProto.WithString("session_id",
-				mcpProto.Description("会话 ID，用于多轮对话。留空则创建临时会话。"),
-			),
-			mcpProto.WithString("knowledge_base_ids",
-				mcpProto.Description("知识库 ID 列表，逗号分隔。指定后只基于这些知识库问答。"),
-			),
-			mcpProto.WithBoolean("use_agent",
-				mcpProto.Description("是否使用 Agentic 模式（ReAct Agent + 工具调用）。默认 false 使用 Pipeline 模式。"),
-			),
-		),
-		s.handleChat,
-	)
+			s.handleChat,
+		)
+	}
 
 	// 3. list_knowledge_bases — 列出知识库
 	s.mcpSrv.AddTool(
@@ -453,6 +472,41 @@ func (s *Server) registerTools() {
 			s.handleIndexCodeRepo,
 		)
 		log.Println("[MCP Server] 已注册工具: index_code_repo")
+
+		// 15. approval_status — 查询 HITL 审批状态
+		s.mcpSrv.AddTool(
+			mcpProto.NewTool(
+				"approval_status",
+				mcpProto.WithDescription("查询高风险 MCP 工具调用的人工审批状态。外部 Agent 收到 approval_required 后可轮询此工具。"),
+				mcpProto.WithString("approval_id",
+					mcpProto.Required(),
+					mcpProto.Description("approval_required 返回的审批 ID"),
+				),
+			),
+			s.handleApprovalStatus,
+		)
+		log.Println("[MCP Server] 已注册工具: approval_status")
+
+		// 16. submit_approval_decision — 提交 HITL 审批决策
+		s.mcpSrv.AddTool(
+			mcpProto.NewTool(
+				"submit_approval_decision",
+				mcpProto.WithDescription("提交人工审批决策。仅具备管理权限的 MCP 凭据可调用。decision 支持 approve/reject。"),
+				mcpProto.WithString("approval_id",
+					mcpProto.Required(),
+					mcpProto.Description("approval_required 返回的审批 ID"),
+				),
+				mcpProto.WithString("decision",
+					mcpProto.Required(),
+					mcpProto.Description("审批决策: approve / reject"),
+				),
+				mcpProto.WithString("reason",
+					mcpProto.Description("审批理由"),
+				),
+			),
+			s.handleSubmitApprovalDecision,
+		)
+		log.Println("[MCP Server] 已注册工具: submit_approval_decision")
 	}
 }
 
@@ -529,6 +583,97 @@ func (s *Server) authorizeAdminTool(ctx context.Context) error {
 	return fmt.Errorf("当前 MCP 凭据无权调用管理工具")
 }
 
+func approvalTTL(cfg *config.Config) time.Duration {
+	if cfg != nil && cfg.HITL.ApprovalTimeoutSeconds > 0 {
+		return time.Duration(cfg.HITL.ApprovalTimeoutSeconds) * time.Second
+	}
+	return 5 * time.Minute
+}
+
+func (s *Server) approvalRuntime() *approval.Manager {
+	if s.approvalManager == nil {
+		s.approvalManager = approval.NewManager(approvalTTL(s.config))
+	}
+	return s.approvalManager
+}
+
+func (s *Server) requireAdminApproval(ctx context.Context, action string, request mcpProto.CallToolRequest, toolInput string) (*mcpProto.CallToolResult, bool) {
+	if s.config == nil || !s.config.MCPExport.RequireApprovalForAdminTools {
+		return nil, true
+	}
+	scope := s.scopeFromContext(ctx)
+	req := approval.Request{
+		TenantID:  scope.tenantID,
+		UserID:    scope.userID,
+		Source:    "mcp",
+		Action:    action,
+		ToolName:  action,
+		ToolInput: toolInput,
+		Reason:    mcpApprovalReason(action),
+		RiskLevel: "high",
+	}
+	approvalID := strings.TrimSpace(request.GetString("approval_id", ""))
+	if approvalID != "" {
+		if err := s.approvalRuntime().ValidateApproved(ctx, approvalID, req); err != nil {
+			return mcpProto.NewToolResultError(err.Error()), false
+		}
+		return nil, true
+	}
+
+	item, err := s.approvalRuntime().Create(ctx, req)
+	if err != nil {
+		return mcpProto.NewToolResultError(fmt.Sprintf("创建审批请求失败: %v", err)), false
+	}
+	result := map[string]any{
+		"type":        "approval_required",
+		"approval_id": item.ID,
+		"status":      string(item.Status),
+		"action":      item.Action,
+		"tool_name":   item.ToolName,
+		"risk_level":  item.RiskLevel,
+		"reason":      item.Reason,
+		"expires_at":  item.ExpiresAt,
+		"action_hash": item.ActionHash,
+		"message":     "该 MCP 管理工具需要人工审批。审批后请携带 approval_id 重试原工具调用。",
+	}
+	toolResult, _ := marshalToolResult(result)
+	return toolResult, false
+}
+
+func mcpApprovalReason(action string) string {
+	switch action {
+	case "create_knowledge_base":
+		return "创建知识库会改变知识治理结构，需要人工确认。"
+	case "import_url":
+		return "导入外部 URL 会产生外部请求和知识库写入，需要人工确认。"
+	case "delete_knowledge_base":
+		return "删除知识库不可恢复，需要人工确认。"
+	case "delete_document":
+		return "删除文档不可恢复，需要人工确认。"
+	case "clone_code_repo":
+		return "克隆外部代码仓库会产生外部网络访问和本地写入，需要人工确认。"
+	case "index_code_repo":
+		return "索引代码仓库会写入代码图谱，需要人工确认。"
+	default:
+		return "高风险 MCP 管理工具调用需要人工确认。"
+	}
+}
+
+func mcpToolInput(request mcpProto.CallToolRequest, keys ...string) string {
+	values := make(map[string]any, len(keys))
+	for _, key := range keys {
+		if value, ok := request.GetArguments()[key]; ok {
+			values[key] = value
+		}
+	}
+	data, _ := json.Marshal(values)
+	return string(data)
+}
+
+func shouldExposeAnswerTool(cfg *config.Config) bool {
+	return cfg != nil && cfg.MCPExport.EnableAnswerTool
+}
+
 // handleKnowledgeSearch 处理知识库检索请求
 func (s *Server) handleKnowledgeSearch(ctx context.Context, req mcpProto.CallToolRequest) (*mcpProto.CallToolResult, error) {
 	query, _ := req.RequireString("query")
@@ -537,31 +682,74 @@ func (s *Server) handleKnowledgeSearch(ctx context.Context, req mcpProto.CallToo
 	}
 
 	kbIDsStr := req.GetString("knowledge_base_ids", "")
+	topK := req.GetInt("top_k", 0)
 
 	kbIDs, err := s.resolveKnowledgeBaseIDs(ctx, parseKnowledgeBaseIDs(kbIDsStr), accessLevelRead)
 	if err != nil {
 		return mcpProto.NewToolResultError(err.Error()), nil
 	}
 
-	// 使用 Pipeline 模式进行检索（通过 Chat 服务，只需要检索部分）
-	chatReq := &service.ChatRequest{
-		Message:           query,
-		KnowledgeBaseIDs:  kbIDs,
-		RestrictRetrieval: true,
-		ForceCitation:     true,
-	}
-
-	resp, err := s.chatSvc.Chat(ctx, chatReq)
+	resp, err := s.chatSvc.Retrieve(ctx, &service.RetrieveRequest{
+		Query:            query,
+		KnowledgeBaseIDs: kbIDs,
+		TopK:             topK,
+	})
 	if err != nil {
 		return mcpProto.NewToolResultError(fmt.Sprintf("检索失败: %v", err)), nil
 	}
 
-	// 格式化结果：回答 + 来源
-	var sb strings.Builder
-	sb.WriteString(resp.Answer)
-	appendSources(&sb, resp.Sources)
+	return marshalToolResult(normalizeKnowledgeSearchResponse(resp))
+}
 
-	return mcpProto.NewToolResultText(sb.String()), nil
+func normalizeKnowledgeSearchResponse(resp *service.RetrieveResponse) *service.RetrieveResponse {
+	if resp == nil {
+		return &service.RetrieveResponse{}
+	}
+	for i := range resp.Results {
+		result := &resp.Results[i]
+		if result.Title == "" {
+			result.Title = firstMetadataValue(result.Metadata, "wiki_title", "title", "document_name", "filename")
+		}
+		if result.KnowledgeBaseID == "" {
+			result.KnowledgeBaseID = metadataString(result.Metadata, "knowledge_base_id")
+		}
+		if result.KnowledgeID == "" {
+			result.KnowledgeID = firstMetadataValue(result.Metadata, "knowledge_id", "document_id", "doc_id")
+		}
+		if result.WikiPath == "" {
+			result.WikiPath = metadataString(result.Metadata, "wiki_path")
+		}
+		if result.WikiPageType == "" {
+			result.WikiPageType = metadataString(result.Metadata, "wiki_page_type")
+		}
+		if result.MatchType == "" {
+			result.MatchType = metadataString(result.Metadata, "match_type")
+		}
+		if result.Type == "" {
+			if result.WikiPath != "" {
+				result.Type = "wiki_page"
+			} else {
+				result.Type = "document"
+			}
+		}
+		if result.Content != "" {
+			result.Content = truncateContent(strings.TrimSpace(result.Content), maxMCPResultContentRunes)
+		}
+		if result.Snippet == "" {
+			result.Snippet = truncateContent(strings.TrimSpace(result.Content), 500)
+		}
+	}
+	resp.Total = len(resp.Results)
+	return resp
+}
+
+func firstMetadataValue(metadata map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if value := metadataString(metadata, key); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // handleChat 处理完整问答请求
@@ -948,6 +1136,9 @@ func (s *Server) handleCreateKnowledgeBase(ctx context.Context, request mcpProto
 	name := request.GetString("name", "")
 	desc := request.GetString("description", "")
 	mode := request.GetString("mode", "")
+	if result, ok := s.requireAdminApproval(ctx, "create_knowledge_base", request, mcpToolInput(request, "name", "description", "mode")); !ok {
+		return result, nil
+	}
 
 	kb, err := s.kbWriter.MCPCreateKB(ctx, name, desc, mode)
 	if err != nil {
@@ -979,6 +1170,9 @@ func (s *Server) handleImportURL(ctx context.Context, request mcpProto.CallToolR
 	if err := s.authorizeAdminTool(ctx); err != nil {
 		return mcpProto.NewToolResultError(err.Error()), nil
 	}
+	if result, ok := s.requireAdminApproval(ctx, "import_url", request, mcpToolInput(request, "knowledge_base_id", "url", "title")); !ok {
+		return result, nil
+	}
 	if err := s.authorizeKnowledgeBase(ctx, kbID, accessLevelWrite); err != nil {
 		return mcpProto.NewToolResultError(err.Error()), nil
 	}
@@ -1004,6 +1198,9 @@ func (s *Server) handleDeleteKnowledgeBase(ctx context.Context, request mcpProto
 	}
 	if err := s.authorizeAdminTool(ctx); err != nil {
 		return mcpProto.NewToolResultError(err.Error()), nil
+	}
+	if result, ok := s.requireAdminApproval(ctx, "delete_knowledge_base", request, mcpToolInput(request, "knowledge_base_id")); !ok {
+		return result, nil
 	}
 	if err := s.authorizeKnowledgeBase(ctx, kbID, accessLevelAdmin); err != nil {
 		return mcpProto.NewToolResultError(err.Error()), nil
@@ -1044,6 +1241,9 @@ func (s *Server) handleDeleteDocument(ctx context.Context, request mcpProto.Call
 	if err := s.authorizeAdminTool(ctx); err != nil {
 		return mcpProto.NewToolResultError(err.Error()), nil
 	}
+	if result, ok := s.requireAdminApproval(ctx, "delete_document", request, mcpToolInput(request, "knowledge_base_id", "document_id")); !ok {
+		return result, nil
+	}
 	if err := s.authorizeKnowledgeBase(ctx, kbID, accessLevelWrite); err != nil {
 		return mcpProto.NewToolResultError(err.Error()), nil
 	}
@@ -1062,6 +1262,9 @@ func (s *Server) handleCloneCodeRepo(ctx context.Context, request mcpProto.CallT
 	name := request.GetString("name", "")
 	if repoURL == "" {
 		return mcpProto.NewToolResultError("url 不能为空"), nil
+	}
+	if result, ok := s.requireAdminApproval(ctx, "clone_code_repo", request, mcpToolInput(request, "url", "name")); !ok {
+		return result, nil
 	}
 	repoName, err := s.kbWriter.MCPCloneCodeRepo(ctx, repoURL, name)
 	if err != nil {
@@ -1082,6 +1285,9 @@ func (s *Server) handleIndexCodeRepo(ctx context.Context, request mcpProto.CallT
 	if name == "" {
 		return mcpProto.NewToolResultError("name 不能为空"), nil
 	}
+	if result, ok := s.requireAdminApproval(ctx, "index_code_repo", request, mcpToolInput(request, "name")); !ok {
+		return result, nil
+	}
 	stats, err := s.kbWriter.MCPIndexCodeRepo(ctx, name)
 	if err != nil {
 		return mcpProto.NewToolResultError(fmt.Sprintf("索引仓库失败: %v", err)), nil
@@ -1089,6 +1295,61 @@ func (s *Server) handleIndexCodeRepo(ctx context.Context, request mcpProto.CallT
 	stats["name"] = name
 	stats["message"] = fmt.Sprintf("仓库 %s 索引完成", name)
 	return marshalToolResult(stats)
+}
+
+func (s *Server) handleApprovalStatus(_ context.Context, request mcpProto.CallToolRequest) (*mcpProto.CallToolResult, error) {
+	approvalID := strings.TrimSpace(request.GetString("approval_id", ""))
+	if approvalID == "" {
+		return mcpProto.NewToolResultError("approval_id 不能为空"), nil
+	}
+	item, ok := s.approvalRuntime().Get(context.Background(), approvalID)
+	if !ok {
+		return mcpProto.NewToolResultError("approval 不存在"), nil
+	}
+	return marshalToolResult(map[string]any{
+		"type":            "approval_status",
+		"approval_id":     item.ID,
+		"status":          string(item.Status),
+		"action":          item.Action,
+		"tool_name":       item.ToolName,
+		"risk_level":      item.RiskLevel,
+		"reason":          item.Reason,
+		"created_at":      item.CreatedAt,
+		"expires_at":      item.ExpiresAt,
+		"decided_at":      item.DecidedAt,
+		"decision_reason": item.DecisionReason,
+		"decider_user_id": item.DeciderUserID,
+	})
+}
+
+func (s *Server) handleSubmitApprovalDecision(ctx context.Context, request mcpProto.CallToolRequest) (*mcpProto.CallToolResult, error) {
+	if err := s.authorizeAdminTool(ctx); err != nil {
+		return mcpProto.NewToolResultError(err.Error()), nil
+	}
+	approvalID := strings.TrimSpace(request.GetString("approval_id", ""))
+	if approvalID == "" {
+		return mcpProto.NewToolResultError("approval_id 不能为空"), nil
+	}
+	decisionValue := approval.DecisionValue(strings.TrimSpace(request.GetString("decision", "")))
+	if decisionValue != approval.DecisionApprove && decisionValue != approval.DecisionReject {
+		return mcpProto.NewToolResultError("decision 必须是 approve 或 reject"), nil
+	}
+	scope := s.scopeFromContext(ctx)
+	decision := approval.Decision{
+		Decision:      decisionValue,
+		DeciderUserID: scope.userID,
+		Reason:        request.GetString("reason", ""),
+	}
+	if err := s.approvalRuntime().Decide(ctx, approvalID, decision); err != nil {
+		return mcpProto.NewToolResultError(fmt.Sprintf("提交审批失败: %v", err)), nil
+	}
+	item, _ := s.approvalRuntime().Get(ctx, approvalID)
+	return marshalToolResult(map[string]any{
+		"type":        "approval_decision",
+		"approval_id": item.ID,
+		"status":      string(item.Status),
+		"decision":    string(decisionValue),
+	})
 }
 
 // MCPServer 返回底层 MCPServer 实例（供启动 SSE/HTTP/Stdio 使用）
