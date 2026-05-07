@@ -2,9 +2,11 @@
 package config
 
 import (
+	"bufio"
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -28,7 +30,15 @@ type Config struct {
 	ImportQueue ImportQueueConfig `yaml:"import_queue"`
 	MCP         MCPConfig         `yaml:"mcp"`
 	MCPExport   MCPExportConfig   `yaml:"mcp_export"`
+	HITL        HITLConfig        `yaml:"hitl"`
 	GraphRAG    GraphRAGConfig    `yaml:"graphrag"`
+}
+
+// HITLConfig Human-in-the-loop 审批运行时配置。
+type HITLConfig struct {
+	Enabled                bool     `yaml:"enabled"`
+	ApprovalTimeoutSeconds int      `yaml:"approval_timeout_seconds"`
+	HighRiskActions        []string `yaml:"high_risk_actions"`
 }
 
 // SecurityConfig 安全策略配置。
@@ -183,6 +193,9 @@ type AgentConfig struct {
 	SystemPrompt string `yaml:"system_prompt"`
 	MaxSteps     int    `yaml:"max_steps"`
 
+	// Pipeline 查询重写时取最近 N 轮用户消息做上文摘要（0=使用默认值 3）
+	QueryContextTurns int `yaml:"query_context_turns"`
+
 	// 工具配置
 	EnableKnowledgeTool bool   `yaml:"enable_knowledge_tool"`
 	EnableWebSearch     bool   `yaml:"enable_web_search"`
@@ -267,15 +280,17 @@ type MCPConfig struct {
 
 // MCPExportConfig MCP Server 导出配置（将项目能力暴露给外部 Agent）
 type MCPExportConfig struct {
-	Enabled                 bool                   `yaml:"enabled"`
-	Transport               string                 `yaml:"transport"`                  // sse / streamable_http / stdio
-	Address                 string                 `yaml:"address"`                    // 监听地址，如 :19094
-	APIKeys                 []string               `yaml:"api_keys"`                   // 可选：允许访问的 API Key 列表，为空则不验证
-	APIKeyScopes            []MCPExportAPIKeyScope `yaml:"api_key_scopes"`             // API Key 到租户/用户/知识库范围的映射
-	DefaultTenantID         int                    `yaml:"default_tenant_id"`          // 未配置 API Key 时的默认租户范围，0 表示不限制
-	DefaultUserID           string                 `yaml:"default_user_id"`            // 未配置 API Key 时的默认用户范围
-	DefaultKnowledgeBaseIDs []string               `yaml:"default_knowledge_base_ids"` // 未配置 API Key 时允许访问的知识库 ID，为空表示不限制
-	EnableAdminTools        bool                   `yaml:"enable_admin_tools"`         // 是否暴露创建、导入、删除、索引等写入/管理工具
+	Enabled                      bool                   `yaml:"enabled"`
+	Transport                    string                 `yaml:"transport"`                        // sse / streamable_http / stdio
+	Address                      string                 `yaml:"address"`                          // 监听地址，如 :19094
+	APIKeys                      []string               `yaml:"api_keys"`                         // 可选：允许访问的 API Key 列表，为空则不验证
+	APIKeyScopes                 []MCPExportAPIKeyScope `yaml:"api_key_scopes"`                   // API Key 到租户/用户/知识库范围的映射
+	DefaultTenantID              int                    `yaml:"default_tenant_id"`                // 未配置 API Key 时的默认租户范围，0 表示不限制
+	DefaultUserID                string                 `yaml:"default_user_id"`                  // 未配置 API Key 时的默认用户范围
+	DefaultKnowledgeBaseIDs      []string               `yaml:"default_knowledge_base_ids"`       // 未配置 API Key 时允许访问的知识库 ID，为空表示不限制
+	EnableAnswerTool             bool                   `yaml:"enable_answer_tool"`               // 是否暴露会调用后端 LLM 生成答案的 chat 工具
+	EnableAdminTools             bool                   `yaml:"enable_admin_tools"`               // 是否暴露创建、导入、删除、索引等写入/管理工具
+	RequireApprovalForAdminTools bool                   `yaml:"require_approval_for_admin_tools"` // 管理工具是否要求显式人工审批标记
 }
 
 // MCPExportAPIKeyScope 定义单个 MCP Export API Key 的访问范围。
@@ -325,8 +340,70 @@ func expandEnvWithDefault(s string) string {
 	})
 }
 
+func loadDotEnv(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		if key == "" || os.Getenv(key) != "" {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if len(value) >= 2 {
+			quote := value[0]
+			if (quote == '\'' || quote == '"') && value[len(value)-1] == quote {
+				value = value[1 : len(value)-1]
+			}
+		}
+		if err := os.Setenv(key, value); err != nil {
+			return err
+		}
+	}
+	return scanner.Err()
+}
+
+func loadProjectDotEnv(configPath string) error {
+	paths := []string{".env"}
+	if dir := filepath.Dir(configPath); dir != "." && dir != "" {
+		paths = append(paths, filepath.Join(dir, ".env"))
+	}
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		clean := filepath.Clean(path)
+		if _, ok := seen[clean]; ok {
+			continue
+		}
+		seen[clean] = struct{}{}
+		if err := loadDotEnv(clean); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Load 加载配置文件
 func Load(path string) (*Config, error) {
+	if err := loadProjectDotEnv(path); err != nil {
+		return nil, fmt.Errorf("load .env: %w", err)
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config file: %w", err)
@@ -590,6 +667,20 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.ImportQueue.PrefetchCount == 0 {
 		cfg.ImportQueue.PrefetchCount = 1
+	}
+
+	if cfg.HITL.ApprovalTimeoutSeconds == 0 {
+		cfg.HITL.ApprovalTimeoutSeconds = 300
+	}
+	if len(cfg.HITL.HighRiskActions) == 0 {
+		cfg.HITL.HighRiskActions = []string{
+			"create_knowledge_base",
+			"import_url",
+			"delete_knowledge_base",
+			"delete_document",
+			"clone_code_repo",
+			"index_code_repo",
+		}
 	}
 
 	// GraphRAG 默认值

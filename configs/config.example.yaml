@@ -169,12 +169,23 @@ mcp_export:
     default_user_id: ""
     default_knowledge_base_ids: []  # 未配置 API Key 时允许访问的 KB；为空表示不限制
     enable_admin_tools: false  # 默认只暴露只读/问答工具；创建、导入、删除、索引等管理工具需显式开启
+    require_approval_for_admin_tools: true  # 管理工具开启后会返回 approval_required，审批通过后携带 approval_id 重试原工具
     # api_key_scopes:
     #   - api_key: "sk-your-secret-key-1"
     #     tenant_id: 1
     #     user_id: "feishu-bot"
     #     knowledge_base_ids: ["kb-id-1"]
     #     allow_admin_tools: false
+hitl:
+    enabled: true
+    approval_timeout_seconds: 300
+    high_risk_actions:
+        - create_knowledge_base
+        - import_url
+        - delete_knowledge_base
+        - delete_document
+        - clone_code_repo
+        - index_code_repo
 graphrag:
     enabled: false
     neo4j_uri: bolt://localhost:7687

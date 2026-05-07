@@ -30,6 +30,7 @@ import (
 	ginSwagger "github.com/swaggo/gin-swagger"
 
 	_ "eino_agent/docs" // swagger docs
+	"eino_agent/internal/approval"
 	cachepkg "eino_agent/internal/cache"
 	"eino_agent/internal/codegraph"
 	"eino_agent/internal/config"
@@ -275,6 +276,12 @@ func main() {
 	}
 	log.Println("[Retriever] 初始化完成")
 	chatService.SetSessionCache(sessionCache)
+	approvalTTL := 5 * time.Minute
+	if cfg.HITL.ApprovalTimeoutSeconds > 0 {
+		approvalTTL = time.Duration(cfg.HITL.ApprovalTimeoutSeconds) * time.Second
+	}
+	approvalManager := approval.NewManager(approvalTTL)
+	chatService.SetApprovalManager(approvalManager)
 
 	// 注入 Reranker（如果启用）
 	if reranker != nil {
@@ -384,6 +391,7 @@ func main() {
 	// 创建 HTTP 处理器
 	apiHandler := handler.NewHandler(cfg, *configPath, chatService, embedding, vectorDB, docReaderCli, db, importQueue)
 	apiHandler.SetMCPManager(mcpMgr)
+	apiHandler.SetApprovalManager(approvalManager)
 	apiHandler.SetRedisClient(redisClient)
 	apiHandler.SetSessionCache(sessionCache)
 	apiHandler.SetRetrievalCache(retrievalCache)
@@ -432,6 +440,7 @@ func main() {
 	// ========================================
 	if cfg.MCPExport.Enabled {
 		mcpExportServer := mcpmanager.NewServer(cfg, chatService, kbRepo)
+		mcpExportServer.SetApprovalManager(approvalManager)
 
 		// 注入可选依赖
 		if graphRAGService != nil {
