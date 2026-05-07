@@ -2,7 +2,7 @@ package handler
 
 import (
 	"context"
-	"strings"
+	"sync/atomic"
 	"testing"
 
 	einoembedding "github.com/cloudwego/eino/components/embedding"
@@ -45,23 +45,28 @@ func (v *capturingVectorDB) Upsert(_ context.Context, docs []*container.Document
 	v.docs = append(v.docs, docs...)
 	return nil
 }
-func (v *capturingVectorDB) Search(context.Context, []float32, int) ([]*container.Document, error) { return nil, nil }
-func (v *capturingVectorDB) Delete(context.Context, []string) error { return nil }
-func (v *capturingVectorDB) DeleteByKnowledgeID(context.Context, string) error { return nil }
+func (v *capturingVectorDB) Search(context.Context, []float32, int) ([]*container.Document, error) {
+	return nil, nil
+}
+func (v *capturingVectorDB) Delete(context.Context, []string) error                { return nil }
+func (v *capturingVectorDB) DeleteByKnowledgeID(context.Context, string) error     { return nil }
 func (v *capturingVectorDB) DeleteByKnowledgeBaseID(context.Context, string) error { return nil }
-func (v *capturingVectorDB) Close() error { return nil }
+func (v *capturingVectorDB) Close() error                                          { return nil }
 
-func TestProcessAndStoreChunksAppliesContextualEnrichment(t *testing.T) {
+func TestProcessAndStoreChunksIndexesOriginalChunksBeforeContextualEnrichment(t *testing.T) {
 	vectorDB := &capturingVectorDB{}
+	stateStore := newMemoryImportStateStore()
+	var llmCalls atomic.Int32
 	h := &Handler{
-		cfg: &config.Config{RAG: config.RAGConfig{EnableContextualEnrichment: true}},
+		cfg:       &config.Config{RAG: config.RAGConfig{EnableContextualEnrichment: true}},
 		embedding: enrichmentTestEmbedder{},
-		vectorDB: vectorDB,
+		vectorDB:  vectorDB,
 		chatModelFactory: func(context.Context) (model.ChatModel, error) {
+			llmCalls.Add(1)
 			return enrichmentTestChatModel{}, nil
 		},
-		importStateStore: cache.NewNoopImportStateStore(),
-		retrievalCache: cache.NewNoopRetrievalCache(),
+		importStateStore: stateStore,
+		retrievalCache:   cache.NewNoopRetrievalCache(),
 	}
 
 	err := h.processAndStoreChunks(context.Background(), "kb-1", "doc-1", "mysql.pdf", []docreader.ParsedChunk{
@@ -70,13 +75,23 @@ func TestProcessAndStoreChunksAppliesContextualEnrichment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("processAndStoreChunks error = %v", err)
 	}
+	if llmCalls.Load() != 0 {
+		t.Fatalf("contextual enrichment ran synchronously, calls = %d", llmCalls.Load())
+	}
 	if len(vectorDB.docs) != 1 {
 		t.Fatalf("stored docs = %d, want 1", len(vectorDB.docs))
 	}
-	if !strings.HasPrefix(vectorDB.docs[0].Content, "[上下文: 本段介绍 MySQL 索引结构的上下文]") {
-		t.Fatalf("content was not enriched: %q", vectorDB.docs[0].Content)
+	if vectorDB.docs[0].Content != "B+Tree 索引适合范围查询" {
+		t.Fatalf("base index content = %q, want original chunk", vectorDB.docs[0].Content)
 	}
-	if vectorDB.docs[0].Metadata["enriched"] != true {
-		t.Fatalf("enriched metadata = %v, want true", vectorDB.docs[0].Metadata["enriched"])
+	state, ok, err := stateStore.GetTaskState(context.Background(), "doc-1")
+	if err != nil {
+		t.Fatalf("GetTaskState error = %v", err)
+	}
+	if !ok {
+		t.Fatal("missing import task state")
+	}
+	if state.EnrichmentStatus != "pending" {
+		t.Fatalf("enrichment status = %q, want pending", state.EnrichmentStatus)
 	}
 }

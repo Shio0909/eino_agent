@@ -2,6 +2,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -21,6 +22,7 @@ import (
 	einoembedding "github.com/cloudwego/eino/components/embedding"
 	"github.com/gin-gonic/gin"
 
+	"eino_agent/internal/approval"
 	cachepkg "eino_agent/internal/cache"
 	"eino_agent/internal/codegraph"
 	"eino_agent/internal/config"
@@ -61,6 +63,7 @@ type Handler struct {
 	codeIndexer      *codegraph.Indexer
 	wikiCompiler     *wiki.Compiler
 	chatModelFactory func(context.Context) (model.ChatModel, error)
+	approvalManager  *approval.Manager
 
 	// Repositories
 	kbRepo           repository.KnowledgeBaseRepository
@@ -77,6 +80,13 @@ type Handler struct {
 // SetMCPManager 设置 MCP 管理器
 func (h *Handler) SetMCPManager(mgr *mcpmanager.Manager) {
 	h.mcpMgr = mgr
+}
+
+func (h *Handler) SetApprovalManager(manager *approval.Manager) {
+	h.approvalManager = manager
+	if h.chatService != nil {
+		h.chatService.SetApprovalManager(manager)
+	}
 }
 
 // SetRedisClient 设置 Redis 客户端状态提供者。
@@ -182,6 +192,9 @@ func NewHandler(
 		retrievalCache:   cachepkg.NewNoopRetrievalCache(),
 		importStateStore: cachepkg.NewNoopImportStateStore(),
 	}
+	if chatService != nil {
+		chatService.SetApprovalManager(h.approvalManager)
+	}
 
 	if logger, err := NewAuditLogger("data/audit/audit.log"); err == nil {
 		h.auditLogger = logger
@@ -233,6 +246,12 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			chat.POST("/stream", h.ChatStream)
 		}
 		protected.GET("/traces/:trace_id", h.GetTrace)
+		approvals := protected.Group("/approvals")
+		{
+			approvals.GET("/pending", h.ListPendingApprovals)
+			approvals.GET("/:id", h.GetApproval)
+			approvals.POST("/:id/decision", h.SubmitApprovalDecision)
+		}
 
 		// 知识库管理
 		kb := protected.Group("/knowledge-bases")
@@ -489,6 +508,9 @@ func (r *ChatRequest) GetMessage() string {
 type ChatResponse struct {
 	Answer     string              `json:"answer"`
 	References []ReferenceDocument `json:"references,omitempty"`
+	Sources    []ReferenceDocument `json:"sources,omitempty"`
+	Evidence   []EvidenceDocument  `json:"evidence,omitempty"`
+	Grounding  GroundingResult     `json:"grounding"`
 	SessionID  string              `json:"session_id,omitempty"`
 	TraceID    string              `json:"trace_id,omitempty"`
 	TokensUsed int                 `json:"tokens_used,omitempty"`
@@ -573,6 +595,22 @@ func mapValue(v any) map[string]any {
 	return nil
 }
 
+// EvidenceDocument 结构化证据
+type EvidenceDocument struct {
+	ID       string                 `json:"id"`
+	DocID    string                 `json:"doc_id"`
+	Source   string                 `json:"source"`
+	Snippet  string                 `json:"snippet"`
+	Metadata map[string]interface{} `json:"metadata,omitempty"`
+}
+
+// GroundingResult 证据支撑状态
+type GroundingResult struct {
+	Status        string `json:"status"`
+	EvidenceCount int    `json:"evidence_count"`
+	Reason        string `json:"reason,omitempty"`
+}
+
 // ReferenceDocument 引用文档
 type ReferenceDocument struct {
 	ID       string                 `json:"id"`
@@ -650,9 +688,15 @@ func (h *Handler) Chat(c *gin.Context) {
 		return
 	}
 
+	references := h.toReferences(resp.Sources)
+	evidence := h.toEvidence(resp.Sources)
+	grounding := groundingFromEvidence(resp.Answer, evidence)
 	c.JSON(http.StatusOK, ChatResponse{
 		Answer:     resp.Answer,
-		References: h.toReferences(resp.Sources),
+		References: references,
+		Sources:    references,
+		Evidence:   evidence,
+		Grounding:  grounding,
 		SessionID:  resp.SessionID,
 		TraceID:    resp.TraceID,
 		LatencyMs:  time.Since(startTime).Milliseconds(),
@@ -756,6 +800,27 @@ func (h *Handler) ChatStream(c *gin.Context) {
 			if event.ToolInput != "" {
 				data["tool_input"] = event.ToolInput
 			}
+			if event.ApprovalID != "" {
+				data["approval_id"] = event.ApprovalID
+			}
+			if event.ApprovalStatus != "" {
+				data["approval_status"] = event.ApprovalStatus
+			}
+			if event.Action != "" {
+				data["action"] = event.Action
+			}
+			if event.RiskLevel != "" {
+				data["risk_level"] = event.RiskLevel
+			}
+			if event.Reason != "" {
+				data["reason"] = event.Reason
+			}
+			if event.ExpiresAt != nil {
+				data["expires_at"] = event.ExpiresAt
+			}
+			if len(event.Metadata) > 0 {
+				data["metadata"] = event.Metadata
+			}
 			if len(event.Sources) > 0 {
 				data["sources"] = h.toReferences(event.Sources)
 			}
@@ -779,6 +844,102 @@ func (h *Handler) ChatStream(c *gin.Context) {
 		}
 		c.SSEvent("done", gin.H{})
 		return false
+	})
+}
+
+func (h *Handler) approvalRuntime() *approval.Manager {
+	if h.approvalManager != nil {
+		return h.approvalManager
+	}
+	ttl := 5 * time.Minute
+	if h.cfg != nil && h.cfg.HITL.ApprovalTimeoutSeconds > 0 {
+		ttl = time.Duration(h.cfg.HITL.ApprovalTimeoutSeconds) * time.Second
+	}
+	h.approvalManager = approval.NewManager(ttl)
+	if h.chatService != nil {
+		h.chatService.SetApprovalManager(h.approvalManager)
+	}
+	return h.approvalManager
+}
+
+func (h *Handler) canAccessApproval(c *gin.Context, item approval.Approval) bool {
+	if item.TenantID > 0 && item.TenantID != h.getTenantID(c) {
+		return false
+	}
+	if h.getUserRole(c) == "admin" {
+		return true
+	}
+	return item.UserID == "" || item.UserID == h.getUserID(c)
+}
+
+func (h *Handler) ListPendingApprovals(c *gin.Context) {
+	items := h.approvalRuntime().ListPending(c.Request.Context(), h.getTenantID(c))
+	filtered := make([]approval.Approval, 0, len(items))
+	for _, item := range items {
+		if h.canAccessApproval(c, item) {
+			filtered = append(filtered, item)
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"approvals": filtered})
+}
+
+func (h *Handler) GetApproval(c *gin.Context) {
+	approvalID := strings.TrimSpace(c.Param("id"))
+	if approvalID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少 approval_id"})
+		return
+	}
+	item, ok := h.approvalRuntime().Get(c.Request.Context(), approvalID)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "approval 不存在"})
+		return
+	}
+	if !h.canAccessApproval(c, item) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "无权访问该 approval"})
+		return
+	}
+	c.JSON(http.StatusOK, item)
+}
+
+func (h *Handler) SubmitApprovalDecision(c *gin.Context) {
+	approvalID := strings.TrimSpace(c.Param("id"))
+	if approvalID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少 approval_id"})
+		return
+	}
+	item, ok := h.approvalRuntime().Get(c.Request.Context(), approvalID)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "approval 不存在"})
+		return
+	}
+	if !h.canAccessApproval(c, item) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "无权审批该 approval"})
+		return
+	}
+	var req struct {
+		Decision string `json:"decision"`
+		Reason   string `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	decisionValue := approval.DecisionValue(strings.TrimSpace(req.Decision))
+	if decisionValue != approval.DecisionApprove && decisionValue != approval.DecisionReject {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "decision 必须是 approve 或 reject"})
+		return
+	}
+	decision := approval.Decision{Decision: decisionValue, DeciderUserID: h.getUserID(c), Reason: req.Reason}
+	if err := h.approvalRuntime().Decide(c.Request.Context(), approvalID, decision); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	updated, _ := h.approvalRuntime().Get(c.Request.Context(), approvalID)
+	c.JSON(http.StatusOK, gin.H{
+		"type":        "approval_decision",
+		"approval_id": updated.ID,
+		"status":      string(updated.Status),
+		"decision":    string(decisionValue),
 	})
 }
 
@@ -969,6 +1130,62 @@ func (h *Handler) toReferences(sources []service.Source) []ReferenceDocument {
 		})
 	}
 	return refs
+}
+
+func (h *Handler) toEvidence(sources []service.Source) []EvidenceDocument {
+	if len(sources) == 0 {
+		return nil
+	}
+	evidence := make([]EvidenceDocument, 0, len(sources))
+	for i, src := range sources {
+		evidence = append(evidence, EvidenceDocument{
+			ID:       fmt.Sprintf("ev-%d", i+1),
+			DocID:    src.DocID,
+			Source:   firstEvidenceSource(src.Metadata, src.DocID),
+			Snippet:  truncateForEvidence(src.Content, 500),
+			Metadata: src.Metadata,
+		})
+	}
+	return evidence
+}
+
+func groundingFromEvidence(answer string, evidence []EvidenceDocument) GroundingResult {
+	if answerSignalsInsufficientEvidence(answer) {
+		return GroundingResult{Status: "insufficient_evidence", EvidenceCount: len(evidence), Reason: "answer reports insufficient evidence"}
+	}
+	if len(evidence) == 0 {
+		return GroundingResult{Status: "insufficient_evidence", EvidenceCount: 0, Reason: "no evidence returned"}
+	}
+	return GroundingResult{Status: "supported_by_retrieval", EvidenceCount: len(evidence)}
+}
+
+func answerSignalsInsufficientEvidence(answer string) bool {
+	text := strings.TrimSpace(answer)
+	return strings.Contains(text, "未在当前知识库中找到足够依据") ||
+		strings.Contains(text, "知识库内容不足") ||
+		strings.Contains(text, "没有找到任何") ||
+		strings.Contains(text, "无法基于当前上下文")
+}
+
+func firstEvidenceSource(metadata map[string]interface{}, fallback string) string {
+	for _, key := range []string{"source", "source_filename", "file_name", "wiki_path", "title"} {
+		if value, ok := metadata[key]; ok && strings.TrimSpace(fmt.Sprint(value)) != "" {
+			return strings.TrimSpace(fmt.Sprint(value))
+		}
+	}
+	return fallback
+}
+
+func truncateForEvidence(content string, maxRunes int) string {
+	content = strings.TrimSpace(content)
+	if maxRunes <= 0 {
+		return content
+	}
+	runes := []rune(content)
+	if len(runes) <= maxRunes {
+		return content
+	}
+	return string(runes[:maxRunes]) + "..."
 }
 
 func (h *Handler) evaluatePromptRisk(input string) security.PromptDecision {
@@ -1392,26 +1609,60 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 	}
 
 	if h.importQueue != nil {
-		knowledge, err := h.enqueueFileImport(c.Request.Context(), kbID, header.Filename, header.Size, file)
+		knowledge, replaced, deduplicated, err := h.enqueueFileImport(c.Request.Context(), kbID, header.Filename, header.Size, file)
 		if err != nil {
 			h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error(), "filename": header.Filename})
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "加入异步导入队列失败: " + err.Error()})
 			return
 		}
 
-		h.audit(c, "doc.upload", kbID, true, map[string]interface{}{"filename": header.Filename, "knowledge_id": knowledge.ID, "async": true})
+		h.audit(c, "doc.upload", kbID, true, map[string]interface{}{"filename": header.Filename, "knowledge_id": knowledge.ID, "async": !deduplicated, "replaced": replaced, "deduplicated": deduplicated})
+		if deduplicated {
+			c.JSON(http.StatusOK, gin.H{
+				"message":               "文档内容已存在，跳过重复导入",
+				"knowledge_id":          knowledge.ID,
+				"existing_knowledge_id": knowledge.ID,
+				"status":                knowledge.ParseStatus,
+				"deduplicated":          true,
+			})
+			return
+		}
 		c.JSON(http.StatusAccepted, gin.H{
-			"message":      "文档已加入异步导入队列",
+			"message":      importAcceptedMessage(replaced, "文档"),
 			"knowledge_id": knowledge.ID,
 			"status":       knowledge.ParseStatus,
+			"replaced":     replaced,
 		})
 		return
 	}
 
-	knowledge, err := h.createKnowledgeRecord(c.Request.Context(), h.newFileKnowledge(kbID, header.Filename, header.Size, "processing"))
+	content, err := io.ReadAll(file)
+	if err != nil {
+		h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取文件失败: " + err.Error()})
+		return
+	}
+	docHash := contentHashBytes(content)
+	if duplicate, dupErr := h.findDuplicateFileByHash(c.Request.Context(), kbID, docHash); dupErr != nil {
+		h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": dupErr.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "检查重复文档失败: " + dupErr.Error()})
+		return
+	} else if duplicate != nil {
+		h.audit(c, "doc.upload", kbID, true, map[string]interface{}{"filename": header.Filename, "knowledge_id": duplicate.ID, "deduplicated": true})
+		c.JSON(http.StatusOK, gin.H{
+			"message":               "文档内容已存在，跳过重复导入",
+			"knowledge_id":          duplicate.ID,
+			"existing_knowledge_id": duplicate.ID,
+			"status":                duplicate.ParseStatus,
+			"deduplicated":          true,
+		})
+		return
+	}
+
+	knowledge, replaced, err := h.prepareKnowledgeForImport(c.Request.Context(), h.newFileKnowledge(kbID, header.Filename, header.Size, "processing", docHash))
 	if err != nil {
 		h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error(), "filename": header.Filename})
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建文档记录失败: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "准备文档记录失败: " + err.Error()})
 		return
 	}
 
@@ -1425,7 +1676,7 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 		// 使用 docreader 解析文件
 		result, err := h.docReaderCli.ParseReader(
 			c.Request.Context(),
-			file,
+			bytes.NewReader(content),
 			header.Filename,
 			fileType,
 			docreader.DefaultParseOptions(),
@@ -1438,7 +1689,19 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 		}
 
 		// 向量化并存储
-		chunkCount, err := h.storeParsedChunks(c.Request.Context(), kbID, knowledge.ID, header.Filename, result.Chunks)
+		var chunkCount int
+		if replaced {
+			content := []byte(strings.Join(parsedChunkContents(result.Chunks), "\n\n"))
+			syncResult, syncErr := h.incrementalSync(c.Request.Context(), kbID, knowledge.ID, header.Filename, content, contentHash(string(content)))
+			if syncErr != nil {
+				chunkCount = 0
+				err = syncErr
+			} else {
+				chunkCount = syncResult.Added + syncResult.Retained
+			}
+		} else {
+			chunkCount, err = h.storeParsedChunks(c.Request.Context(), kbID, knowledge.ID, header.Filename, result.Chunks)
+		}
 		if err != nil {
 			log.Printf("[Upload] 向量化失败（文档已解析 %d 块）: %v", chunkCount, err)
 			h.markKnowledgeFailed(c.Request.Context(), knowledge.ID, chunkCount, err)
@@ -1457,19 +1720,32 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 		h.audit(c, "doc.upload", kbID, true, map[string]interface{}{"filename": header.Filename, "chunk_count": chunkCount})
 
 		c.JSON(http.StatusOK, gin.H{
-			"message":      "文档上传成功",
+			"message":      uploadSuccessMessage(replaced, "文档"),
 			"chunk_count":  chunkCount,
 			"knowledge_id": knowledge.ID,
+			"replaced":     replaced,
 		})
 		return
 	}
 
-	// 回退到本地处理: 读取文件内容
-	content, err := io.ReadAll(file)
-	if err != nil {
-		h.markKnowledgeFailed(c.Request.Context(), knowledge.ID, 0, err)
-		h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error()})
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取文件失败: " + err.Error()})
+	// 回退到本地处理
+	if replaced {
+		syncResult, syncErr := h.incrementalSync(c.Request.Context(), kbID, knowledge.ID, header.Filename, content, docHash)
+		if syncErr != nil {
+			h.markKnowledgeFailed(c.Request.Context(), knowledge.ID, 0, syncErr)
+			h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": syncErr.Error()})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "文档更新失败: " + syncErr.Error()})
+			return
+		}
+		chunkCount := syncResult.Added + syncResult.Retained
+		h.markKnowledgeCompleted(c.Request.Context(), knowledge, chunkCount)
+		h.audit(c, "doc.upload", kbID, true, map[string]interface{}{"filename": header.Filename, "chunk_count": chunkCount, "replaced": true})
+		c.JSON(http.StatusOK, gin.H{
+			"message":      uploadSuccessMessage(true, "文档"),
+			"chunk_count":  chunkCount,
+			"knowledge_id": knowledge.ID,
+			"replaced":     true,
+		})
 		return
 	}
 
@@ -1485,13 +1761,13 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 	h.audit(c, "doc.upload", kbID, true, map[string]interface{}{"filename": header.Filename, "chunk_count": chunkCount})
 
 	c.JSON(http.StatusOK, gin.H{
-		"message":      "文档上传成功",
+		"message":      uploadSuccessMessage(replaced, "文档"),
 		"chunk_count":  chunkCount,
 		"knowledge_id": knowledge.ID,
+		"replaced":     replaced,
 	})
 }
 
-// UploadDocumentURL 从网页 URL 导入文档
 // @Summary 上传网页 URL
 // @Description 从指定 URL 抓取内容到知识库，自动解析、分块、向量化
 // @Tags 知识库
@@ -1542,18 +1818,19 @@ func (h *Handler) UploadDocumentURL(c *gin.Context) {
 	}
 
 	if h.importQueue != nil {
-		knowledge, err := h.enqueueURLImport(c.Request.Context(), kbID, title, parsedURL.String(), req.EnableMultimodal)
+		knowledge, replaced, err := h.enqueueURLImport(c.Request.Context(), kbID, title, parsedURL.String(), req.EnableMultimodal)
 		if err != nil {
 			h.audit(c, "doc.upload_url", kbID, false, map[string]interface{}{"error": err.Error(), "url": parsedURL.String()})
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "加入异步导入队列失败: " + err.Error()})
 			return
 		}
 
-		h.audit(c, "doc.upload_url", kbID, true, map[string]interface{}{"url": parsedURL.String(), "knowledge_id": knowledge.ID, "async": true})
+		h.audit(c, "doc.upload_url", kbID, true, map[string]interface{}{"url": parsedURL.String(), "knowledge_id": knowledge.ID, "async": true, "replaced": replaced})
 		c.JSON(http.StatusAccepted, gin.H{
-			"message":      "网页已加入异步导入队列",
+			"message":      importAcceptedMessage(replaced, "网页"),
 			"knowledge_id": knowledge.ID,
 			"status":       knowledge.ParseStatus,
+			"replaced":     replaced,
 		})
 		return
 	}
@@ -1561,10 +1838,10 @@ func (h *Handler) UploadDocumentURL(c *gin.Context) {
 	parseOpts := docreader.DefaultParseOptions()
 	parseOpts.EnableMultimodal = req.EnableMultimodal
 
-	knowledge, err := h.createKnowledgeRecord(c.Request.Context(), h.newURLKnowledge(kbID, title, parsedURL.String(), "processing"))
+	knowledge, replaced, err := h.prepareKnowledgeForImport(c.Request.Context(), h.newURLKnowledge(kbID, title, parsedURL.String(), "processing"))
 	if err != nil {
 		h.audit(c, "doc.upload_url", kbID, false, map[string]interface{}{"error": err.Error(), "url": parsedURL.String()})
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建文档记录失败: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "准备文档记录失败: " + err.Error()})
 		return
 	}
 
@@ -1576,7 +1853,19 @@ func (h *Handler) UploadDocumentURL(c *gin.Context) {
 		return
 	}
 
-	chunkCount, err := h.storeParsedChunks(c.Request.Context(), kbID, knowledge.ID, title, result.Chunks)
+	var chunkCount int
+	if replaced {
+		content := []byte(strings.Join(parsedChunkContents(result.Chunks), "\n\n"))
+		syncResult, syncErr := h.incrementalSync(c.Request.Context(), kbID, knowledge.ID, title, content, contentHash(string(content)))
+		if syncErr != nil {
+			chunkCount = 0
+			err = syncErr
+		} else {
+			chunkCount = syncResult.Added + syncResult.Retained
+		}
+	} else {
+		chunkCount, err = h.storeParsedChunks(c.Request.Context(), kbID, knowledge.ID, title, result.Chunks)
+	}
 	if err != nil {
 		log.Printf("[UploadURL] 向量化失败（URL 已解析 %d 块）: %v", chunkCount, err)
 		h.markKnowledgeFailed(c.Request.Context(), knowledge.ID, chunkCount, err)
@@ -1592,16 +1881,35 @@ func (h *Handler) UploadDocumentURL(c *gin.Context) {
 	}
 
 	h.markKnowledgeCompleted(c.Request.Context(), knowledge, chunkCount)
-	h.audit(c, "doc.upload_url", kbID, true, map[string]interface{}{"url": parsedURL.String(), "chunk_count": chunkCount})
+	h.audit(c, "doc.upload_url", kbID, true, map[string]interface{}{"url": parsedURL.String(), "chunk_count": chunkCount, "replaced": replaced})
 
 	c.JSON(http.StatusOK, gin.H{
-		"message":      "网页上传成功",
+		"message":      uploadSuccessMessage(replaced, "网页"),
 		"chunk_count":  chunkCount,
 		"knowledge_id": knowledge.ID,
+		"replaced":     replaced,
 	})
 }
 
-func (h *Handler) newFileKnowledge(kbID, filename string, fileSize int64, status string) *repository.Knowledge {
+func uploadSuccessMessage(replaced bool, sourceLabel string) string {
+	if replaced {
+		return sourceLabel + "更新成功"
+	}
+	return sourceLabel + "上传成功"
+}
+
+func importAcceptedMessage(replaced bool, sourceLabel string) string {
+	if replaced {
+		return sourceLabel + "已加入增量更新队列"
+	}
+	return sourceLabel + "已加入异步导入队列"
+}
+
+func (h *Handler) newFileKnowledge(kbID, filename string, fileSize int64, status string, contentHashValue ...string) *repository.Knowledge {
+	contentHash := ""
+	if len(contentHashValue) > 0 {
+		contentHash = contentHashValue[0]
+	}
 	return &repository.Knowledge{
 		KnowledgeBaseID: kbID,
 		Name:            filename,
@@ -1611,6 +1919,7 @@ func (h *Handler) newFileKnowledge(kbID, filename string, fileSize int64, status
 		FileSize:        fileSize,
 		ParseStatus:     status,
 		ChunkCount:      0,
+		ContentHash:     contentHash,
 	}
 }
 
@@ -1649,9 +1958,61 @@ func (h *Handler) createKnowledgeRecord(ctx context.Context, knowledge *reposito
 	return knowledge, nil
 }
 
+func (h *Handler) findExistingKnowledge(ctx context.Context, knowledge *repository.Knowledge) (*repository.Knowledge, error) {
+	if h.knowledgeRepo == nil || knowledge == nil {
+		return nil, nil
+	}
+	switch knowledge.SourceType {
+	case "file":
+		return h.knowledgeRepo.FindByFileName(ctx, knowledge.KnowledgeBaseID, knowledge.FileName)
+	case "url":
+		sourceURL := ""
+		if knowledge.FilePath != nil {
+			sourceURL = *knowledge.FilePath
+		}
+		if sourceURL == "" && knowledge.Metadata != nil {
+			if value, ok := knowledge.Metadata["source_url"].(string); ok {
+				sourceURL = value
+			}
+		}
+		if sourceURL == "" {
+			return nil, nil
+		}
+		return h.knowledgeRepo.FindBySourceURL(ctx, knowledge.KnowledgeBaseID, sourceURL)
+	default:
+		return nil, nil
+	}
+}
+
+func (h *Handler) prepareKnowledgeForImport(ctx context.Context, knowledge *repository.Knowledge) (*repository.Knowledge, bool, error) {
+	existing, err := h.findExistingKnowledge(ctx, knowledge)
+	if err != nil {
+		return nil, false, err
+	}
+	if existing == nil {
+		created, err := h.createKnowledgeRecord(ctx, knowledge)
+		return created, false, err
+	}
+	knowledge.ID = existing.ID
+	knowledge.ChunkCount = existing.ChunkCount
+	if knowledge.ContentHash == "" {
+		knowledge.ContentHash = existing.ContentHash
+	}
+	if err := h.knowledgeRepo.PrepareForReplacement(ctx, existing.ID, knowledge); err != nil {
+		return nil, false, err
+	}
+	return knowledge, true, nil
+}
+
 func (h *Handler) markKnowledgeCompleted(ctx context.Context, knowledge *repository.Knowledge, chunkCount int) {
 	if knowledge == nil || h.knowledgeRepo == nil {
 		return
+	}
+	previousChunkCount := knowledge.ChunkCount
+	if previousChunkCount == 0 && h.knowledgeRepo != nil {
+		if existing, err := h.knowledgeRepo.GetByID(ctx, knowledge.ID); err == nil && existing != nil {
+			previousChunkCount = existing.ChunkCount
+		}
 	}
 	if err := h.knowledgeRepo.UpdateParseStatus(ctx, knowledge.ID, "completed", "", chunkCount); err != nil {
 		log.Printf("[Handler] 更新文档完成状态失败: id=%s err=%v", knowledge.ID, err)
@@ -1661,10 +2022,16 @@ func (h *Handler) markKnowledgeCompleted(ctx context.Context, knowledge *reposit
 		state.Stage = "completed"
 		state.ChunkCount = chunkCount
 		state.Error = ""
+		if state.EnrichmentStatus == "" {
+			state.EnrichmentStatus = enrichmentStatusForConfig(h.cfg)
+		}
 	})
 	if h.kbRepo != nil {
-		if err := h.kbRepo.IncrementCounts(ctx, knowledge.KnowledgeBaseID, 0, chunkCount); err != nil {
-			log.Printf("[Handler] 更新知识库 chunk 计数失败: kb=%s err=%v", knowledge.KnowledgeBaseID, err)
+		chunkDelta := chunkCount - previousChunkCount
+		if chunkDelta != 0 {
+			if err := h.kbRepo.IncrementCounts(ctx, knowledge.KnowledgeBaseID, 0, chunkDelta); err != nil {
+				log.Printf("[Handler] 更新知识库 chunk 计数失败: kb=%s err=%v", knowledge.KnowledgeBaseID, err)
+			}
 		}
 		// 记录本次索引使用的 Embedding 指纹，用于后续失效检测
 		if err := h.kbRepo.UpdateEmbedFingerprint(ctx, knowledge.KnowledgeBaseID, container.EmbedFingerprint(&h.cfg.Embedding)); err != nil {
@@ -1676,6 +2043,7 @@ func (h *Handler) markKnowledgeCompleted(ctx context.Context, knowledge *reposit
 			log.Printf("[Cache] 文档完成导入后失效检索缓存失败: kb=%s knowledge=%s err=%v", knowledge.KnowledgeBaseID, knowledge.ID, err)
 		}
 	}
+	h.scheduleContextualEnrichment(knowledge.ID, knowledge.KnowledgeBaseID)
 }
 
 func (h *Handler) markKnowledgeFailed(ctx context.Context, knowledgeID string, chunkCount int, err error) {
@@ -1693,10 +2061,24 @@ func (h *Handler) markKnowledgeFailed(ctx context.Context, knowledgeID string, c
 	})
 }
 
-func (h *Handler) enqueueFileImport(ctx context.Context, kbID, filename string, fileSize int64, reader io.Reader) (*repository.Knowledge, error) {
-	knowledge, err := h.createKnowledgeRecord(ctx, h.newFileKnowledge(kbID, filename, fileSize, "pending"))
+func (h *Handler) enqueueFileImport(ctx context.Context, kbID, filename string, fileSize int64, reader io.Reader) (*repository.Knowledge, bool, bool, error) {
+	tempPath, contentHash, err := h.persistUploadedFile(filename, reader)
 	if err != nil {
-		return nil, err
+		return nil, false, false, err
+	}
+
+	if duplicate, err := h.findDuplicateFileByHash(ctx, kbID, contentHash); err != nil {
+		_ = os.Remove(tempPath)
+		return nil, false, false, err
+	} else if duplicate != nil {
+		_ = os.Remove(tempPath)
+		return duplicate, false, true, nil
+	}
+
+	knowledge, replaced, err := h.prepareKnowledgeForImport(ctx, h.newFileKnowledge(kbID, filename, fileSize, "pending", contentHash))
+	if err != nil {
+		_ = os.Remove(tempPath)
+		return nil, false, false, err
 	}
 	h.writeImportTaskState(ctx, knowledge.ID, func(state *cachepkg.ImportTaskState) {
 		state.Status = "pending"
@@ -1705,12 +2087,6 @@ func (h *Handler) enqueueFileImport(ctx context.Context, kbID, filename string, 
 		state.Error = ""
 	})
 
-	tempPath, err := h.persistUploadedFile(filename, reader)
-	if err != nil {
-		h.markKnowledgeFailed(ctx, knowledge.ID, 0, err)
-		return nil, err
-	}
-
 	task := importqueue.Task{
 		KnowledgeID:     knowledge.ID,
 		KnowledgeBaseID: kbID,
@@ -1718,20 +2094,21 @@ func (h *Handler) enqueueFileImport(ctx context.Context, kbID, filename string, 
 		FilePath:        tempPath,
 		FileName:        filename,
 		FileType:        inferFileType(filename),
+		ReplaceExisting: replaced,
 	}
 	if err := h.importQueue.Enqueue(ctx, task); err != nil {
 		_ = os.Remove(tempPath)
 		h.markKnowledgeFailed(ctx, knowledge.ID, 0, err)
-		return nil, err
+		return nil, false, false, err
 	}
 
-	return knowledge, nil
+	return knowledge, replaced, false, nil
 }
 
-func (h *Handler) enqueueURLImport(ctx context.Context, kbID, title, sourceURL string, enableMultimodal bool) (*repository.Knowledge, error) {
-	knowledge, err := h.createKnowledgeRecord(ctx, h.newURLKnowledge(kbID, title, sourceURL, "pending"))
+func (h *Handler) enqueueURLImport(ctx context.Context, kbID, title, sourceURL string, enableMultimodal bool) (*repository.Knowledge, bool, error) {
+	knowledge, replaced, err := h.prepareKnowledgeForImport(ctx, h.newURLKnowledge(kbID, title, sourceURL, "pending"))
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	h.writeImportTaskState(ctx, knowledge.ID, func(state *cachepkg.ImportTaskState) {
 		state.Status = "pending"
@@ -1747,16 +2124,17 @@ func (h *Handler) enqueueURLImport(ctx context.Context, kbID, title, sourceURL s
 		Title:            title,
 		SourceURL:        sourceURL,
 		EnableMultimodal: enableMultimodal,
+		ReplaceExisting:  replaced,
 	}
 	if err := h.importQueue.Enqueue(ctx, task); err != nil {
 		h.markKnowledgeFailed(ctx, knowledge.ID, 0, err)
-		return nil, err
+		return nil, replaced, err
 	}
 
-	return knowledge, nil
+	return knowledge, replaced, nil
 }
 
-func (h *Handler) persistUploadedFile(filename string, reader io.Reader) (string, error) {
+func (h *Handler) persistUploadedFile(filename string, reader io.Reader) (string, string, error) {
 	tempDir := h.cfg.ImportQueue.TempDir
 	if tempDir == "" {
 		if h.cfg.RAG.DocumentsPath != "" {
@@ -1766,7 +2144,7 @@ func (h *Handler) persistUploadedFile(filename string, reader io.Reader) (string
 		}
 	}
 	if err := os.MkdirAll(tempDir, 0o755); err != nil {
-		return "", fmt.Errorf("create import temp dir: %w", err)
+		return "", "", fmt.Errorf("create import temp dir: %w", err)
 	}
 
 	safeName := sanitizeFilename(filename)
@@ -1777,15 +2155,17 @@ func (h *Handler) persistUploadedFile(filename string, reader io.Reader) (string
 
 	tempFile, err := os.Create(tempPath)
 	if err != nil {
-		return "", fmt.Errorf("create temp file: %w", err)
+		return "", "", fmt.Errorf("create temp file: %w", err)
 	}
 	defer tempFile.Close()
 
-	if _, err := io.Copy(tempFile, reader); err != nil {
-		return "", fmt.Errorf("write temp file: %w", err)
+	hasher := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(tempFile, hasher), reader); err != nil {
+		_ = os.Remove(tempPath)
+		return "", "", fmt.Errorf("write temp file: %w", err)
 	}
 
-	return tempPath, nil
+	return tempPath, hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
 func sanitizeFilename(name string) string {
@@ -1939,8 +2319,30 @@ func (h *Handler) uploadWikiDocument(c *gin.Context, kb *repository.KnowledgeBas
 
 // contentHash 计算内容的 SHA256 哈希
 func contentHash(content string) string {
-	h := sha256.Sum256([]byte(content))
+	return contentHashBytes([]byte(content))
+}
+
+func contentHashBytes(content []byte) string {
+	h := sha256.Sum256(content)
 	return hex.EncodeToString(h[:])
+}
+
+func (h *Handler) findDuplicateFileByHash(ctx context.Context, kbID, hash string) (*repository.Knowledge, error) {
+	if h.knowledgeRepo == nil || hash == "" {
+		return nil, nil
+	}
+	duplicate, err := h.knowledgeRepo.FindByContentHash(ctx, kbID, "file", hash)
+	if err != nil || duplicate == nil {
+		return duplicate, err
+	}
+	if duplicate.ParseStatus != "completed" {
+		return nil, nil
+	}
+	return duplicate, nil
+}
+
+func (h *Handler) findDuplicateFileByContentHash(ctx context.Context, kbID string, content []byte) (*repository.Knowledge, error) {
+	return h.findDuplicateFileByHash(ctx, kbID, contentHashBytes(content))
 }
 
 func (h *Handler) enrichChunks(ctx context.Context, docContent string, chunks []*container.Document) []*container.Document {
@@ -1995,9 +2397,7 @@ func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeI
 		return 0, fmt.Errorf("文档分块失败: %w", err)
 	}
 
-	// 上下文富化（可选）
-	chunks = h.enrichChunks(ctx, string(content), chunks)
-
+	// 上下文富化由后台任务异步覆盖向量库内容，不阻塞基础索引。
 	contents := make([]string, len(chunks))
 	for i, chunk := range chunks {
 		contents[i] = chunk.Content
@@ -2046,6 +2446,8 @@ func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeI
 			log.Printf("[DualWrite][WARN] 文档 content_hash 更新失败: knowledge=%s err=%v", knowledgeID, err)
 		}
 	}
+
+	h.markContextualEnrichmentPending(ctx, knowledgeID)
 
 	return len(chunks), nil
 }
@@ -2102,11 +2504,28 @@ func (h *Handler) ProcessImportTask(ctx context.Context, task importqueue.Task) 
 	}
 
 	log.Printf("[ImportWorker] 完成: %s → %d chunks [%v]", task.FileName, chunkCount, elapsed)
-	h.markKnowledgeCompleted(ctx, &repository.Knowledge{ID: task.KnowledgeID, KnowledgeBaseID: task.KnowledgeBaseID}, chunkCount)
+	knowledge := &repository.Knowledge{ID: task.KnowledgeID, KnowledgeBaseID: task.KnowledgeBaseID}
+	if task.ReplaceExisting && h.knowledgeRepo != nil {
+		if existing, getErr := h.knowledgeRepo.GetByID(ctx, task.KnowledgeID); getErr == nil && existing != nil {
+			knowledge = existing
+		}
+	}
+	h.markKnowledgeCompleted(ctx, knowledge, chunkCount)
 	return nil
 }
 
 func (h *Handler) processQueuedFileImport(ctx context.Context, task importqueue.Task) (int, error) {
+	if task.ReplaceExisting {
+		content, err := os.ReadFile(task.FilePath)
+		if err != nil {
+			return 0, fmt.Errorf("read temp file: %w", err)
+		}
+		result, err := h.incrementalSync(ctx, task.KnowledgeBaseID, task.KnowledgeID, task.FileName, content, contentHash(string(content)))
+		if err != nil {
+			return 0, err
+		}
+		return result.Added + result.Retained, nil
+	}
 	if h.docReaderCli != nil {
 		file, err := os.Open(task.FilePath)
 		if err != nil {
@@ -2129,6 +2548,26 @@ func (h *Handler) processQueuedFileImport(ctx context.Context, task importqueue.
 }
 
 func (h *Handler) processQueuedURLImport(ctx context.Context, task importqueue.Task) (int, error) {
+	if task.ReplaceExisting {
+		content, err := h.fetchDocumentContent(ctx, &repository.Knowledge{
+			ID:              task.KnowledgeID,
+			KnowledgeBaseID: task.KnowledgeBaseID,
+			SourceType:      "url",
+			FileName:        task.Title,
+			FilePath:        &task.SourceURL,
+			Metadata: repository.JSON{
+				"source_url": task.SourceURL,
+			},
+		})
+		if err != nil {
+			return 0, err
+		}
+		result, err := h.incrementalSync(ctx, task.KnowledgeBaseID, task.KnowledgeID, task.Title, content, contentHash(string(content)))
+		if err != nil {
+			return 0, err
+		}
+		return result.Added + result.Retained, nil
+	}
 	if h.docReaderCli != nil {
 		parseOpts := docreader.DefaultParseOptions()
 		parseOpts.EnableMultimodal = task.EnableMultimodal
@@ -2161,6 +2600,129 @@ func (h *Handler) processQueuedURLImport(ctx context.Context, task importqueue.T
 		return 0, fmt.Errorf("读取响应失败: %w", err)
 	}
 	return h.processPlainTextDocument(ctx, task.KnowledgeBaseID, task.KnowledgeID, task.FileName, body)
+}
+
+func enrichmentStatusForConfig(cfg *config.Config) string {
+	if cfg == nil || !cfg.RAG.EnableContextualEnrichment {
+		return "skipped"
+	}
+	return "pending"
+}
+
+func (h *Handler) markContextualEnrichmentPending(ctx context.Context, knowledgeID string) {
+	status := enrichmentStatusForConfig(h.cfg)
+	if h.knowledgeRepo != nil {
+		if err := h.knowledgeRepo.UpdateEnrichmentStatus(ctx, knowledgeID, status, "", 0); err != nil {
+			log.Printf("[Enricher] 更新富化状态失败: knowledge=%s status=%s err=%v", knowledgeID, status, err)
+		}
+	}
+	h.writeImportTaskState(ctx, knowledgeID, func(state *cachepkg.ImportTaskState) {
+		state.EnrichmentStatus = status
+		state.EnrichmentError = ""
+		state.EnrichedChunkCount = 0
+		state.EnrichmentUpdatedAt = time.Now()
+	})
+}
+
+func (h *Handler) scheduleContextualEnrichment(knowledgeID, kbID string) {
+	if h.cfg == nil || !h.cfg.RAG.EnableContextualEnrichment || h.chunkRepo == nil || h.vectorDB == nil || h.embedding == nil {
+		return
+	}
+	go h.processContextualEnrichment(context.Background(), knowledgeID, kbID)
+}
+
+func (h *Handler) processContextualEnrichment(ctx context.Context, knowledgeID, kbID string) {
+	h.writeImportTaskState(ctx, knowledgeID, func(state *cachepkg.ImportTaskState) {
+		state.EnrichmentStatus = "processing"
+		state.EnrichmentError = ""
+		state.EnrichmentUpdatedAt = time.Now()
+	})
+	if h.knowledgeRepo != nil {
+		if err := h.knowledgeRepo.UpdateEnrichmentStatus(ctx, knowledgeID, "processing", "", 0); err != nil {
+			log.Printf("[Enricher] 更新富化处理中状态失败: knowledge=%s err=%v", knowledgeID, err)
+		}
+	}
+
+	chunks, err := h.chunkRepo.GetByKnowledgeID(ctx, knowledgeID)
+	if err != nil {
+		h.markContextualEnrichmentFailed(ctx, knowledgeID, err)
+		return
+	}
+	if len(chunks) == 0 {
+		h.markContextualEnrichmentCompleted(ctx, knowledgeID, 0)
+		return
+	}
+
+	docs := make([]*container.Document, len(chunks))
+	contents := make([]string, 0, len(chunks))
+	for i, chunk := range chunks {
+		contents = append(contents, strings.TrimSpace(chunk.Content))
+		metadata := map[string]interface{}{}
+		for key, value := range chunk.Metadata {
+			metadata[key] = value
+		}
+		metadata["knowledge_base_id"] = kbID
+		metadata["knowledge_id"] = knowledgeID
+		metadata["chunk_id"] = chunk.ID
+		metadata["chunk_index"] = chunk.ChunkIndex
+		metadata["source_content"] = chunk.Content
+		docs[i] = &container.Document{ID: chunk.ID, Content: chunk.Content, Metadata: metadata}
+	}
+	docContent := strings.Join(contents, "\n\n")
+	enrichedDocs := h.enrichChunks(ctx, docContent, docs)
+	embedContents := make([]string, len(enrichedDocs))
+	for i, doc := range enrichedDocs {
+		embedContents[i] = doc.Content
+	}
+
+	vectors, err := container.BatchEmbedFloat32(ctx, h.embedding, embedContents)
+	if err != nil {
+		h.markContextualEnrichmentFailed(ctx, knowledgeID, fmt.Errorf("增强向量化失败: %w", err))
+		return
+	}
+	for i, doc := range enrichedDocs {
+		doc.Vector = vectors[i]
+	}
+	if err := h.vectorDB.Upsert(ctx, enrichedDocs); err != nil {
+		h.markContextualEnrichmentFailed(ctx, knowledgeID, fmt.Errorf("增强向量写入失败: %w", err))
+		return
+	}
+	if h.retrievalCache != nil {
+		if err := h.retrievalCache.InvalidateKnowledgeBase(ctx, kbID); err != nil {
+			log.Printf("[Cache] 文档富化后失效检索缓存失败: kb=%s knowledge=%s err=%v", kbID, knowledgeID, err)
+		}
+	}
+	h.markContextualEnrichmentCompleted(ctx, knowledgeID, len(enrichedDocs))
+}
+
+func (h *Handler) markContextualEnrichmentCompleted(ctx context.Context, knowledgeID string, chunkCount int) {
+	if h.knowledgeRepo != nil {
+		if err := h.knowledgeRepo.UpdateEnrichmentStatus(ctx, knowledgeID, "completed", "", chunkCount); err != nil {
+			log.Printf("[Enricher] 更新富化完成状态失败: knowledge=%s err=%v", knowledgeID, err)
+		}
+	}
+	h.writeImportTaskState(ctx, knowledgeID, func(state *cachepkg.ImportTaskState) {
+		state.EnrichmentStatus = "completed"
+		state.EnrichmentError = ""
+		state.EnrichedChunkCount = chunkCount
+		state.EnrichmentUpdatedAt = time.Now()
+	})
+}
+
+func (h *Handler) markContextualEnrichmentFailed(ctx context.Context, knowledgeID string, err error) {
+	if err == nil {
+		return
+	}
+	if h.knowledgeRepo != nil {
+		if updateErr := h.knowledgeRepo.UpdateEnrichmentStatus(ctx, knowledgeID, "failed", err.Error(), 0); updateErr != nil {
+			log.Printf("[Enricher] 更新富化失败状态失败: knowledge=%s err=%v", knowledgeID, updateErr)
+		}
+	}
+	h.writeImportTaskState(ctx, knowledgeID, func(state *cachepkg.ImportTaskState) {
+		state.EnrichmentStatus = "failed"
+		state.EnrichmentError = err.Error()
+		state.EnrichmentUpdatedAt = time.Now()
+	})
 }
 
 // processAndStoreChunks 处理并存储文档块
@@ -2198,10 +2760,9 @@ func (h *Handler) processAndStoreChunks(ctx context.Context, kbID, knowledgeID, 
 		}
 	}
 
-	docContent := strings.Join(parsedChunkContents(chunks), "\n\n")
-	docs = h.enrichChunks(ctx, docContent, docs)
 	for i, doc := range docs {
 		contents[i] = doc.Content
+		doc.Metadata["source_content"] = doc.Content
 	}
 
 	// 批量向量化
@@ -2267,6 +2828,7 @@ func (h *Handler) processAndStoreChunks(ctx context.Context, kbID, knowledgeID, 
 		}()
 	}
 
+	h.markContextualEnrichmentPending(ctx, knowledgeID)
 	return nil
 }
 
@@ -2331,22 +2893,35 @@ func (h *Handler) ListDocuments(c *gin.Context) {
 			if !state.UpdatedAt.IsZero() {
 				updatedAt = state.UpdatedAt
 			}
+			if state.EnrichmentStatus != "" {
+				k.EnrichmentStatus = state.EnrichmentStatus
+			}
+			if state.EnrichmentError != "" {
+				enrichmentError := state.EnrichmentError
+				k.EnrichmentError = &enrichmentError
+			}
+			if state.EnrichedChunkCount > 0 {
+				k.EnrichedChunkCount = state.EnrichedChunkCount
+			}
 		}
 		docs = append(docs, gin.H{
-			"id":           k.ID,
-			"filename":     k.FileName,
-			"name":         k.Name,
-			"source_type":  k.SourceType,
-			"file_size":    k.FileSize,
-			"file_type":    k.FileType,
-			"file_path":    k.FilePath,
-			"metadata":     k.Metadata,
-			"parse_status": k.ParseStatus,
-			"parse_error":  k.ParseError,
-			"chunk_count":  k.ChunkCount,
-			"created_at":   k.CreatedAt,
-			"updated_at":   updatedAt,
-			"stage":        stage,
+			"id":                   k.ID,
+			"filename":             k.FileName,
+			"name":                 k.Name,
+			"source_type":          k.SourceType,
+			"file_size":            k.FileSize,
+			"file_type":            k.FileType,
+			"file_path":            k.FilePath,
+			"metadata":             k.Metadata,
+			"parse_status":         k.ParseStatus,
+			"parse_error":          k.ParseError,
+			"chunk_count":          k.ChunkCount,
+			"enrichment_status":    k.EnrichmentStatus,
+			"enrichment_error":     k.EnrichmentError,
+			"enriched_chunk_count": k.EnrichedChunkCount,
+			"created_at":           k.CreatedAt,
+			"updated_at":           updatedAt,
+			"stage":                stage,
 		})
 	}
 
@@ -2384,14 +2959,17 @@ func (h *Handler) GetDocumentImportStatus(c *gin.Context) {
 	}
 
 	resp := gin.H{
-		"knowledge_id":      knowledge.ID,
-		"knowledge_base_id": knowledge.KnowledgeBaseID,
-		"status":            knowledge.ParseStatus,
-		"stage":             "",
-		"chunk_count":       knowledge.ChunkCount,
-		"error":             knowledge.ParseError,
-		"created_at":        knowledge.CreatedAt,
-		"updated_at":        knowledge.UpdatedAt,
+		"knowledge_id":         knowledge.ID,
+		"knowledge_base_id":    knowledge.KnowledgeBaseID,
+		"status":               knowledge.ParseStatus,
+		"stage":                "",
+		"chunk_count":          knowledge.ChunkCount,
+		"error":                knowledge.ParseError,
+		"enrichment_status":    knowledge.EnrichmentStatus,
+		"enrichment_error":     knowledge.EnrichmentError,
+		"enriched_chunk_count": knowledge.EnrichedChunkCount,
+		"created_at":           knowledge.CreatedAt,
+		"updated_at":           knowledge.UpdatedAt,
 	}
 	if state, ok := h.getImportTaskState(c.Request.Context(), knowledge.ID); ok {
 		if state.Status != "" {
@@ -2401,6 +2979,18 @@ func (h *Handler) GetDocumentImportStatus(c *gin.Context) {
 		resp["chunk_count"] = state.ChunkCount
 		if state.Error != "" {
 			resp["error"] = state.Error
+		}
+		if state.EnrichmentStatus != "" {
+			resp["enrichment_status"] = state.EnrichmentStatus
+		}
+		if state.EnrichmentError != "" {
+			resp["enrichment_error"] = state.EnrichmentError
+		}
+		if state.EnrichedChunkCount > 0 {
+			resp["enriched_chunk_count"] = state.EnrichedChunkCount
+		}
+		if !state.EnrichmentUpdatedAt.IsZero() {
+			resp["enrichment_updated_at"] = state.EnrichmentUpdatedAt
 		}
 		if !state.StartedAt.IsZero() {
 			resp["started_at"] = state.StartedAt
@@ -2687,7 +3277,7 @@ func (h *Handler) SyncDocument(c *gin.Context) {
 		}
 		log.Printf("[Sync] 增量同步完成: doc=%s added=%d removed=%d retained=%d",
 			docID, result.Added, result.Removed, result.Retained)
-		h.markKnowledgeCompleted(bgCtx, &repository.Knowledge{ID: docID, KnowledgeBaseID: kbID}, result.Added+result.Retained)
+		h.markKnowledgeCompleted(bgCtx, k, result.Added+result.Retained)
 	}()
 
 	c.JSON(http.StatusAccepted, gin.H{
@@ -2700,6 +3290,44 @@ type syncResult struct {
 	Added    int
 	Removed  int
 	Retained int
+}
+
+func diffChunksByOccurrence(oldChunks []*repository.Chunk, newContents []string) ([]string, []string, []int, error) {
+	newKeyToIndex := make(map[string]int, len(newContents))
+	newHashCounts := make(map[string]int)
+	for i, content := range newContents {
+		hash := contentHash(content)
+		occurrence := newHashCounts[hash]
+		newHashCounts[hash] = occurrence + 1
+		newKeyToIndex[fmt.Sprintf("%s#%d", hash, occurrence)] = i
+	}
+
+	oldKeyToID := make(map[string]string, len(oldChunks))
+	oldHashCounts := make(map[string]int)
+	for _, chunk := range oldChunks {
+		if chunk.ContentHash == "" {
+			return nil, nil, nil, fmt.Errorf("chunk %s missing content hash", chunk.ID)
+		}
+		occurrence := oldHashCounts[chunk.ContentHash]
+		oldHashCounts[chunk.ContentHash] = occurrence + 1
+		oldKeyToID[fmt.Sprintf("%s#%d", chunk.ContentHash, occurrence)] = chunk.ID
+	}
+
+	var retainedIDs []string
+	var removeIDs []string
+	var addIndices []int
+	for oldKey, oldID := range oldKeyToID {
+		if _, exists := newKeyToIndex[oldKey]; exists {
+			retainedIDs = append(retainedIDs, oldID)
+			delete(newKeyToIndex, oldKey)
+		} else {
+			removeIDs = append(removeIDs, oldID)
+		}
+	}
+	for _, idx := range newKeyToIndex {
+		addIndices = append(addIndices, idx)
+	}
+	return retainedIDs, removeIDs, addIndices, nil
 }
 
 // incrementalSync 执行 chunk 级增量同步
@@ -2731,38 +3359,22 @@ func (h *Handler) incrementalSync(ctx context.Context, kbID, knowledgeID, filena
 		return nil, fmt.Errorf("分块失败: %w", err)
 	}
 
-	// 计算新 chunk 哈希
-	newHashMap := make(map[string]int) // content_hash → index in newChunks
+	newContents := make([]string, len(newChunks))
 	for i, ch := range newChunks {
-		newHashMap[contentHash(ch.Content)] = i
+		newContents[i] = ch.Content
 	}
 
 	// Layer 2: 获取旧 chunk 哈希
-	oldHashMap, err := h.chunkRepo.GetHashesByKnowledgeID(ctx, knowledgeID)
+	oldChunks, err := h.chunkRepo.GetByKnowledgeID(ctx, knowledgeID)
 	if err != nil {
-		log.Printf("[Sync] 获取旧哈希失败，回退全量: %v", err)
+		log.Printf("[Sync] 获取旧 chunk 失败，回退全量: %v", err)
 		return h.fullReindex(ctx, kbID, knowledgeID, filename, content, docHash)
 	}
 
-	// Diff: 分类为 keep / add / remove
-	var (
-		retainedIDs []string // 旧 chunk 保留的 ID
-		removeIDs   []string // 旧 chunk 需删除的 ID
-		addIndices  []int    // 新 chunk 需新增的索引
-	)
-
-	// 标记保留和删除
-	for oldHash, oldID := range oldHashMap {
-		if _, exists := newHashMap[oldHash]; exists {
-			retainedIDs = append(retainedIDs, oldID)
-			delete(newHashMap, oldHash) // 从待添加中移除
-		} else {
-			removeIDs = append(removeIDs, oldID)
-		}
-	}
-	// 剩下的 newHashMap 就是需要新增的
-	for _, idx := range newHashMap {
-		addIndices = append(addIndices, idx)
+	retainedIDs, removeIDs, addIndices, err := diffChunksByOccurrence(oldChunks, newContents)
+	if err != nil {
+		log.Printf("[Sync] 旧 chunk 哈希不可用，回退全量: %v", err)
+		return h.fullReindex(ctx, kbID, knowledgeID, filename, content, docHash)
 	}
 
 	result := &syncResult{
@@ -2858,7 +3470,7 @@ func (h *Handler) incrementalSync(ctx context.Context, kbID, knowledgeID, filena
 }
 
 // fullReindex 全量重建回退（当旧哈希不可用时）
-func (h *Handler) fullReindex(ctx context.Context, kbID, knowledgeID, filename string, content []byte, docHash string) (*syncResult, error) {
+func (h *Handler) fullReindex(ctx context.Context, kbID, knowledgeID, filename string, content []byte, _ string) (*syncResult, error) {
 	// 清除所有旧数据
 	if h.vectorDB != nil {
 		if err := h.vectorDB.DeleteByKnowledgeID(ctx, knowledgeID); err != nil {
