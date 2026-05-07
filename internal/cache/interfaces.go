@@ -31,12 +31,16 @@ type RetrievalResult struct {
 
 // ImportTaskState 表示导入任务的实时状态。
 type ImportTaskState struct {
-	Status     string    `json:"status"`
-	Stage      string    `json:"stage,omitempty"`
-	ChunkCount int       `json:"chunk_count,omitempty"`
-	Error      string    `json:"error,omitempty"`
-	StartedAt  time.Time `json:"started_at,omitempty"`
-	UpdatedAt  time.Time `json:"updated_at,omitempty"`
+	Status              string    `json:"status"`
+	Stage               string    `json:"stage,omitempty"`
+	ChunkCount          int       `json:"chunk_count,omitempty"`
+	Error               string    `json:"error,omitempty"`
+	EnrichmentStatus    string    `json:"enrichment_status,omitempty"`
+	EnrichmentError     string    `json:"enrichment_error,omitempty"`
+	EnrichedChunkCount  int       `json:"enriched_chunk_count,omitempty"`
+	EnrichmentUpdatedAt time.Time `json:"enrichment_updated_at,omitempty"`
+	StartedAt           time.Time `json:"started_at,omitempty"`
+	UpdatedAt           time.Time `json:"updated_at,omitempty"`
 }
 
 // SessionCache 定义会话热数据缓存能力。

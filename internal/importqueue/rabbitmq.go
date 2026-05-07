@@ -22,6 +22,7 @@ type Task struct {
 	Title            string `json:"title,omitempty"`
 	SourceURL        string `json:"source_url,omitempty"`
 	EnableMultimodal bool   `json:"enable_multimodal,omitempty"`
+	ReplaceExisting  bool   `json:"replace_existing,omitempty"`
 }
 
 // Queue 定义导入队列的基本能力。

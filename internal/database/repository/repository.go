@@ -54,22 +54,25 @@ func (kb *KnowledgeBase) IsWikiMode() bool {
 
 // Knowledge 知识文档
 type Knowledge struct {
-	ID              string    `json:"id"`
-	KnowledgeBaseID string    `json:"knowledge_base_id"`
-	TagID           *string   `json:"tag_id"`
-	Name            string    `json:"name"`
-	SourceType      string    `json:"source_type"` // file, faq, url
-	FileName        string    `json:"file_name"`
-	FileType        string    `json:"file_type"`
-	FileSize        int64     `json:"file_size"`
-	FilePath        *string   `json:"file_path"`
-	ParseStatus     string    `json:"parse_status"` // pending, processing, completed, failed
-	ParseError      *string   `json:"parse_error"`
-	ChunkCount      int       `json:"chunk_count"`
-	ContentHash     string    `json:"content_hash"` // SHA256 of raw document content
-	Metadata        JSON      `json:"metadata"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	ID                 string    `json:"id"`
+	KnowledgeBaseID    string    `json:"knowledge_base_id"`
+	TagID              *string   `json:"tag_id"`
+	Name               string    `json:"name"`
+	SourceType         string    `json:"source_type"` // file, faq, url
+	FileName           string    `json:"file_name"`
+	FileType           string    `json:"file_type"`
+	FileSize           int64     `json:"file_size"`
+	FilePath           *string   `json:"file_path"`
+	ParseStatus        string    `json:"parse_status"` // pending, processing, completed, failed
+	ParseError         *string   `json:"parse_error"`
+	ChunkCount         int       `json:"chunk_count"`
+	EnrichmentStatus   string    `json:"enrichment_status"`
+	EnrichmentError    *string   `json:"enrichment_error"`
+	EnrichedChunkCount int       `json:"enriched_chunk_count"`
+	ContentHash        string    `json:"content_hash"` // SHA256 of raw document content
+	Metadata           JSON      `json:"metadata"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 // Chunk 文本块
@@ -252,10 +255,15 @@ type AccessControlRepository interface {
 type KnowledgeRepository interface {
 	Create(ctx context.Context, k *Knowledge) error
 	GetByID(ctx context.Context, id string) (*Knowledge, error)
+	FindByFileName(ctx context.Context, kbID, filename string) (*Knowledge, error)
+	FindBySourceURL(ctx context.Context, kbID, sourceURL string) (*Knowledge, error)
+	FindByContentHash(ctx context.Context, kbID, sourceType, hash string) (*Knowledge, error)
 	ListByKnowledgeBase(ctx context.Context, kbID string, offset, limit int) ([]*Knowledge, error)
 	CountByKnowledgeBase(ctx context.Context, kbID string) (int, error)
 	UpdateParseStatus(ctx context.Context, id, status, errorMsg string, chunkCount int) error
+	UpdateEnrichmentStatus(ctx context.Context, id, status, errorMsg string, enrichedChunkCount int) error
 	UpdateContentHash(ctx context.Context, id, hash string) error
+	PrepareForReplacement(ctx context.Context, id string, k *Knowledge) error
 	Delete(ctx context.Context, id string) error
 }
 
@@ -477,10 +485,10 @@ func NewKnowledgeRepository(db *postgres.DB) KnowledgeRepository {
 func (r *pgKnowledgeRepo) Create(ctx context.Context, k *Knowledge) error {
 	metadata, _ := json.Marshal(k.Metadata)
 	return r.db.QueryRow(ctx, `
-		INSERT INTO knowledges (knowledge_base_id, tag_id, name, source_type, file_name, file_type, file_size, file_path, parse_status, chunk_count, metadata)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		INSERT INTO knowledges (knowledge_base_id, tag_id, name, source_type, file_name, file_type, file_size, file_path, parse_status, chunk_count, content_hash, metadata)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		RETURNING id, created_at, updated_at
-	`, k.KnowledgeBaseID, k.TagID, k.Name, k.SourceType, k.FileName, k.FileType, k.FileSize, k.FilePath, k.ParseStatus, k.ChunkCount, metadata).
+	`, k.KnowledgeBaseID, k.TagID, k.Name, k.SourceType, k.FileName, k.FileType, k.FileSize, k.FilePath, k.ParseStatus, k.ChunkCount, k.ContentHash, metadata).
 		Scan(&k.ID, &k.CreatedAt, &k.UpdatedAt)
 }
 
@@ -489,11 +497,58 @@ func (r *pgKnowledgeRepo) GetByID(ctx context.Context, id string) (*Knowledge, e
 	var metadata []byte
 	err := r.db.QueryRow(ctx, `
 		SELECT id, knowledge_base_id, tag_id, name, source_type, file_name, file_type, file_size, file_path,
-		       parse_status, parse_error, chunk_count, content_hash, metadata, created_at, updated_at
+		       parse_status, parse_error, chunk_count, enrichment_status, enrichment_error, enriched_chunk_count, content_hash, metadata, created_at, updated_at
 		FROM knowledges WHERE id = $1 AND deleted_at IS NULL
 	`, id).Scan(
 		&k.ID, &k.KnowledgeBaseID, &k.TagID, &k.Name, &k.SourceType, &k.FileName, &k.FileType, &k.FileSize, &k.FilePath,
-		&k.ParseStatus, &k.ParseError, &k.ChunkCount, &k.ContentHash, &metadata, &k.CreatedAt, &k.UpdatedAt,
+		&k.ParseStatus, &k.ParseError, &k.ChunkCount, &k.EnrichmentStatus, &k.EnrichmentError, &k.EnrichedChunkCount, &k.ContentHash, &metadata, &k.CreatedAt, &k.UpdatedAt,
+	)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	_ = json.Unmarshal(metadata, &k.Metadata)
+	return k, nil
+}
+
+func (r *pgKnowledgeRepo) FindByFileName(ctx context.Context, kbID, filename string) (*Knowledge, error) {
+	return r.findOne(ctx, `
+		SELECT id, knowledge_base_id, tag_id, name, source_type, file_name, file_type, file_size, file_path,
+		       parse_status, parse_error, chunk_count, enrichment_status, enrichment_error, enriched_chunk_count, content_hash, metadata, created_at, updated_at
+		FROM knowledges
+		WHERE knowledge_base_id = $1 AND source_type = 'file' AND file_name = $2 AND deleted_at IS NULL
+		ORDER BY updated_at DESC LIMIT 1
+	`, kbID, filename)
+}
+
+func (r *pgKnowledgeRepo) FindBySourceURL(ctx context.Context, kbID, sourceURL string) (*Knowledge, error) {
+	return r.findOne(ctx, `
+		SELECT id, knowledge_base_id, tag_id, name, source_type, file_name, file_type, file_size, file_path,
+		       parse_status, parse_error, chunk_count, enrichment_status, enrichment_error, enriched_chunk_count, content_hash, metadata, created_at, updated_at
+		FROM knowledges
+		WHERE knowledge_base_id = $1 AND source_type = 'url' AND file_path = $2 AND deleted_at IS NULL
+		ORDER BY updated_at DESC LIMIT 1
+	`, kbID, sourceURL)
+}
+
+func (r *pgKnowledgeRepo) FindByContentHash(ctx context.Context, kbID, sourceType, hash string) (*Knowledge, error) {
+	return r.findOne(ctx, `
+		SELECT id, knowledge_base_id, tag_id, name, source_type, file_name, file_type, file_size, file_path,
+		       parse_status, parse_error, chunk_count, enrichment_status, enrichment_error, enriched_chunk_count, content_hash, metadata, created_at, updated_at
+		FROM knowledges
+		WHERE knowledge_base_id = $1 AND source_type = $2 AND content_hash = $3 AND deleted_at IS NULL
+		ORDER BY updated_at DESC LIMIT 1
+	`, kbID, sourceType, hash)
+}
+
+func (r *pgKnowledgeRepo) findOne(ctx context.Context, query string, args ...interface{}) (*Knowledge, error) {
+	k := &Knowledge{}
+	var metadata []byte
+	err := r.db.QueryRow(ctx, query, args...).Scan(
+		&k.ID, &k.KnowledgeBaseID, &k.TagID, &k.Name, &k.SourceType, &k.FileName, &k.FileType, &k.FileSize, &k.FilePath,
+		&k.ParseStatus, &k.ParseError, &k.ChunkCount, &k.EnrichmentStatus, &k.EnrichmentError, &k.EnrichedChunkCount, &k.ContentHash, &metadata, &k.CreatedAt, &k.UpdatedAt,
 	)
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -508,7 +563,7 @@ func (r *pgKnowledgeRepo) GetByID(ctx context.Context, id string) (*Knowledge, e
 func (r *pgKnowledgeRepo) ListByKnowledgeBase(ctx context.Context, kbID string, offset, limit int) ([]*Knowledge, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT id, knowledge_base_id, tag_id, name, source_type, file_name, file_type, file_size, file_path,
-		       parse_status, parse_error, chunk_count, content_hash, metadata, created_at, updated_at
+		       parse_status, parse_error, chunk_count, enrichment_status, enrichment_error, enriched_chunk_count, content_hash, metadata, created_at, updated_at
 		FROM knowledges WHERE knowledge_base_id = $1 AND deleted_at IS NULL
 		ORDER BY created_at DESC LIMIT $2 OFFSET $3
 	`, kbID, limit, offset)
@@ -523,7 +578,7 @@ func (r *pgKnowledgeRepo) ListByKnowledgeBase(ctx context.Context, kbID string, 
 		var metadata []byte
 		if err := rows.Scan(
 			&k.ID, &k.KnowledgeBaseID, &k.TagID, &k.Name, &k.SourceType, &k.FileName, &k.FileType, &k.FileSize, &k.FilePath,
-			&k.ParseStatus, &k.ParseError, &k.ChunkCount, &k.ContentHash, &metadata, &k.CreatedAt, &k.UpdatedAt,
+			&k.ParseStatus, &k.ParseError, &k.ChunkCount, &k.EnrichmentStatus, &k.EnrichmentError, &k.EnrichedChunkCount, &k.ContentHash, &metadata, &k.CreatedAt, &k.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -550,6 +605,14 @@ func (r *pgKnowledgeRepo) UpdateParseStatus(ctx context.Context, id, status, err
 	return err
 }
 
+func (r *pgKnowledgeRepo) UpdateEnrichmentStatus(ctx context.Context, id, status, errorMsg string, enrichedChunkCount int) error {
+	_, err := r.db.Pool().Exec(ctx, `
+		UPDATE knowledges SET enrichment_status = $2, enrichment_error = $3, enriched_chunk_count = $4, updated_at = CURRENT_TIMESTAMP
+		WHERE id = $1
+	`, id, status, errorMsg, enrichedChunkCount)
+	return err
+}
+
 func (r *pgKnowledgeRepo) Delete(ctx context.Context, id string) error {
 	_, err := r.db.Pool().Exec(ctx, `
 		UPDATE knowledges SET deleted_at = CURRENT_TIMESTAMP WHERE id = $1
@@ -561,6 +624,25 @@ func (r *pgKnowledgeRepo) UpdateContentHash(ctx context.Context, id, hash string
 	_, err := r.db.Pool().Exec(ctx, `
 		UPDATE knowledges SET content_hash = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1
 	`, id, hash)
+	return err
+}
+
+func (r *pgKnowledgeRepo) PrepareForReplacement(ctx context.Context, id string, k *Knowledge) error {
+	metadata, _ := json.Marshal(k.Metadata)
+	_, err := r.db.Pool().Exec(ctx, `
+		UPDATE knowledges SET
+			name = $2,
+			file_name = $3,
+			file_type = $4,
+			file_size = $5,
+			file_path = $6,
+			parse_status = $7,
+			parse_error = NULL,
+			content_hash = $8,
+			metadata = $9,
+			updated_at = CURRENT_TIMESTAMP
+		WHERE id = $1 AND deleted_at IS NULL
+	`, id, k.Name, k.FileName, k.FileType, k.FileSize, k.FilePath, k.ParseStatus, k.ContentHash, metadata)
 	return err
 }
 
