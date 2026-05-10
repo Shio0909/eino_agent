@@ -51,10 +51,10 @@ func (s *ChatService) saveUserMessage(ctx context.Context, sessionID, content st
 }
 
 func (s *ChatService) saveAssistantMessage(ctx context.Context, sessionID, content string, tokensUsed int, latencyMs int64) string {
-	return s.saveAssistantMessageWithTrace(ctx, sessionID, content, tokensUsed, latencyMs, nil)
+	return s.saveAssistantMessageWithTrace(ctx, sessionID, content, tokensUsed, latencyMs, nil, nil)
 }
 
-func (s *ChatService) saveAssistantMessageWithTrace(ctx context.Context, sessionID, content string, tokensUsed int, latencyMs int64, trace []TraceStep) string {
+func (s *ChatService) saveAssistantMessageWithTrace(ctx context.Context, sessionID, content string, tokensUsed int, latencyMs int64, trace []TraceStep, sources []Source) string {
 	if s.messageRepo == nil || sessionID == "" {
 		return ""
 	}
@@ -66,12 +66,15 @@ func (s *ChatService) saveAssistantMessageWithTrace(ctx context.Context, session
 		TokensUsed: tokensUsed,
 		LatencyMs:  int(latencyMs),
 	}
-	if len(trace) > 0 {
+	if len(trace) > 0 || len(sources) > 0 {
 		steps := make([]any, 0, len(trace))
 		for _, step := range trace {
 			steps = append(steps, step)
 		}
 		msg.AgentSteps = repository.JSON{"trace": steps}
+		if sourceItems := sourcesToAgentSteps(sources); len(sourceItems) > 0 {
+			msg.AgentSteps["sources"] = sourceItems
+		}
 	}
 	if err := s.messageRepo.Create(ctx, msg); err != nil {
 		log.Printf("[ChatService] save assistant message failed: %v", err)

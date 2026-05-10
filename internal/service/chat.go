@@ -1073,24 +1073,31 @@ func (s *ChatService) renderSystemPrompt(mode string) string {
 
 // chatContext 封装 Chat/ChatStream 共用的请求预处理结果
 type chatContext struct {
-	sessionID          string
-	runtimeInstruction string
-	messageWithInst    string
-	runtimeRetriever   retriever.Retriever
+	sessionID             string
+	runtimeInstruction    string
+	messageWithInst       string
+	runtimeRetriever      retriever.Retriever
+	followUpEvidenceCount int
 }
 
 // prepareChatContext 执行聊天请求的公共预处理：会话管理、指令构建、检索器构建、保存用户消息
 func (s *ChatService) prepareChatContext(ctx context.Context, req *ChatRequest) *chatContext {
 	sessionID, _ := s.ensureSession(ctx, req)
 	runtimeInstruction := s.buildRuntimeInstruction(ctx, req, sessionID)
+	followUpEvidenceCount := 0
+	if evidenceInstruction, evidenceSources := s.buildFollowUpEvidenceInstruction(ctx, req, sessionID); evidenceInstruction != "" {
+		runtimeInstruction = appendInstructionPart(runtimeInstruction, evidenceInstruction)
+		followUpEvidenceCount = len(evidenceSources)
+	}
 	messageWithInst := appendInstructionToMessage(req.Message, runtimeInstruction)
 	runtimeRetriever := s.getRuntimeRetriever(req)
 	s.saveUserMessage(ctx, sessionID, req.Message)
 	return &chatContext{
-		sessionID:          sessionID,
-		runtimeInstruction: runtimeInstruction,
-		messageWithInst:    messageWithInst,
-		runtimeRetriever:   runtimeRetriever,
+		sessionID:             sessionID,
+		runtimeInstruction:    runtimeInstruction,
+		messageWithInst:       messageWithInst,
+		runtimeRetriever:      runtimeRetriever,
+		followUpEvidenceCount: followUpEvidenceCount,
 	}
 }
 
@@ -1252,6 +1259,9 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 		},
 	})
 	cc := s.prepareChatContext(ctx, req)
+	if cc.followUpEvidenceCount > 0 {
+		trace.add(TraceStep{Type: "context", Stage: "followup_evidence", Summary: "reused last-turn evidence for follow-up question", Metadata: map[string]any{"source_count": cc.followUpEvidenceCount}})
+	}
 	cc.runtimeRetriever = newTracedRetriever(cc.runtimeRetriever, trace)
 
 	var resp *ChatResponse
@@ -1431,7 +1441,7 @@ finalizeChat:
 	latencyMs := time.Since(startTime).Milliseconds()
 	trace.add(TraceStep{Type: "status", Stage: "complete", LatencyMs: latencyMs, Metadata: map[string]any{"mode": mode, "source_count": len(resp.Sources)}})
 	resp.Trace = trace.snapshot()
-	messageID := s.saveAssistantMessageWithTrace(ctx, cc.sessionID, resp.Answer, 0, latencyMs, resp.Trace)
+	messageID := s.saveAssistantMessageWithTrace(ctx, cc.sessionID, resp.Answer, 0, latencyMs, resp.Trace, resp.Sources)
 	s.recordRequestTrace(traceID, req, cc.sessionID, messageID, mode, "completed", latencyMs, resp.Trace, trace.summary(mode, "completed", latencyMs, len(resp.Sources), ""), "")
 
 	return resp, nil
@@ -1444,6 +1454,9 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 	trace := newTraceCollector(traceID)
 	ctx = trace.context(ctx)
 	cc := s.prepareChatContext(ctx, req)
+	if cc.followUpEvidenceCount > 0 {
+		trace.add(TraceStep{Type: "context", Stage: "followup_evidence", Summary: "reused last-turn evidence for follow-up question", Metadata: map[string]any{"source_count": cc.followUpEvidenceCount}})
+	}
 	trace.add(TraceStep{
 		Type:  "status",
 		Stage: "request",
@@ -1585,7 +1598,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			latencyMs := time.Since(startTime).Milliseconds()
 			trace.add(TraceStep{Type: "status", Stage: "complete", LatencyMs: latencyMs, Metadata: map[string]any{"mode": mode}})
 			snapshot := trace.snapshot()
-			messageID := s.saveAssistantMessageWithTrace(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs, snapshot)
+			messageID := s.saveAssistantMessageWithTrace(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs, snapshot, sources)
 			s.recordRequestTrace(traceID, req, cc.sessionID, messageID, mode, "completed", latencyMs, snapshot, trace.summary(mode, "completed", latencyMs, len(sources), ""), "")
 			trySend(StreamEvent{Type: "trace_snapshot", TraceSnapshot: snapshot})
 			trySend(StreamEvent{Type: "done"})
@@ -1615,6 +1628,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 				return
 			}
 
+			sources := make([]Source, 0, s.config.RAG.TopK)
 			pipelineDone := false
 			for chunk := range stream {
 				if chunk.Type == pipeline.ChunkTypeDone {
@@ -1638,10 +1652,14 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 						}
 					}
 				} else {
+					if chunk.Type == pipeline.ChunkTypeSource {
+						sources = append(sources, Source{Content: chunk.Content, DocID: chunk.DocID, Metadata: chunk.Metadata})
+					}
 					event := StreamEvent{
-						Type:    string(chunk.Type),
-						Content: chunk.Content,
-						DocID:   chunk.DocID,
+						Type:     string(chunk.Type),
+						Content:  chunk.Content,
+						DocID:    chunk.DocID,
+						Metadata: chunk.Metadata,
 					}
 					if chunk.Type == pipeline.ChunkTypeTrace {
 						event.TraceStep = traceStepFromPipelineMetadata(chunk.Metadata)
@@ -1660,7 +1678,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			latencyMs := time.Since(startTime).Milliseconds()
 			trace.add(TraceStep{Type: "status", Stage: "complete", LatencyMs: latencyMs, Metadata: map[string]any{"mode": "pipeline"}})
 			snapshot := trace.snapshot()
-			messageID := s.saveAssistantMessageWithTrace(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs, snapshot)
+			messageID := s.saveAssistantMessageWithTrace(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs, snapshot, sources)
 			s.recordRequestTrace(traceID, req, cc.sessionID, messageID, "pipeline", "completed", latencyMs, snapshot, trace.summary("pipeline", "completed", latencyMs, 0, ""), "")
 			trySend(StreamEvent{Type: "trace_snapshot", TraceSnapshot: snapshot})
 			if pipelineDone {

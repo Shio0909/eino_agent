@@ -662,9 +662,10 @@ func (p *RAGPipeline) RunStream(ctx context.Context, req *RAGRequest) (<-chan St
 				break
 			}
 			ch <- StreamChunk{
-				Type:    ChunkTypeSource,
-				Content: doc.Content,
-				DocID:   doc.ID,
+				Type:     ChunkTypeSource,
+				Content:  doc.Content,
+				DocID:    doc.ID,
+				Metadata: doc.MetaData,
 			}
 		}
 

@@ -126,6 +126,120 @@ func TestBuildMemoryInstructionUsesSessionCache(t *testing.T) {
 	}
 }
 
+func TestFollowUpEvidenceInstructionUsesLastAssistantSources(t *testing.T) {
+	cfg := &config.Config{Memory: config.MemoryConfig{Enabled: true, MaxContextChars: 1000}}
+	svc, err := NewChatService(cfg)
+	if err != nil {
+		t.Fatalf("NewChatService error = %v", err)
+	}
+	messageRepo := newFakeMessageRepo()
+	svc.messageRepo = messageRepo
+
+	ctx := context.Background()
+	svc.saveAssistantMessageWithTrace(ctx, "s1", "上一轮答案", 0, 10, nil, []Source{
+		{DocID: "doc-1", Content: "Eino Agent 支持 Pipeline RAG 和 Agentic ReAct 两条路径。", Metadata: map[string]any{"source": "README.md"}},
+	})
+
+	instruction, sources := svc.buildFollowUpEvidenceInstruction(ctx, &ChatRequest{Message: "这个有什么风险？"}, "s1")
+	if len(sources) != 1 {
+		t.Fatalf("sources len = %d, want 1", len(sources))
+	}
+	if !strings.Contains(instruction, "上一轮检索证据") || !strings.Contains(instruction, "Pipeline RAG") || !strings.Contains(instruction, "README.md") {
+		t.Fatalf("instruction missing last evidence: %s", instruction)
+	}
+}
+
+func TestFollowUpEvidenceInstructionReadsJSONDecodedSources(t *testing.T) {
+	cfg := &config.Config{Memory: config.MemoryConfig{Enabled: true, MaxContextChars: 1000}}
+	svc, err := NewChatService(cfg)
+	if err != nil {
+		t.Fatalf("NewChatService error = %v", err)
+	}
+	messageRepo := newFakeMessageRepo()
+	messageRepo.messages["s1"] = []*repository.Message{{
+		SessionID: "s1",
+		Role:      "assistant",
+		Content:   "上一轮答案",
+		AgentSteps: repository.JSON{"sources": []any{map[string]any{
+			"content":  "GraphRAG 用图谱关系补充向量检索。",
+			"doc_id":   "doc-graph",
+			"metadata": map[string]any{"source": "graphrag.md"},
+		}}},
+	}}
+	svc.messageRepo = messageRepo
+
+	instruction, sources := svc.buildFollowUpEvidenceInstruction(context.Background(), &ChatRequest{Message: "继续展开这个"}, "s1")
+	if len(sources) != 1 || sources[0].DocID != "doc-graph" {
+		t.Fatalf("unexpected decoded sources: %#v", sources)
+	}
+	if !strings.Contains(instruction, "GraphRAG") || !strings.Contains(instruction, "graphrag.md") {
+		t.Fatalf("instruction missing decoded evidence: %s", instruction)
+	}
+}
+
+func TestFollowUpEvidenceInstructionSkipsNewTopic(t *testing.T) {
+	cfg := &config.Config{Memory: config.MemoryConfig{Enabled: true, MaxContextChars: 1000}}
+	svc, err := NewChatService(cfg)
+	if err != nil {
+		t.Fatalf("NewChatService error = %v", err)
+	}
+	messageRepo := newFakeMessageRepo()
+	svc.messageRepo = messageRepo
+
+	ctx := context.Background()
+	svc.saveAssistantMessageWithTrace(ctx, "s1", "上一轮答案", 0, 10, nil, []Source{
+		{DocID: "doc-1", Content: "旧证据", Metadata: map[string]any{"source": "old.md"}},
+	})
+
+	instruction, sources := svc.buildFollowUpEvidenceInstruction(ctx, &ChatRequest{Message: "请介绍 Redis 的持久化机制"}, "s1")
+	if instruction != "" || len(sources) != 0 {
+		t.Fatalf("expected no reused evidence for new topic, got instruction=%q sources=%#v", instruction, sources)
+	}
+}
+
+func TestFollowUpEvidenceInstructionSkipsStandaloneRiskQuestion(t *testing.T) {
+	cfg := &config.Config{Memory: config.MemoryConfig{Enabled: true, MaxContextChars: 1000}}
+	svc, err := NewChatService(cfg)
+	if err != nil {
+		t.Fatalf("NewChatService error = %v", err)
+	}
+	messageRepo := newFakeMessageRepo()
+	svc.messageRepo = messageRepo
+
+	ctx := context.Background()
+	svc.saveAssistantMessageWithTrace(ctx, "s1", "上一轮答案", 0, 10, nil, []Source{
+		{DocID: "doc-1", Content: "Eino Agent 的旧证据", Metadata: map[string]any{"source": "old.md"}},
+	})
+
+	instruction, sources := svc.buildFollowUpEvidenceInstruction(ctx, &ChatRequest{Message: "Redis 持久化有什么风险？"}, "s1")
+	if instruction != "" || len(sources) != 0 {
+		t.Fatalf("expected standalone topic risk question not to reuse evidence, got instruction=%q sources=%#v", instruction, sources)
+	}
+}
+
+func TestPrepareChatContextTracksFollowUpEvidenceCount(t *testing.T) {
+	cfg := &config.Config{Memory: config.MemoryConfig{Enabled: true, MaxContextChars: 1000}}
+	svc, err := NewChatService(cfg)
+	if err != nil {
+		t.Fatalf("NewChatService error = %v", err)
+	}
+	messageRepo := newFakeMessageRepo()
+	svc.messageRepo = messageRepo
+
+	ctx := context.Background()
+	svc.saveAssistantMessageWithTrace(ctx, "s1", "上一轮答案", 0, 10, nil, []Source{
+		{DocID: "doc-1", Content: "上一轮证据", Metadata: map[string]any{"source": "evidence.md"}},
+	})
+
+	cc := svc.prepareChatContext(ctx, &ChatRequest{SessionID: "s1", Message: "继续展开这个"})
+	if cc.followUpEvidenceCount != 1 {
+		t.Fatalf("followUpEvidenceCount = %d, want 1", cc.followUpEvidenceCount)
+	}
+	if !strings.Contains(cc.runtimeInstruction, "上一轮检索证据") {
+		t.Fatalf("runtimeInstruction missing evidence: %s", cc.runtimeInstruction)
+	}
+}
+
 func TestSaveMessagesRefreshesSessionCache(t *testing.T) {
 	baseTime := time.Date(2026, 3, 23, 12, 0, 0, 0, time.UTC)
 	cfg := &config.Config{
