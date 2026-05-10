@@ -1,6 +1,38 @@
 package postgres
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestKnowledgeContentHashIndexIsCreatedOnlyByDedicatedMigration(t *testing.T) {
+	migrationDir := "../../../migrations"
+	matches := make([]string, 0)
+
+	entries, err := os.ReadDir(migrationDir)
+	if err != nil {
+		t.Fatalf("ReadDir returned error: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".up.sql") {
+			continue
+		}
+		path := filepath.Join(migrationDir, entry.Name())
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(%s) returned error: %v", path, err)
+		}
+		if strings.Contains(string(content), "idx_knowledges_kb_source_hash") {
+			matches = append(matches, entry.Name())
+		}
+	}
+
+	if len(matches) != 1 || matches[0] != "000009_add_knowledge_content_hash_index.up.sql" {
+		t.Fatalf("idx_knowledges_kb_source_hash should only be created by 000009, got %#v", matches)
+	}
+}
 
 func TestListMigrationFilesReturnsAllUpMigrations(t *testing.T) {
 	files, err := ListMigrationFiles("../../../migrations")
