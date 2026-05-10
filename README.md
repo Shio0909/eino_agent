@@ -4,6 +4,36 @@
 
 项目定位是“企业知识中台 / RAG 能力服务”：后端提供向量检索、Wiki 知识库、GraphRAG、Code Search、MCP Export 等能力，前端提供知识库管理、聊天、引用和图谱浏览。
 
+## 能力概览
+
+- **多范式 RAG 编排**：支持 Pipeline RAG、Agentic ReAct、GraphRAG、Code Search 等多种问答链路。
+- **可观测检索链路**：每次请求生成 `trace_id`，记录 rewrite、retrieve、rerank、context、generation 和 sources。
+- **多轮 Evidence Memory**：保存上一轮检索 sources，追问时复用 evidence，减少短句追问查偏。
+- **能力服务化**：通过 HTTP API 和 MCP Export 暴露 `chat`、`knowledge_search`、KB 查询等能力。
+- **工程化导入链路**：支持文件、URL、异步队列、多模式 DocReader 和导入状态跟踪。
+
+## 系统架构
+
+```mermaid
+flowchart LR
+    User[Web UI / API Client] --> API[Gin HTTP API]
+    API --> Chat[ChatService]
+    Chat --> Pipeline[Pipeline RAG]
+    Chat --> Agentic[Agentic ReAct]
+    Pipeline --> Retrieval[Hybrid Retrieval]
+    Agentic --> Tools[Knowledge / Code / Web / MCP Tools]
+    Retrieval --> Vector[(pgvector / Milvus)]
+    Retrieval --> FTS[(PostgreSQL FTS)]
+    Chat --> Memory[Message + Evidence Memory]
+    Chat --> Trace[Request Trace]
+    API --> KB[Knowledge Import]
+    KB --> Queue[RabbitMQ]
+    KB --> DocReader[DocReader / MinerU]
+    KB --> Store[(PostgreSQL / Redis)]
+    Tools --> MCP[MCP Remote Servers]
+    Retrieval --> Graph[Neo4j GraphRAG]
+```
+
 ## 设计目标
 
 > Demo 讲解稿见 `docs/SHOWCASE.md`。
@@ -26,7 +56,7 @@
 - **Eino Skill**：渐进式披露（Progressive Disclosure）skill 中间件，支持按请求动态选择技能
 - **智能分块**：支持 recursive / markdown / semantic / auto 四种分块策略，可选上下文增强（LLM 生成分块摘要前缀）
 - **Wiki 模式**：知识库可选 `wiki` 模式，LLM 将文件/URL 编译为可浏览的 Markdown 页面和交叉链接，并使用 PostgreSQL FTS/ILIKE 检索（适合长期沉淀的结构化知识库）
-- **记忆系统**：Redis 短期缓存 + PostgreSQL 长期记忆（跨会话）
+- **记忆系统**：Redis 短期缓存 + PostgreSQL 长期记忆（跨会话）+ 会话内 Evidence Memory（追问复用上一轮 sources）
 - **安全防护**：Prompt Injection 检测 + SSRF 防护（URL 白名单/黑名单）
 - **GraphRAG**：Neo4j 实体关系图谱增强检索（可选）
 - **Code Search / Code Graph**：代码仓库克隆索引 + 代码知识图谱检索（可选）
@@ -67,6 +97,12 @@
                          ├── code_search / code_graph（代码搜索）
                          └── MCP 远程工具
 ```
+
+### 多轮上下文与 Evidence Memory
+
+系统会把 assistant 回答中的 sources 持久化到会话消息里。后续问题命中“这个、继续、上面、刚才”等追问信号时，会把上一轮 sources 作为 evidence instruction 注入当前轮生成上下文，同时保留本轮检索流程，避免仅凭短句追问查偏。
+
+该复用行为会写入 `followup_evidence` trace step，便于观察一次回答是否使用了上一轮证据。
 
 ## 项目结构
 
