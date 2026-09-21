@@ -24,6 +24,11 @@ export function KnowledgePage() {
   const [url, setUrl] = useState('');
   const [title, setTitle] = useState('');
   const [message, setMessage] = useState<{ text: string; tone: 'warning' | 'success' | 'error' } | null>(null);
+  const [chunkDoc, setChunkDoc] = useState<{ id: string; title: string } | null>(null);
+  const [chunks, setChunks] = useState<{ id: string; index: number; content: string; char_count?: number }[]>([]);
+  const [revisions, setRevisions] = useState<Record<string, { id: string; content: string; created_at?: string }[]>>({});
+  const [editingChunk, setEditingChunk] = useState<string | null>(null);
+  const [chunkDraft, setChunkDraft] = useState('');
 
   const kbs = data?.knowledge_bases ?? [];
   const selected = kbs.find((kb) => kb.id === selectedKnowledgeBaseId);
@@ -66,6 +71,49 @@ export function KnowledgePage() {
     setUrl('');
     setTitle('');
     documents.refetch();
+  };
+
+  const openChunks = async (doc: { id: string; title: string }) => {
+    if (!selected) return;
+    const result = await endpoints.chunks(selected.id, doc.id);
+    setChunkDoc(doc);
+    setChunks(result.chunks);
+    setRevisions({});
+  };
+
+  const loadRevisions = async (chunkId: string) => {
+    if (!selected || !chunkDoc) return;
+    const result = await endpoints.chunkRevisions(selected.id, chunkDoc.id, chunkId);
+    setRevisions((current) => ({ ...current, [chunkId]: result.revisions }));
+  };
+
+  const restoreRevision = async (chunkId: string, revisionId: string) => {
+    if (!selected || !chunkDoc) return;
+    await endpoints.restoreChunkRevision(selected.id, chunkDoc.id, chunkId, revisionId);
+    const result = await endpoints.chunks(selected.id, chunkDoc.id);
+    setChunks(result.chunks);
+    setMessage({ text: '已回滚 Chunk；请重新索引文档后才会影响检索。', tone: 'warning' });
+  };
+
+  const reindexChunk = async (chunkId: string) => {
+    if (!selected || !chunkDoc) return;
+    await endpoints.reindexChunk(selected.id, chunkDoc.id, chunkId);
+    setMessage({ text: '当前 Chunk 已重新向量化并写入索引。', tone: 'success' });
+  };
+
+  const saveChunk = async (chunkId: string) => {
+    if (!selected || !chunkDoc) return;
+    await endpoints.updateChunk(selected.id, chunkDoc.id, chunkId, chunkDraft);
+    const result = await endpoints.chunks(selected.id, chunkDoc.id);
+    setChunks(result.chunks);
+    setEditingChunk(null);
+    setMessage({ text: 'Chunk 已保存；请重新索引文档后才会影响检索。', tone: 'warning' });
+  };
+
+  const reindexChunkDoc = async () => {
+    if (!selected || !chunkDoc) return;
+    await endpoints.reindexDocument(selected.id, chunkDoc.id);
+    setMessage({ text: '已提交重建索引任务。', tone: 'success' });
   };
 
   return (
@@ -133,7 +181,7 @@ export function KnowledgePage() {
                   <tbody>
                     {(docItems).map((doc) => (
                       <tr key={doc.id} className="border-t border-border/70">
-                        <td className="px-4 py-3 font-medium">{doc.title || doc.filename || doc.source || doc.id}</td>
+                        <td className="px-4 py-3 font-medium"><button type="button" className="text-left text-accent hover:underline" onClick={() => openChunks({ id: doc.id, title: doc.title || doc.filename || doc.source || doc.id })}>{doc.title || doc.filename || doc.source || doc.id}</button></td>
                         <td className="px-4 py-3">
                           <div className="flex flex-col gap-1">
                             <Badge tone={statusTone(documentStatus(doc))}>{doc.stage || documentStatus(doc) || 'unknown'}</Badge>
@@ -147,6 +195,16 @@ export function KnowledgePage() {
                   </tbody>
                 </table>
               </div>
+              {chunkDoc ? <div className="mt-4 rounded-3xl border border-border/70 bg-surface/35 p-4">
+                <div className="flex items-center justify-between"><h5 className="font-display text-xl font-semibold">{chunkDoc.title} · Chunks</h5><div className="flex items-center gap-3"><button type="button" className="text-sm text-accent hover:underline" onClick={reindexChunkDoc}>重新索引</button><button type="button" className="text-sm text-muted hover:text-text" onClick={() => setChunkDoc(null)}>关闭</button></div></div>
+                <div className="mt-3 max-h-72 space-y-3 overflow-auto">
+                  {chunks.map((chunk) => <div key={chunk.id} className="rounded-2xl border border-border/60 bg-panel/60 p-3">
+                    <div className="mb-2 flex items-center justify-between text-xs text-muted"><span>#{chunk.index} · {chunk.char_count ?? chunk.content.length} chars</span><div className="flex gap-3">{editingChunk === chunk.id ? <button type="button" className="text-accent" onClick={() => saveChunk(chunk.id)}>保存</button> : <button type="button" className="text-accent" onClick={() => { setEditingChunk(chunk.id); setChunkDraft(chunk.content); }}>编辑</button>}<button type="button" className="text-accent" onClick={() => reindexChunk(chunk.id)}>更新索引</button><button type="button" className="text-muted hover:text-text" onClick={() => loadRevisions(chunk.id)}>历史</button></div></div>
+                    {editingChunk === chunk.id ? <textarea className="focus-ring min-h-24 w-full rounded-xl border-border/80 bg-panel p-2 text-sm" value={chunkDraft} onChange={(event) => setChunkDraft(event.target.value)} /> : <p className="whitespace-pre-wrap text-sm text-muted">{chunk.content}</p>}
+                    {revisions[chunk.id]?.length ? <div className="mt-3 border-t border-border/60 pt-3 text-xs">{revisions[chunk.id].map((revision) => <div key={revision.id} className="flex items-center justify-between gap-2 py-1"><span className="truncate text-muted">{revision.created_at ? formatDate(revision.created_at) : '历史版本'} · {revision.content.slice(0, 50)}</span><button type="button" className="shrink-0 text-accent" onClick={() => restoreRevision(chunk.id, revision.id)}>回滚</button></div>)}</div> : null}
+                  </div>)}
+                </div>
+              </div> : null}
             </div>
           )}
         </div>

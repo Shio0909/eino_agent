@@ -21,6 +21,7 @@ import (
 
 	einoembedding "github.com/cloudwego/eino/components/embedding"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
 	"eino_agent/internal/approval"
 	cachepkg "eino_agent/internal/cache"
@@ -274,7 +275,11 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			kb.GET("/:id/documents", h.ListDocuments)
 			kb.GET("/:id/documents/:docId/status", h.GetDocumentImportStatus)
 			kb.GET("/:id/documents/:docId/chunks", h.GetDocumentChunks)
+			kb.PATCH("/:id/documents/:docId/chunks/:chunkId", h.UpdateDocumentChunk)
+			kb.GET("/:id/documents/:docId/chunks/:chunkId/revisions", h.ListChunkRevisions)
+			kb.POST("/:id/documents/:docId/chunks/:chunkId/revisions/:revisionId/restore", h.RestoreChunkRevision)
 			kb.POST("/:id/documents/:docId/reindex", h.ReindexDocument)
+			kb.POST("/:id/documents/:docId/chunks/:chunkId/reindex", h.ReindexEditedChunk)
 			kb.POST("/:id/documents/:docId/sync", h.SyncDocument)
 			kb.DELETE("/:id/documents/:docId", h.DeleteDocument)
 		}
@@ -2409,6 +2414,7 @@ func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeI
 	}
 
 	for i, chunk := range chunks {
+		chunk.ID = uuid.NewString()
 		chunk.Vector = vectors[i]
 		chunk.Metadata["knowledge_base_id"] = kbID
 		chunk.Metadata["knowledge_id"] = knowledgeID
@@ -2740,10 +2746,8 @@ func (h *Handler) processAndStoreChunks(ctx context.Context, kbID, knowledgeID, 
 	// 转换为内部格式
 	docs := make([]*container.Document, len(chunks))
 	contents := make([]string, len(chunks))
-	batchPrefix := time.Now().UnixNano()
-
 	for i, chunk := range chunks {
-		chunkID := fmt.Sprintf("%s_chunk_%d_%d_%d", kbID, batchPrefix, chunk.Seq, i)
+		chunkID := uuid.NewString()
 		docs[i] = &container.Document{
 			ID:      chunkID,
 			Content: chunk.Content,
@@ -3106,6 +3110,152 @@ func (h *Handler) GetDocumentChunks(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"chunks": result, "total": len(result)})
 }
 
+// UpdateDocumentChunk updates one chunk's text. Re-indexing is intentionally
+// explicit via the document reindex endpoint so edits can be reviewed first.
+func (h *Handler) UpdateDocumentChunk(c *gin.Context) {
+	kbID, docID, chunkID := c.Param("id"), c.Param("docId"), c.Param("chunkId")
+	if _, ok := h.ensureKnowledgeBaseWriteAccess(c, kbID); !ok {
+		return
+	}
+	editor, ok := h.chunkRepo.(repository.ChunkEditor)
+	if !ok {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "chunk 编辑未启用"})
+		return
+	}
+	var req struct {
+		Content string `json:"content" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Content) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "content 不能为空"})
+		return
+	}
+	chunks, err := h.chunkRepo.GetByKnowledgeID(c.Request.Context(), docID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	belongs := false
+	for _, chunk := range chunks {
+		if chunk != nil && chunk.ID == chunkID && chunk.KnowledgeBaseID == kbID {
+			belongs = true
+			break
+		}
+	}
+	if !belongs {
+		c.JSON(http.StatusNotFound, gin.H{"error": "chunk 不存在"})
+		return
+	}
+	updated, err := editor.UpdateContent(c.Request.Context(), chunkID, req.Content)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"chunk": gin.H{
+		"id": updated.ID, "index": updated.ChunkIndex, "content": updated.Content,
+		"char_count": updated.ContentLength, "content_hash": updated.ContentHash,
+	}, "reindex_required": true})
+}
+
+func (h *Handler) ListChunkRevisions(c *gin.Context) {
+	if _, ok := h.ensureKnowledgeBaseAccess(c, c.Param("id")); !ok {
+		return
+	}
+	if !h.chunkBelongsToDocument(c, c.Param("id"), c.Param("docId"), c.Param("chunkId")) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "chunk 不存在"})
+		return
+	}
+	editor, ok := h.chunkRepo.(repository.ChunkEditor)
+	if !ok {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "chunk revision 未启用"})
+		return
+	}
+	revisions, err := editor.ListRevisions(c.Request.Context(), c.Param("chunkId"))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"revisions": revisions, "total": len(revisions)})
+}
+
+func (h *Handler) RestoreChunkRevision(c *gin.Context) {
+	if _, ok := h.ensureKnowledgeBaseWriteAccess(c, c.Param("id")); !ok {
+		return
+	}
+	if !h.chunkBelongsToDocument(c, c.Param("id"), c.Param("docId"), c.Param("chunkId")) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "chunk 不存在"})
+		return
+	}
+	editor, ok := h.chunkRepo.(repository.ChunkEditor)
+	if !ok {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "chunk revision 未启用"})
+		return
+	}
+	updated, err := editor.RestoreRevision(c.Request.Context(), c.Param("chunkId"), c.Param("revisionId"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"chunk": updated, "reindex_required": true})
+}
+
+func (h *Handler) chunkBelongsToDocument(c *gin.Context, kbID, docID, chunkID string) bool {
+	if h.chunkRepo == nil {
+		return false
+	}
+	chunks, err := h.chunkRepo.GetByKnowledgeID(c.Request.Context(), docID)
+	if err != nil {
+		return false
+	}
+	for _, chunk := range chunks {
+		if chunk != nil && chunk.ID == chunkID && chunk.KnowledgeBaseID == kbID {
+			return true
+		}
+	}
+	return false
+}
+
+// ReindexEditedChunk rebuilds only the selected chunk from its current stored
+// content, so a manual edit is not overwritten by re-parsing the source file.
+func (h *Handler) ReindexEditedChunk(c *gin.Context) {
+	kbID, docID, chunkID := c.Param("id"), c.Param("docId"), c.Param("chunkId")
+	if _, ok := h.ensureKnowledgeBaseWriteAccess(c, kbID); !ok {
+		return
+	}
+	if h.chunkRepo == nil || h.embedding == nil || h.vectorDB == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "向量索引组件未启用"})
+		return
+	}
+	chunks, err := h.chunkRepo.GetByKnowledgeID(c.Request.Context(), docID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	var target *repository.Chunk
+	for _, chunk := range chunks {
+		if chunk != nil && chunk.ID == chunkID && chunk.KnowledgeBaseID == kbID {
+			target = chunk
+			break
+		}
+	}
+	if target == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "chunk 不存在"})
+		return
+	}
+	vectors, err := container.BatchEmbedFloat32(c.Request.Context(), h.embedding, []string{target.Content})
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("embedding 失败: %v", err)})
+		return
+	}
+	doc := &container.Document{ID: target.ID, Content: target.Content, Vector: vectors[0], Metadata: map[string]interface{}{
+		"knowledge_base_id": kbID, "knowledge_id": docID, "chunk_index": target.ChunkIndex,
+	}}
+	if err := h.vectorDB.Upsert(c.Request.Context(), []*container.Document{doc}); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"chunk_id": chunkID, "indexed": true})
+}
+
 // ReindexDocument 重新向量化文档（仅支持 URL 来源或文件仍存在的情况）
 func (h *Handler) ReindexDocument(c *gin.Context) {
 	kbID := c.Param("id")
@@ -3400,11 +3550,9 @@ func (h *Handler) incrementalSync(ctx context.Context, kbID, knowledgeID, filena
 		sort.Ints(addIndices)
 		addDocs := make([]*container.Document, len(addIndices))
 		addContents := make([]string, len(addIndices))
-		batchPrefix := time.Now().UnixNano()
-
 		for j, idx := range addIndices {
 			ch := newChunks[idx]
-			chunkID := fmt.Sprintf("%s_chunk_%d_%d", kbID, batchPrefix, idx)
+			chunkID := uuid.NewString()
 			addDocs[j] = &container.Document{
 				ID:      chunkID,
 				Content: ch.Content,

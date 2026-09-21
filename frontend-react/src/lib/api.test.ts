@@ -60,4 +60,20 @@ describe('ApiClient', () => {
 
     expect(events).toEqual([{ type: 'delta', content: 'Hi' }, { type: 'done' }]);
   });
+
+  it('supports JSON PATCH requests for chunk edits', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      json: async () => ({ reindex_required: true }),
+    });
+    const client = new ApiClient({ baseUrl: '/api/v1', fetcher: fetchMock });
+
+    await expect(client.patch('/knowledge-bases/kb/documents/doc/chunks/chunk', { content: 'updated' })).resolves.toEqual({ reindex_required: true });
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/knowledge-bases/kb/documents/doc/chunks/chunk', expect.objectContaining({
+      method: 'PATCH',
+      body: JSON.stringify({ content: 'updated' }),
+    }));
+  });
 });

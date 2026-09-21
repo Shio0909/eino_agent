@@ -60,6 +60,28 @@ export interface DocumentListResponse {
   total: number;
 }
 
+export interface Chunk {
+  id: string;
+  index: number;
+  content: string;
+  char_count?: number;
+  content_hash?: string;
+}
+
+export interface ChunkListResponse {
+  chunks: Chunk[];
+  total: number;
+}
+
+export interface ChunkRevision {
+  id: string;
+  chunk_id: string;
+  content: string;
+  content_hash: string;
+  reason?: string;
+  created_at?: string;
+}
+
 export interface ImportStatus {
   status: string;
   stage?: string;

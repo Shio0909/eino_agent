@@ -3,10 +3,12 @@ package repository
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/pgvector/pgvector-go"
 
@@ -274,6 +276,24 @@ type ChunkRepository interface {
 	GetHashesByKnowledgeID(ctx context.Context, knowledgeID string) (map[string]string, error) // content_hash → chunk_id
 	DeleteByIDs(ctx context.Context, ids []string) error
 	DeleteByKnowledgeID(ctx context.Context, knowledgeID string) error
+}
+
+// ChunkEditor provides the optional manual-edit surface for chunk iteration.
+// It is separate from ChunkRepository so existing ingestion implementations do
+// not need to support revisions immediately.
+type ChunkEditor interface {
+	UpdateContent(ctx context.Context, id, content string) (*Chunk, error)
+	ListRevisions(ctx context.Context, chunkID string) ([]*ChunkRevision, error)
+	RestoreRevision(ctx context.Context, chunkID, revisionID string) (*Chunk, error)
+}
+
+type ChunkRevision struct {
+	ID          string    `json:"id"`
+	ChunkID     string    `json:"chunk_id"`
+	Content     string    `json:"content"`
+	ContentHash string    `json:"content_hash"`
+	Reason      string    `json:"reason"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // EmbeddingRepository 向量嵌入仓储接口
@@ -827,16 +847,16 @@ func (r *pgChunkRepo) BatchCreate(ctx context.Context, chunks []*Chunk) error {
 
 	for _, chunk := range chunks {
 		if chunk.ID == "" {
-			chunk.ID = fmt.Sprintf("%s_%d", chunk.KnowledgeID, chunk.ChunkIndex)
+			chunk.ID = uuid.NewString()
 		}
 		metadata, _ := json.Marshal(chunk.Metadata)
 
 		err := r.db.QueryRow(ctx, `
-			INSERT INTO chunks (knowledge_id, knowledge_base_id, chunk_index, content, content_length, content_hash, metadata)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			INSERT INTO chunks (id, knowledge_id, knowledge_base_id, chunk_index, content, content_length, content_hash, metadata)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 			ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, metadata = EXCLUDED.metadata
 			RETURNING id, created_at
-		`, chunk.KnowledgeID, chunk.KnowledgeBaseID, chunk.ChunkIndex, chunk.Content, len(chunk.Content), chunk.ContentHash, metadata).
+		`, chunk.ID, chunk.KnowledgeID, chunk.KnowledgeBaseID, chunk.ChunkIndex, chunk.Content, len(chunk.Content), chunk.ContentHash, metadata).
 			Scan(&chunk.ID, &chunk.CreatedAt)
 		if err != nil {
 			return fmt.Errorf("插入 chunk %d 失败: %w", chunk.ChunkIndex, err)
@@ -867,6 +887,56 @@ func (r *pgChunkRepo) GetByKnowledgeID(ctx context.Context, knowledgeID string) 
 		result = append(result, c)
 	}
 	return result, rows.Err()
+}
+
+func (r *pgChunkRepo) UpdateContent(ctx context.Context, id, content string) (*Chunk, error) {
+	contentHash := fmt.Sprintf("%x", sha256.Sum256([]byte(content)))
+	var previous, previousHash string
+	if err := r.db.QueryRow(ctx, `SELECT content, content_hash FROM chunks WHERE id = $1`, id).Scan(&previous, &previousHash); err != nil {
+		return nil, fmt.Errorf("读取原 chunk 失败: %w", err)
+	}
+	if err := r.db.Exec(ctx, `INSERT INTO chunk_revisions (chunk_id, content, content_hash, reason) VALUES ($1, $2, $3, $4)`, id, previous, previousHash, "manual_edit"); err != nil {
+		return nil, fmt.Errorf("保存 chunk revision 失败: %w", err)
+	}
+	chunk := &Chunk{}
+	var metaRaw []byte
+	err := r.db.QueryRow(ctx, `
+		UPDATE chunks SET content = $2, content_length = $3, content_hash = $4
+		WHERE id = $1
+		RETURNING id, knowledge_id, knowledge_base_id, chunk_index, content, content_length, content_hash, metadata, created_at
+	`, id, content, len(content), contentHash).Scan(
+		&chunk.ID, &chunk.KnowledgeID, &chunk.KnowledgeBaseID, &chunk.ChunkIndex,
+		&chunk.Content, &chunk.ContentLength, &chunk.ContentHash, &metaRaw, &chunk.CreatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("更新 chunk 失败: %w", err)
+	}
+	_ = json.Unmarshal(metaRaw, &chunk.Metadata)
+	return chunk, nil
+}
+
+func (r *pgChunkRepo) ListRevisions(ctx context.Context, chunkID string) ([]*ChunkRevision, error) {
+	rows, err := r.db.Query(ctx, `SELECT id, chunk_id, content, content_hash, reason, created_at FROM chunk_revisions WHERE chunk_id = $1 ORDER BY created_at DESC`, chunkID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*ChunkRevision
+	for rows.Next() {
+		rev := &ChunkRevision{}
+		if err := rows.Scan(&rev.ID, &rev.ChunkID, &rev.Content, &rev.ContentHash, &rev.Reason, &rev.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, rev)
+	}
+	return out, rows.Err()
+}
+
+func (r *pgChunkRepo) RestoreRevision(ctx context.Context, chunkID, revisionID string) (*Chunk, error) {
+	var content string
+	if err := r.db.QueryRow(ctx, `SELECT content FROM chunk_revisions WHERE id = $1 AND chunk_id = $2`, revisionID, chunkID).Scan(&content); err != nil {
+		return nil, fmt.Errorf("读取 chunk revision 失败: %w", err)
+	}
+	return r.UpdateContent(ctx, chunkID, content)
 }
 
 func (r *pgChunkRepo) DeleteByKnowledgeID(ctx context.Context, knowledgeID string) error {

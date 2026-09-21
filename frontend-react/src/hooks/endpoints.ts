@@ -1,5 +1,5 @@
 import { api } from '../lib/api';
-import type { AuthResponse, ChatResponse, DocumentListResponse, GraphData, ImportStatus, KnowledgeBase, KnowledgeBaseListResponse, MCPStatus, Message, RequestTrace, Session, SettingsResponse, User, WikiPage, WikiPageListResponse } from '../types/api';
+import type { AuthResponse, ChatResponse, ChunkListResponse, ChunkRevision, DocumentListResponse, GraphData, ImportStatus, KnowledgeBase, KnowledgeBaseListResponse, MCPStatus, Message, RequestTrace, Session, SettingsResponse, User, WikiPage, WikiPageListResponse } from '../types/api';
 
 export const endpoints = {
   me: () => api.get<{ user: User }>('/auth/me'),
@@ -7,6 +7,12 @@ export const endpoints = {
   knowledgeBases: () => api.get<KnowledgeBaseListResponse>('/knowledge-bases?page_size=100'),
   createKnowledgeBase: (input: Pick<KnowledgeBase, 'name' | 'description' | 'mode'>) => api.post<KnowledgeBase>('/knowledge-bases', input),
   documents: (kbId: string) => api.get<DocumentListResponse>(`/knowledge-bases/${kbId}/documents?page_size=50`),
+  chunks: (kbId: string, docId: string) => api.get<ChunkListResponse>(`/knowledge-bases/${kbId}/documents/${docId}/chunks`),
+  updateChunk: (kbId: string, docId: string, chunkId: string, content: string) => api.patch(`/knowledge-bases/${kbId}/documents/${docId}/chunks/${chunkId}`, { content }),
+  reindexDocument: (kbId: string, docId: string) => api.post(`/knowledge-bases/${kbId}/documents/${docId}/reindex`, {}),
+  reindexChunk: (kbId: string, docId: string, chunkId: string) => api.post(`/knowledge-bases/${kbId}/documents/${docId}/chunks/${chunkId}/reindex`, {}),
+  chunkRevisions: (kbId: string, docId: string, chunkId: string) => api.get<{ revisions: ChunkRevision[] }>(`/knowledge-bases/${kbId}/documents/${docId}/chunks/${chunkId}/revisions`),
+  restoreChunkRevision: (kbId: string, docId: string, chunkId: string, revisionId: string) => api.post(`/knowledge-bases/${kbId}/documents/${docId}/chunks/${chunkId}/revisions/${revisionId}/restore`, {}),
   uploadDocument: (kbId: string, file: File) => api.upload(`/knowledge-bases/${kbId}/documents`, file),
   importUrl: (kbId: string, url: string, title: string) => api.post(`/knowledge-bases/${kbId}/documents/url`, { url, title }),
   documentStatus: (kbId: string, docId: string) => api.get<ImportStatus>(`/knowledge-bases/${kbId}/documents/${docId}/status`),
