@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -322,7 +323,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 
 		eval := protected.Group("/eval")
 		{
-			eval.GET("/reports", h.ListEvalReports)
+		eval.GET("/reports", h.ListEvalReports)
+		eval.GET("/reports/:name", h.GetEvalReport)
 		}
 
 		// GraphRAG 管理
@@ -3157,59 +3159,31 @@ func (h *Handler) UpdateDocumentChunk(c *gin.Context) {
 }
 
 func (h *Handler) ListChunkRevisions(c *gin.Context) {
-	if _, ok := h.ensureKnowledgeBaseAccess(c, c.Param("id")); !ok {
-		return
-	}
-	if !h.chunkBelongsToDocument(c, c.Param("id"), c.Param("docId"), c.Param("chunkId")) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "chunk 不存在"})
-		return
-	}
+	if _, ok := h.ensureKnowledgeBaseAccess(c, c.Param("id")); !ok { return }
+	if !h.chunkBelongsToDocument(c, c.Param("id"), c.Param("docId"), c.Param("chunkId")) { c.JSON(http.StatusNotFound, gin.H{"error": "chunk 不存在"}); return }
 	editor, ok := h.chunkRepo.(repository.ChunkEditor)
-	if !ok {
-		c.JSON(http.StatusNotImplemented, gin.H{"error": "chunk revision 未启用"})
-		return
-	}
+	if !ok { c.JSON(http.StatusNotImplemented, gin.H{"error": "chunk revision 未启用"}); return }
 	revisions, err := editor.ListRevisions(c.Request.Context(), c.Param("chunkId"))
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+	if err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()}); return }
 	c.JSON(http.StatusOK, gin.H{"revisions": revisions, "total": len(revisions)})
 }
 
 func (h *Handler) RestoreChunkRevision(c *gin.Context) {
-	if _, ok := h.ensureKnowledgeBaseWriteAccess(c, c.Param("id")); !ok {
-		return
-	}
-	if !h.chunkBelongsToDocument(c, c.Param("id"), c.Param("docId"), c.Param("chunkId")) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "chunk 不存在"})
-		return
-	}
+	if _, ok := h.ensureKnowledgeBaseWriteAccess(c, c.Param("id")); !ok { return }
+	if !h.chunkBelongsToDocument(c, c.Param("id"), c.Param("docId"), c.Param("chunkId")) { c.JSON(http.StatusNotFound, gin.H{"error": "chunk 不存在"}); return }
 	editor, ok := h.chunkRepo.(repository.ChunkEditor)
-	if !ok {
-		c.JSON(http.StatusNotImplemented, gin.H{"error": "chunk revision 未启用"})
-		return
-	}
+	if !ok { c.JSON(http.StatusNotImplemented, gin.H{"error": "chunk revision 未启用"}); return }
 	updated, err := editor.RestoreRevision(c.Request.Context(), c.Param("chunkId"), c.Param("revisionId"))
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-		return
-	}
+	if err != nil { c.JSON(http.StatusNotFound, gin.H{"error": err.Error()}); return }
 	c.JSON(http.StatusOK, gin.H{"chunk": updated, "reindex_required": true})
 }
 
 func (h *Handler) chunkBelongsToDocument(c *gin.Context, kbID, docID, chunkID string) bool {
-	if h.chunkRepo == nil {
-		return false
-	}
+	if h.chunkRepo == nil { return false }
 	chunks, err := h.chunkRepo.GetByKnowledgeID(c.Request.Context(), docID)
-	if err != nil {
-		return false
-	}
+	if err != nil { return false }
 	for _, chunk := range chunks {
-		if chunk != nil && chunk.ID == chunkID && chunk.KnowledgeBaseID == kbID {
-			return true
-		}
+		if chunk != nil && chunk.ID == chunkID && chunk.KnowledgeBaseID == kbID { return true }
 	}
 	return false
 }
@@ -3218,40 +3192,25 @@ func (h *Handler) chunkBelongsToDocument(c *gin.Context, kbID, docID, chunkID st
 // content, so a manual edit is not overwritten by re-parsing the source file.
 func (h *Handler) ReindexEditedChunk(c *gin.Context) {
 	kbID, docID, chunkID := c.Param("id"), c.Param("docId"), c.Param("chunkId")
-	if _, ok := h.ensureKnowledgeBaseWriteAccess(c, kbID); !ok {
-		return
-	}
+	if _, ok := h.ensureKnowledgeBaseWriteAccess(c, kbID); !ok { return }
 	if h.chunkRepo == nil || h.embedding == nil || h.vectorDB == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "向量索引组件未启用"})
 		return
 	}
 	chunks, err := h.chunkRepo.GetByKnowledgeID(c.Request.Context(), docID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+	if err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()}); return }
 	var target *repository.Chunk
 	for _, chunk := range chunks {
-		if chunk != nil && chunk.ID == chunkID && chunk.KnowledgeBaseID == kbID {
-			target = chunk
-			break
-		}
+		if chunk != nil && chunk.ID == chunkID && chunk.KnowledgeBaseID == kbID { target = chunk; break }
 	}
-	if target == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "chunk 不存在"})
-		return
-	}
+	if target == nil { c.JSON(http.StatusNotFound, gin.H{"error": "chunk 不存在"}); return }
 	vectors, err := container.BatchEmbedFloat32(c.Request.Context(), h.embedding, []string{target.Content})
-	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("embedding 失败: %v", err)})
-		return
-	}
+	if err != nil { c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("embedding 失败: %v", err)}); return }
 	doc := &container.Document{ID: target.ID, Content: target.Content, Vector: vectors[0], Metadata: map[string]interface{}{
 		"knowledge_base_id": kbID, "knowledge_id": docID, "chunk_index": target.ChunkIndex,
 	}}
 	if err := h.vectorDB.Upsert(c.Request.Context(), []*container.Document{doc}); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()}); return
 	}
 	c.JSON(http.StatusOK, gin.H{"chunk_id": chunkID, "indexed": true})
 }
@@ -4793,7 +4752,7 @@ func (h *Handler) ListEvalReports(c *gin.Context) {
 
 	reports := make([]EvalReportView, 0)
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".md") {
+		if entry.IsDir() || !(strings.HasSuffix(strings.ToLower(entry.Name()), ".md") || strings.HasSuffix(strings.ToLower(entry.Name()), ".json")) {
 			continue
 		}
 		info, err := entry.Info()
@@ -4816,6 +4775,25 @@ func (h *Handler) ListEvalReports(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"reports": reports})
+}
+
+func (h *Handler) GetEvalReport(c *gin.Context) {
+	name := filepath.Base(c.Param("name"))
+	if name != c.Param("name") || !(strings.HasSuffix(strings.ToLower(name), ".md") || strings.HasSuffix(strings.ToLower(name), ".json")) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "非法报告名称"})
+		return
+	}
+	path := filepath.Join("docs", "eval_reports", name)
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) { c.JSON(http.StatusNotFound, gin.H{"error": "报告不存在"}); return }
+	if err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()}); return }
+	if strings.HasSuffix(strings.ToLower(name), ".json") {
+		var report any
+		if err := json.Unmarshal(data, &report); err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": "报告 JSON 无效"}); return }
+		c.JSON(http.StatusOK, gin.H{"name": name, "report": report})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"name": name, "content": string(data)})
 }
 
 // GetSystemInfo 获取系统信息

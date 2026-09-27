@@ -1,10 +1,11 @@
-import { BookOpen, Bot, Database, GitBranch, Settings2 } from 'lucide-react';
+import { BarChart3, BookOpen, Bot, Database, GitBranch, Settings2 } from 'lucide-react';
 import { clsx } from 'clsx';
 import type { AppView } from '../../store/workspace';
 
 const navItems: Array<{ id: AppView; label: string; description: string; icon: typeof Bot }> = [
   { id: 'chat', label: 'Chat', description: '问答与证据流', icon: Bot },
   { id: 'knowledge', label: 'Knowledge', description: '知识库与导入', icon: Database },
+  { id: 'evaluation', label: 'Evaluation', description: '评测与回归', icon: BarChart3 },
   { id: 'wiki', label: 'Wiki', description: '页面浏览与搜索', icon: BookOpen },
   { id: 'graph', label: 'Graph', description: '实体关系与来源图谱', icon: GitBranch },
 ];

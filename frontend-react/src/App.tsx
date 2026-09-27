@@ -10,6 +10,7 @@ import { KnowledgePage } from './pages/KnowledgePage';
 import { WikiPageView } from './pages/WikiPageView';
 import { GraphPage } from './pages/GraphPage';
 import { SettingsPage } from './pages/SettingsPage';
+import { EvaluationPage } from './pages/EvaluationPage';
 import { LoginPage } from './pages/LoginPage';
 import type { ReferenceDocument, TraceStep } from './types/api';
 
@@ -57,6 +58,7 @@ export function App() {
         <div className="min-h-0 flex-1">
           {view === 'chat' ? <ChatPage onEvidence={updateEvidence} mode={chatMode} forceCitation={forceCitation} /> : null}
           {view === 'knowledge' ? <KnowledgePage /> : null}
+          {view === 'evaluation' ? <EvaluationPage /> : null}
           {view === 'wiki' ? <WikiPageView /> : null}
           {view === 'graph' ? <GraphPage /> : null}
           {view === 'settings' ? <SettingsPage mode={chatMode} forceCitation={forceCitation} evidenceOptions={evidenceOptions} onModeChange={setChatMode} onForceCitationChange={setForceCitation} onEvidenceOptionsChange={setEvidenceOptions} /> : null}

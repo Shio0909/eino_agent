@@ -17,10 +17,12 @@ import (
 )
 
 type EvalSample struct {
-	ID       string   `json:"id"`
-	Question string   `json:"question"`
-	GoldDocs []string `json:"gold_docs,omitempty"`
-	Category string   `json:"category,omitempty"`
+	ID             string   `json:"id"`
+	Question       string   `json:"question"`
+	GoldDocs       []string `json:"gold_docs,omitempty"`
+	Category       string   `json:"category,omitempty"`
+	ExpectedTools  []string `json:"expected_tools,omitempty"`
+	ForbiddenTools []string `json:"forbidden_tools,omitempty"`
 }
 
 type loginRequest struct {
@@ -55,19 +57,36 @@ type chatResponse struct {
 	References []reference `json:"references,omitempty"`
 	Sources    []source    `json:"sources,omitempty"`
 	LatencyMs  int64       `json:"latency_ms"`
+	Trace      []traceStep `json:"trace,omitempty"`
+}
+
+type traceStep struct {
+	Type      string `json:"type"`
+	ToolName  string `json:"tool_name,omitempty"`
+	ToolInput string `json:"tool_input,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
 type sampleResult struct {
-	ID               string
-	Category         string
-	LatencyMs        int64
-	Recall           float64
-	Precision        float64
-	Hit              float64
-	MRR              float64
-	NDCG             float64
-	RetrievalLabeled bool
-	Error            string
+	ID                   string
+	Category             string
+	LatencyMs            int64
+	Recall               float64
+	Precision            float64
+	Hit                  float64
+	MRR                  float64
+	NDCG                 float64
+	RetrievalLabeled     bool
+	Error                string
+	ToolCalls            int
+	ToolLabeled          bool
+	ExpectedToolsLabeled bool
+	ExpectedToolsHit     bool
+	ForbiddenToolCalls   int
+	InvalidToolArguments int
+	RepeatedToolCalls    int
+	ToolErrors           int
+	ToolBehaviorPassed   bool
 }
 
 func main() {
@@ -81,6 +100,8 @@ func main() {
 	timeoutSec := flag.Int("timeout", 60, "单请求超时（秒）")
 	reportPath := flag.String("report", "", "报告输出路径（默认为 docs/eval_reports/<timestamp>.md）")
 	strategy := flag.String("strategy", "", "检索策略: vector|hybrid|hybrid_rerank|full (通过 API 自动切换)")
+	revisionID := flag.String("revision-id", "", "关联的 Chunk revision ID（可选）")
+	experimentID := flag.String("experiment-id", "", "实验 ID（可选）")
 	noRAG := flag.Bool("no-rag", false, "No-RAG baseline：传入不存在的知识库 ID，LLM 纯靠自身知识回答")
 	flag.Parse()
 
@@ -140,7 +161,7 @@ func main() {
 	if *noRAG {
 		reportStrategy = "no-rag"
 	}
-	report := buildReport(*mode, reportStrategy, *baseURL, results)
+	report := buildReport(*mode, reportStrategy, *baseURL, *revisionID, *experimentID, results)
 	out := *reportPath
 	if strings.TrimSpace(out) == "" {
 		out = filepath.Join("docs", "eval_reports", time.Now().Format("20060102_150405")+".md")
@@ -277,6 +298,8 @@ func applyStrategy(client *http.Client, baseURL, bearer, strategy string) error 
 
 func runSample(client *http.Client, baseURL, bearer, mode string, sample EvalSample, knowledgeBaseIDs []string) sampleResult {
 	result := sampleResult{ID: sample.ID, Category: sample.Category}
+	result.ToolLabeled = sample.ExpectedTools != nil || sample.ForbiddenTools != nil
+	result.ExpectedToolsLabeled = sample.ExpectedTools != nil
 	request := chatRequest{Message: sample.Question, KnowledgeBaseIDs: knowledgeBaseIDs}
 	switch mode {
 	case "agentic":
@@ -321,6 +344,7 @@ func runSample(client *http.Client, baseURL, bearer, mode string, sample EvalSam
 		latency = time.Since(started).Milliseconds()
 	}
 	result.LatencyMs = latency
+	applyToolMetrics(&result, sample, cr.Trace)
 	refs := make([]reference, 0, len(cr.References)+len(cr.Sources))
 	refs = append(refs, cr.References...)
 	for _, src := range cr.Sources {
@@ -467,13 +491,35 @@ func parseCSVList(raw string) []string {
 	return out
 }
 
-func buildReport(mode, strategy, baseURL string, results []sampleResult) string {
+func buildReport(mode, strategy, baseURL, revisionID, experimentID string, results []sampleResult) string {
 	latencies := make([]int64, 0, len(results))
 	var recallSum, precisionSum, hitSum, mrrSum, ndcgSum float64
 	errCount := 0
 	retrievalLabeled := 0
+	toolLabeled := 0
+	toolHit := 0
+	forbiddenCalls := 0
+	expectedLabeled, behaviorPassed := 0, 0
+	totalCalls, invalidArgs, repeatedCalls, toolErrors := 0, 0, 0, 0
 
 	for _, r := range results {
+		if r.ToolLabeled {
+			toolLabeled++
+		}
+		if r.ExpectedToolsLabeled {
+			expectedLabeled++
+			if r.Error == "" && r.ExpectedToolsHit {
+				toolHit++
+			}
+		}
+		if r.ToolBehaviorPassed && r.Error == "" {
+			behaviorPassed++
+		}
+		forbiddenCalls += r.ForbiddenToolCalls
+		totalCalls += r.ToolCalls
+		invalidArgs += r.InvalidToolArguments
+		repeatedCalls += r.RepeatedToolCalls
+		toolErrors += r.ToolErrors
 		if r.Error != "" {
 			errCount++
 			continue
@@ -516,6 +562,12 @@ func buildReport(mode, strategy, baseURL string, results []sampleResult) string 
 		b.WriteString(fmt.Sprintf("- 策略: %s\n", strategy))
 	}
 	b.WriteString(fmt.Sprintf("- 服务: %s\n", strings.TrimRight(baseURL, "/")))
+	if revisionID != "" {
+		b.WriteString(fmt.Sprintf("- Chunk Revision: %s\n", revisionID))
+	}
+	if experimentID != "" {
+		b.WriteString(fmt.Sprintf("- Experiment: %s\n", experimentID))
+	}
 	b.WriteString(fmt.Sprintf("- 样本数: %d\n\n", len(results)))
 
 	b.WriteString("## 总体指标\n\n")
@@ -530,21 +582,45 @@ func buildReport(mode, strategy, baseURL string, results []sampleResult) string 
 	b.WriteString(fmt.Sprintf("- Error Rate: %.4f\n", errorRate))
 	b.WriteString(fmt.Sprintf("- Retrieval标注样本: %d\n", retrievalLabeled))
 	b.WriteString(fmt.Sprintf("- Retrieval标注覆盖率: %.2f%%\n\n", 100*float64(retrievalLabeled)/float64(max(1, len(results)-errCount))))
+	b.WriteString(fmt.Sprintf("- Tool 评测覆盖样本: %d\n", toolLabeled))
+	if expectedLabeled > 0 {
+		b.WriteString(fmt.Sprintf("- Tool 必需工具覆盖/无需调用通过率: %.4f (%d/%d)\n", float64(toolHit)/float64(expectedLabeled), toolHit, expectedLabeled))
+	} else {
+		b.WriteString("- Tool 必需工具覆盖/无需调用通过率: N/A（未标注）\n")
+	}
+	if toolLabeled > 0 {
+		b.WriteString(fmt.Sprintf("- Tool 行为约束通过率: %.4f (%d/%d)\n", float64(behaviorPassed)/float64(toolLabeled), behaviorPassed, toolLabeled))
+	} else {
+		b.WriteString("- Tool 行为约束通过率: N/A（未标注）\n")
+	}
+	b.WriteString(fmt.Sprintf("- Tool 调用尝试次数（仅 action）: %d\n", totalCalls))
+	b.WriteString(fmt.Sprintf("- 非法 JSON 对象参数次数: %d\n", invalidArgs))
+	b.WriteString(fmt.Sprintf("- 相同工具/参数重复尝试: %d\n", repeatedCalls))
+	b.WriteString(fmt.Sprintf("- Tool observation 错误次数: %d\n", toolErrors))
+	b.WriteString(fmt.Sprintf("- 禁止工具调用次数: %d\n\n", forbiddenCalls))
 
 	if retrievalLabeled == 0 {
 		b.WriteString("> ⚠️ 当前评测集中未提供 gold_docs，Recall/Precision/Hit/MRR/nDCG 仅为占位值，不可用于检索效果结论。\n\n")
 	}
 
 	b.WriteString("## 明细\n\n")
-	b.WriteString("| id | category | latency_ms | recall | precision | hit | mrr | ndcg | retrieval_labeled | status |\n")
-	b.WriteString("|---|---|---:|---:|---:|---:|---:|---:|---:|---|\n")
+	b.WriteString("> Tool 行为统计 v2：只统计 action；expected_tools 全部必需，显式 [] 表示不应调用工具。缺省字段不评分。工具命中不等于答案正确或任务完成。\n\n")
+	b.WriteString("| id | category | latency_ms | recall | precision | hit | mrr | ndcg | tool_calls | expected_tool | forbidden_calls | invalid_json | tool_errors | behavior_pass | status |\n")
+	b.WriteString("|---|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---|---|\n")
 	for _, r := range results {
 		status := "ok"
 		if r.Error != "" {
 			status = "error"
 		}
-		b.WriteString(fmt.Sprintf("| %s | %s | %d | %.3f | %.3f | %.0f | %.3f | %.3f | %t | %s |\n",
-			r.ID, r.Category, r.LatencyMs, r.Recall, r.Precision, r.Hit, r.MRR, r.NDCG, r.RetrievalLabeled, status))
+		expected, behavior := "N/A", "N/A"
+		if r.ExpectedToolsLabeled {
+			expected = fmt.Sprint(r.ExpectedToolsHit && r.Error == "")
+		}
+		if r.ToolLabeled {
+			behavior = fmt.Sprint(r.ToolBehaviorPassed && r.Error == "")
+		}
+		b.WriteString(fmt.Sprintf("| %s | %s | %d | %.3f | %.3f | %.0f | %.3f | %.3f | %d | %s | %d | %d | %d | %s | %s |\n",
+			r.ID, r.Category, r.LatencyMs, r.Recall, r.Precision, r.Hit, r.MRR, r.NDCG, r.ToolCalls, expected, r.ForbiddenToolCalls, r.InvalidToolArguments, r.ToolErrors, behavior, status))
 	}
 
 	return b.String()

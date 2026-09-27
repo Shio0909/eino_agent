@@ -5,7 +5,9 @@ package container
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"math"
 
 	"github.com/cloudwego/eino-ext/components/embedding/openai"
 	einoembedding "github.com/cloudwego/eino/components/embedding"
@@ -16,6 +18,8 @@ import (
 // NewEmbeddingProvider 创建 Embedding 提供者
 func NewEmbeddingProvider(ctx context.Context, cfg *config.EmbeddingConfig) (einoembedding.Embedder, CleanupFunc, error) {
 	switch cfg.Provider {
+	case "hash", "local":
+		return newHashEmbedding(cfg.Dimensions), nil, nil
 	case "openai", "jina", "azure", "doubao", "qwen":
 		return newOpenAICompatibleEmbedding(ctx, cfg)
 	case "ollama":
@@ -25,15 +29,48 @@ func NewEmbeddingProvider(ctx context.Context, cfg *config.EmbeddingConfig) (ein
 	}
 }
 
+// hashEmbedder is a deterministic local baseline for smoke tests. It is not a
+// semantic embedding model and should not be used to report retrieval quality.
+type hashEmbedder struct{ dimensions int }
+
+func newHashEmbedding(dimensions int) *hashEmbedder {
+	if dimensions <= 0 { dimensions = 128 }
+	return &hashEmbedder{dimensions: dimensions}
+}
+
+func (e *hashEmbedder) EmbedStrings(_ context.Context, texts []string, _ ...einoembedding.Option) ([][]float64, error) {
+	result := make([][]float64, len(texts))
+	for i, text := range texts {
+		vector := make([]float64, e.dimensions)
+		digest := sha256.Sum256([]byte(text))
+		for j := range vector {
+			b := digest[j%len(digest)]
+			vector[j] = (float64(b)/127.5 - 1) * float64((j%7)+1)
+		}
+		var norm float64
+		for _, value := range vector { norm += value * value }
+		norm = math.Sqrt(norm)
+		if norm > 0 { for j := range vector { vector[j] /= norm } }
+		result[i] = vector
+	}
+	return result, nil
+}
+
 // newOpenAICompatibleEmbedding 创建 OpenAI 兼容的 Embedding
 func newOpenAICompatibleEmbedding(ctx context.Context, cfg *config.EmbeddingConfig) (einoembedding.Embedder, CleanupFunc, error) {
 	// 【Eino 特点】使用 eino-ext 的 OpenAI Embedding 组件
-	embedder, err := openai.NewEmbedder(ctx, &openai.EmbeddingConfig{
-		BaseURL:    cfg.BaseURL,
-		APIKey:     cfg.APIKey,
-		Model:      cfg.ModelID,
-		Dimensions: &cfg.Dimensions,
-	})
+	embedCfg := &openai.EmbeddingConfig{
+		BaseURL: cfg.BaseURL,
+		APIKey:  cfg.APIKey,
+		Model:   cfg.ModelID,
+	}
+	// dimensions 是 OpenAI text-embedding-3 及之后的维度裁剪参数；BAAI/bge-m3
+	// 这类固定维度模型不接受它，下发会被直接拒绝（siliconflow code 20015）。
+	// 因此由配置的 send_dimensions 显式控制，并顺带挡住 0 维这种无意义取值。
+	if cfg.ShouldSendDimensions() && cfg.Dimensions > 0 {
+		embedCfg.Dimensions = &cfg.Dimensions
+	}
+	embedder, err := openai.NewEmbedder(ctx, embedCfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("创建 OpenAI Embedder 失败: %w", err)
 	}

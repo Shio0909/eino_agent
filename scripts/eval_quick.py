@@ -50,6 +50,17 @@ def safe_mean(values):
     return round(mean(clean), 6) if clean else None
 
 
+def percentile(values, p):
+    clean = sorted(v for v in values if v is not None)
+    if not clean:
+        return None
+    index = (len(clean) - 1) * p
+    lo, hi = math.floor(index), math.ceil(index)
+    if lo == hi:
+        return round(clean[lo], 2)
+    return round(clean[lo] + (clean[hi] - clean[lo]) * (index - lo), 2)
+
+
 def resolve_kb_ids(names_or_ids):
     """Resolve KB names to UUIDs by querying the API."""
     if not names_or_ids:
@@ -210,18 +221,26 @@ def main():
     ok_details = [d for d in details if d["status"] == "ok"]
     ar_mean = safe_mean([d.get("answer_relevancy") for d in details])
     f_mean = safe_mean([d.get("faithfulness") for d in details])
+    latency_values = [d["latency_ms"] for d in details]
+    latency_p50 = percentile(latency_values, 0.50)
+    latency_p95 = percentile(latency_values, 0.95)
     print(f"{'='*90}", flush=True)
-    print(f"MEAN:  Answer Relevancy = {ar_mean}  |  Faithfulness = {f_mean}", flush=True)
+    print(f"MEAN:  Answer Relevancy = {ar_mean}  |  Faithfulness = {f_mean}  |  Latency p50/p95 = {latency_p50}/{latency_p95}ms", flush=True)
     print(f"Samples: {len(samples)} total, {len(ok_details)} ok", flush=True)
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    out_path = OUT_DIR / f"{stamp}_pipeline_{rag_tag}_ragas.json"
+    run_tag = f"{chat_mode}_{rag_tag}"
+    out_path = OUT_DIR / f"{stamp}_{run_tag}_ragas.json"
     out_path.write_text(json.dumps({
-        "mode": f"pipeline_{rag_tag}",
+        "mode": chat_mode,
+        "retrieval": rag_tag,
+        "run_tag": run_tag,
         "dataset": DATASET_PATH.name,
         "samples": len(samples),
+        "config": settings,
         "answer_relevancy": ar_mean,
         "faithfulness": f_mean,
+        "latency_ms": {"p50": latency_p50, "p95": latency_p95},
         "details": details,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\nSaved: {out_path}", flush=True)

@@ -28,6 +28,8 @@ export const endpoints = {
   mcp: () => api.get<MCPStatus>('/mcp'),
   settings: () => api.get<SettingsResponse>('/settings'),
   systemInfo: () => api.get<Record<string, unknown>>('/system/info'),
+  evalReports: () => api.get<{ reports: Array<{ name: string; modified_at?: string; size?: number }> }>('/eval/reports'),
+  evalReport: (name: string) => api.get<{ name: string; report?: Record<string, unknown>; content?: string }>(`/eval/reports/${encodeURIComponent(name)}`),
   graphStatus: () => api.get<Record<string, unknown>>('/graphrag/status'),
   graph: (kbId: string, limit = 200) => api.get<GraphData>(`/graphrag/${kbId}/graph?limit=${limit}`),
 };

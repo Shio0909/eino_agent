@@ -139,6 +139,17 @@ type EmbeddingConfig struct {
 	APIKey     string `yaml:"api_key"`
 	ModelID    string `yaml:"model_id"`
 	Dimensions int    `yaml:"dimensions"`
+	// SendDimensions 控制是否把 dimensions 下发给 Embedding 接口。
+	// 用指针以区分「未配置」（nil，沿用旧行为：下发）与「显式关掉」（false）。
+	// BAAI/bge-m3 这类固定维度模型不接受该参数，下发会被直接拒绝
+	// （siliconflow 返回 code 20015）。
+	SendDimensions *bool `yaml:"send_dimensions"`
+}
+
+// ShouldSendDimensions 返回是否应把 dimensions 下发给 Embedding 接口。
+// 未显式配置时保持旧行为（下发），避免影响依赖该参数做维度裁剪的模型。
+func (c *EmbeddingConfig) ShouldSendDimensions() bool {
+	return c.SendDimensions == nil || *c.SendDimensions
 }
 
 // RerankerConfig Reranker 配置

@@ -20,6 +20,7 @@ llm:
     temperature: 0.7
     max_tokens: 4096
 embedding:
+    # openai/jina/... 用于真实语义检索；hash 仅用于无外部凭据的本地 smoke 回归
     provider: openai
     base_url: https://api.siliconflow.cn/v1
     api_key: your-embedding-api-key

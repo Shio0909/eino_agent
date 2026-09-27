@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 configs/config.yaml
+configs/*.bak*
 
 # AI 文档（面试材料、架构分析等）
 ai_docs/
