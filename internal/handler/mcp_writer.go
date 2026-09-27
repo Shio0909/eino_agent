@@ -16,7 +16,7 @@ import (
 )
 
 // MCPCreateKB creates a knowledge base via MCP write tool.
-func (h *Handler) MCPCreateKB(ctx context.Context, name, desc, mode string) (*repository.KnowledgeBase, error) {
+func (h *Handler) MCPCreateKB(ctx context.Context, tenantID int, name, desc, mode string) (*repository.KnowledgeBase, error) {
 	if h.kbRepo == nil {
 		return nil, fmt.Errorf("数据库未连接")
 	}
@@ -30,9 +30,12 @@ func (h *Handler) MCPCreateKB(ctx context.Context, name, desc, mode string) (*re
 		return nil, fmt.Errorf("mode 只能是 'vector' 或 'wiki'")
 	}
 
+	if tenantID <= 0 {
+		tenantID = h.cfg.Auth.AdminTenantID
+	}
 	dimensions := h.cfg.Embedding.Dimensions
 	kb := &repository.KnowledgeBase{
-		TenantID:            1,
+		TenantID:            tenantID,
 		Name:                name,
 		Description:         desc,
 		Mode:                mode,

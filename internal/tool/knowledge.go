@@ -146,10 +146,8 @@ func (t *KnowledgeTool) InvokableRun(ctx context.Context, input string, opts ...
 		if i >= t.topK {
 			break
 		}
+		// 真实相关度分数；未知时为 0，不伪造递减分数。
 		score := doc.Score()
-		if score == 0 {
-			score = 1.0 - float64(i)*0.1
-		}
 		content := doc.Content
 		if len(content) > t.maxContentPerDoc {
 			content = content[:t.maxContentPerDoc] + "..."

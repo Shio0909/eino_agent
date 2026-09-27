@@ -48,10 +48,11 @@ func (h *Handler) Login(c *gin.Context) {
 
 	role := ""
 	tenantID := 0
-	if h.cfg.Auth.AdminPassword != "" && req.Username == h.cfg.Auth.AdminUsername && req.Password == h.cfg.Auth.AdminPassword {
+	// 常量时间比较，避免凭据前缀的时序侧信道。
+	if credentialsMatch(req.Username, req.Password, h.cfg.Auth.AdminUsername, h.cfg.Auth.AdminPassword) {
 		role = "admin"
 		tenantID = h.cfg.Auth.AdminTenantID
-	} else if h.cfg.Auth.UserPassword != "" && req.Username == h.cfg.Auth.UserUsername && req.Password == h.cfg.Auth.UserPassword {
+	} else if credentialsMatch(req.Username, req.Password, h.cfg.Auth.UserUsername, h.cfg.Auth.UserPassword) {
 		role = "user"
 		tenantID = h.cfg.Auth.UserTenantID
 	}
@@ -89,6 +90,15 @@ func (h *Handler) Login(c *gin.Context) {
 			"tenant_id": tenantID,
 		},
 	})
+}
+
+func credentialsMatch(username, password, wantUsername, wantPassword string) bool {
+	if wantPassword == "" {
+		return false
+	}
+	uOK := subtle.ConstantTimeCompare([]byte(username), []byte(wantUsername)) == 1
+	pOK := subtle.ConstantTimeCompare([]byte(password), []byte(wantPassword)) == 1
+	return uOK && pOK
 }
 
 func (h *Handler) Me(c *gin.Context) {
@@ -240,7 +250,7 @@ func (h *Handler) parseToken(token string) (*tokenClaims, error) {
 		return nil, fmt.Errorf("token 缺少主体")
 	}
 	if claims.TenantID <= 0 {
-		claims.TenantID = 1
+		return nil, fmt.Errorf("token 缺少有效租户")
 	}
 	if claims.Role == "" {
 		claims.Role = "user"

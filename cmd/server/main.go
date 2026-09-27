@@ -70,14 +70,6 @@ func main() {
 	// 初始化结构化日志（slog）
 	logger.Init(cfg.Server.Mode)
 
-	// 安全校验：release 模式下禁止使用默认 JWT 密钥
-	if cfg.Auth.Enabled && cfg.Auth.JWTSecret == "change-me-in-production" && cfg.Server.Mode == "release" {
-		log.Fatal("[Config] JWT 密钥未配置！请在配置文件中设置 auth.jwt_secret")
-	}
-	if cfg.Auth.Enabled && cfg.Auth.AdminPassword == "" && cfg.Server.Mode == "release" {
-		log.Fatal("[Config] 管理员密码未配置！请设置 auth.admin_password 或 ADMIN_PASSWORD 环境变量")
-	}
-
 	log.Println("========================================")
 	log.Println("    Eino RAG Service - 知识库问答系统    ")
 	log.Println("    Powered by Eino + Gin + PostgreSQL  ")
@@ -139,7 +131,7 @@ func main() {
 				log.Printf("[Database] 连接失败（第 %d/5 次），%v 后重试: %v", attempt, wait, err)
 				time.Sleep(wait)
 			} else {
-				log.Printf("[Database] 连接失败（将使用内存存储）: %v", err)
+				log.Fatalf("[Database] 连接失败，已配置 PostgreSQL 时不会降级到内存存储: %v", err)
 			}
 		}
 		if db != nil {
@@ -345,12 +337,10 @@ func main() {
 			log.Printf("[GraphRAG] 初始化失败（将跳过图谱检索）: %v", err)
 		} else {
 			log.Println("[GraphRAG] 服务初始化完成")
-			// 将图谱检索器注入到 CompositeRetriever
+			// 图谱按知识库命名空间隔离，只注入工厂，由作用域检索器按 KB 创建，不注入全局图谱检索器。
 			if cr, ok := einoRetriever.(*container.CompositeRetriever); ok {
-				// 使用默认命名空间（查询时会通过 WithKnowledgeBaseScope 切换）
-				gr := graphRAGService.CreateGraphRetriever(&graphrag.NameSpace{}, 10)
-				cr.SetGraphRetriever(gr)
-				log.Println("[GraphRAG] 图谱检索器已注入 Retriever")
+				cr.SetGraphRetrieverFactory(graphRAGService)
+				log.Println("[GraphRAG] 图谱检索器工厂已注入 Retriever")
 			}
 		}
 	}
@@ -441,6 +431,9 @@ func main() {
 	if cfg.MCPExport.Enabled {
 		mcpExportServer := mcpmanager.NewServer(cfg, chatService, kbRepo)
 		mcpExportServer.SetApprovalManager(approvalManager)
+		if db != nil {
+			mcpExportServer.SetAccessControlRepository(repository.NewAccessControlRepository(db))
+		}
 
 		// 注入可选依赖
 		if graphRAGService != nil {
@@ -544,20 +537,21 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	// 优雅关闭
+	// 优雅关闭：先停止接收新请求并等待在途请求完成，再取消后台任务，最后由 defer 释放依赖。
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
 
-		log.Println("\n[Server] 正在关闭服务...")
-		cancel() // 通知所有使用 ctx 的 goroutine（MCP Export 等）退出
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		log.Println("[Server] 正在关闭服务...")
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer shutdownCancel()
-
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Printf("[Server] 服务关闭失败: %v", err)
 		}
+		cancel()
 	}()
 
 	// 启动服务
@@ -587,6 +581,7 @@ func main() {
 	if err := server.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("[Server] 服务启动失败: %v", err)
 	}
+	<-shutdownDone
 
 	log.Println("[Server] 服务已关闭")
 }

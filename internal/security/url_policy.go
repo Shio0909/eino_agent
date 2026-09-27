@@ -1,12 +1,15 @@
 package security
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"net/netip"
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 
 	"eino_agent/internal/config"
 )
@@ -55,6 +58,83 @@ func ValidateExternalURL(raw string, cfg config.URLPolicyConfig) (*url.URL, erro
 	}
 
 	return parsed, nil
+}
+
+// NewHTTPClient 返回带 SSRF 防护的 HTTP 客户端：
+// 每次连接在拨号时重新校验解析到的 IP（覆盖 DNS 重绑定与解析时间差），
+// 重定向目标同样按策略校验。
+func NewHTTPClient(policy config.URLPolicyConfig, timeout time.Duration) *http.Client {
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	maxRedirects := policy.MaxRedirects
+	if maxRedirects <= 0 {
+		maxRedirects = 5
+	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: NewCheckedTransport(policy),
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= maxRedirects {
+				return fmt.Errorf("重定向次数超过上限 %d", maxRedirects)
+			}
+			_, err := ValidateExternalURL(req.URL.String(), policy)
+			return err
+		},
+	}
+}
+
+// NewCheckedTransport 返回在拨号时校验目标 IP 的 Transport。
+func NewCheckedTransport(policy config.URLPolicyConfig) *http.Transport {
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           checkedDialContext(dialer, policy),
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
+}
+
+// checkedDialContext 在每次拨号前解析主机并逐个校验 IP，
+// 只连接通过策略的地址，防止校验与连接之间的 DNS 结果变化（rebinding）。
+func checkedDialContext(dialer *net.Dialer, policy config.URLPolicyConfig) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("地址非法: %w", err)
+		}
+		if policy.AllowPrivateNetworks {
+			return dialer.DialContext(ctx, network, addr)
+		}
+		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+		if err != nil {
+			return nil, fmt.Errorf("解析目标地址失败: %w", err)
+		}
+		var lastErr error
+		for _, ip := range ips {
+			netipAddr, ok := netip.AddrFromSlice(ip)
+			if !ok {
+				continue
+			}
+			if isPrivateOrLocal(netipAddr.Unmap()) {
+				lastErr = fmt.Errorf("目标地址 %s 属于私有或本地网络，已拒绝访问", ip)
+				continue
+			}
+			conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			return conn, nil
+		}
+		if lastErr == nil {
+			lastErr = fmt.Errorf("目标主机 %s 没有可用地址", host)
+		}
+		return nil, lastErr
+	}
 }
 
 func containsFold(items []string, want string) bool {

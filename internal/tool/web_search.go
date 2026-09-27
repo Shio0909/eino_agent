@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
@@ -60,9 +61,13 @@ func NewWebSearchTool(config *WebSearchConfig) *WebSearchTool {
 	if config.TavilyURL == "" {
 		config.TavilyURL = "https://api.tavily.com/search"
 	}
+	timeout := time.Duration(config.Timeout) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
 	return &WebSearchTool{
 		config: config,
-		client: &http.Client{},
+		client: &http.Client{Timeout: timeout},
 	}
 }
 
@@ -119,7 +124,7 @@ func (t *WebSearchTool) searchTavily(ctx context.Context, query string) (string,
 		return "", err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", t.config.TavilyURL, 
+	req, err := http.NewRequestWithContext(ctx, "POST", t.config.TavilyURL,
 		bytes.NewReader(jsonBody))
 	if err != nil {
 		return "", err

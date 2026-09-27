@@ -45,3 +45,49 @@ func TestLoadDotEnvDoesNotOverrideEnvironment(t *testing.T) {
 		t.Fatalf("LLM.APIKey = %q, want from-env", cfg.LLM.APIKey)
 	}
 }
+
+func validConfig(mode string) *Config {
+	cfg := &Config{}
+	cfg.Server.Mode = mode
+	setDefaults(cfg)
+	return cfg
+}
+
+func TestValidateRejectsDefaultJWTInRelease(t *testing.T) {
+	cfg := validConfig("release")
+	cfg.Auth.Enabled = true
+	cfg.Auth.AdminPassword = "a-strong-admin-password"
+	if _, err := cfg.Validate(); err == nil {
+		t.Fatal("expected default JWT secret to be rejected in release mode")
+	}
+}
+
+func TestValidateWarnsOnlyInDebug(t *testing.T) {
+	cfg := validConfig("debug")
+	cfg.Auth.Enabled = true
+	warnings, err := cfg.Validate()
+	if err != nil {
+		t.Fatalf("debug mode should only warn: %v", err)
+	}
+	if len(warnings) == 0 {
+		t.Fatal("expected warnings for weak auth config")
+	}
+}
+
+func TestValidateRejectsInvalidChunking(t *testing.T) {
+	cfg := validConfig("debug")
+	cfg.RAG.ChunkSize = 100
+	cfg.RAG.ChunkOverlap = 100
+	if _, err := cfg.Validate(); err == nil {
+		t.Fatal("expected chunk_overlap >= chunk_size to be rejected")
+	}
+}
+
+func TestValidateRejectsOpenMCPExportInRelease(t *testing.T) {
+	cfg := validConfig("release")
+	cfg.MCPExport.Enabled = true
+	cfg.MCPExport.Transport = "streamable_http"
+	if _, err := cfg.Validate(); err == nil {
+		t.Fatal("expected unauthenticated network MCP export to be rejected in release mode")
+	}
+}

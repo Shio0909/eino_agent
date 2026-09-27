@@ -17,8 +17,8 @@ import (
 
 // UnifiedRetriever 统一检索器，聚合 vector + wiki 两种来源
 type UnifiedRetriever struct {
-	vectorRetriever *CompositeRetriever           // 向量检索（可为 nil）
-	wikiRetriever   *WikiRetriever                // Wiki 全文检索（可为 nil）
+	vectorRetriever *CompositeRetriever                // 向量检索（可为 nil）
+	wikiRetriever   *WikiRetriever                     // Wiki 全文检索（可为 nil）
 	kbRepo          repository.KnowledgeBaseRepository // 用于查询 KB mode
 	topK            int
 }

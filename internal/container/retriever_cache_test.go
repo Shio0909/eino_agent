@@ -32,20 +32,32 @@ type fakeVectorDB struct {
 	keywordDocs        []*Document
 }
 
-func (f *fakeVectorDB) Upsert(context.Context, []*Document) error { return nil }
-func (f *fakeVectorDB) Delete(context.Context, []string) error    { return nil }
-func (f *fakeVectorDB) Close() error                              { return nil }
+func (f *fakeVectorDB) Upsert(context.Context, []*Document) error             { return nil }
+func (f *fakeVectorDB) Delete(context.Context, []string) error                { return nil }
+func (f *fakeVectorDB) Close() error                                          { return nil }
+func (f *fakeVectorDB) Ping(context.Context) error                            { return nil }
 func (f *fakeVectorDB) DeleteByKnowledgeID(context.Context, string) error     { return nil }
 func (f *fakeVectorDB) DeleteByKnowledgeBaseID(context.Context, string) error { return nil }
 
-func (f *fakeVectorDB) Search(context.Context, []float32, int) ([]*Document, error) {
+func (f *fakeVectorDB) Search(_ context.Context, _ []float32, _ int, filter SearchFilter) ([]*Document, error) {
 	f.searchCalls++
-	return cloneDocuments(f.docs), nil
+	return filterDocuments(f.docs, filter), nil
 }
 
-func (f *fakeVectorDB) SearchKeyword(context.Context, string, int) ([]*Document, error) {
+func (f *fakeVectorDB) SearchKeyword(_ context.Context, _ string, _ int, filter SearchFilter) ([]*Document, error) {
 	f.searchKeywordCalls++
-	return cloneDocuments(f.keywordDocs), nil
+	return filterDocuments(f.keywordDocs, filter), nil
+}
+
+func filterDocuments(docs []*Document, filter SearchFilter) []*Document {
+	filter = filter.Normalized()
+	out := make([]*Document, 0, len(docs))
+	for _, doc := range cloneDocuments(docs) {
+		if filter.Matches(doc) {
+			out = append(out, doc)
+		}
+	}
+	return out
 }
 
 type memoryRetrievalCache struct {

@@ -45,7 +45,13 @@ func (v *capturingVectorDB) Upsert(_ context.Context, docs []*container.Document
 	v.docs = append(v.docs, docs...)
 	return nil
 }
-func (v *capturingVectorDB) Search(context.Context, []float32, int) ([]*container.Document, error) {
+func (v *capturingVectorDB) Ping(context.Context) error { return nil }
+
+func (v *capturingVectorDB) SearchKeyword(context.Context, string, int, container.SearchFilter) ([]*container.Document, error) {
+	return nil, nil
+}
+
+func (v *capturingVectorDB) Search(context.Context, []float32, int, container.SearchFilter) ([]*container.Document, error) {
 	return nil, nil
 }
 func (v *capturingVectorDB) Delete(context.Context, []string) error                { return nil }

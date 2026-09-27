@@ -12,13 +12,17 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"eino_agent/internal/security"
 )
 
 // mineruEngine 通过 HTTP 调用 MinerU FastAPI 微服务完成文档解析。
 type mineruEngine struct {
 	endpoint   string
 	httpClient *http.Client
-	cfg        *Config
+	// dlClient 用于下载用户提供的 URL，带 SSRF 防护；与内部 MinerU 端点分开。
+	dlClient *http.Client
+	cfg      *Config
 }
 
 // mineruChunk 对应 FastAPI 服务返回的单个 chunk。
@@ -40,6 +44,7 @@ func newMineruEngine(cfg *Config) Engine {
 	return &mineruEngine{
 		endpoint:   strings.TrimRight(cfg.MinerUEndpoint, "/"),
 		httpClient: &http.Client{Timeout: timeout},
+		dlClient:   security.NewHTTPClient(buildURLPolicy(cfg), cfg.RequestTimeout),
 		cfg:        cfg,
 	}
 }
@@ -109,13 +114,16 @@ func (e *mineruEngine) ParseBytes(ctx context.Context, content []byte, fileName,
 
 // ParseURL 先下载 URL 内容，再调用 ParseBytes 解析。
 func (e *mineruEngine) ParseURL(ctx context.Context, rawURL, title string, opts *ParseOptions) (*ParseResult, error) {
+	if _, err := security.ValidateExternalURL(rawURL, buildURLPolicy(e.cfg)); err != nil {
+		return nil, fmt.Errorf("mineru: %w", err)
+	}
 	dlReq, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("mineru: build download request: %w", err)
 	}
 	dlReq.Header.Set("User-Agent", e.cfg.UserAgent)
 
-	dlResp, err := e.httpClient.Do(dlReq)
+	dlResp, err := e.dlClient.Do(dlReq)
 	if err != nil {
 		return nil, fmt.Errorf("mineru: download url: %w", err)
 	}

@@ -14,6 +14,7 @@ import (
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/retriever"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
 )
 
 // Service GraphRAG 服务
@@ -22,9 +23,15 @@ type Service struct {
 	extractor  *Extractor
 	chatModel  model.ChatModel
 	config     *Config
+
+	// driver 仅在 InitService 创建时由 Service 持有，Close 负责释放
+	driver    neo4j.DriverWithContext
+	closeOnce sync.Once
+	closeErr  error
 }
 
-// NewService 创建 GraphRAG 服务
+// NewService 创建 GraphRAG 服务。
+// repo 由调用方拥有：通过 NewService 构造的 Service 在 Close 时不会关闭 repo 背后的驱动。
 func NewService(cfg *Config, chatModel model.ChatModel, repo GraphRepository) *Service {
 	extractor := NewExtractor(chatModel, cfg.ExtractTemp)
 	return &Service{
@@ -45,10 +52,32 @@ func (s *Service) GetRepository() GraphRepository {
 	return s.repository
 }
 
+// Driver 返回 Service 持有的 Neo4j 驱动（NewService 构造时为 nil）。
+// 供其它组件（如代码图谱）复用同一连接池；驱动生命周期仍归 Service，调用方不得 Close。
+func (s *Service) Driver() neo4j.DriverWithContext {
+	if s == nil {
+		return nil
+	}
+	return s.driver
+}
+
+// Close 关闭 Service 持有的 Neo4j 驱动，可重复调用。
+func (s *Service) Close(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	s.closeOnce.Do(func() {
+		if s.driver != nil {
+			s.closeErr = s.driver.Close(ctx)
+		}
+	})
+	return s.closeErr
+}
+
 // BuildGraphRequest 构建图谱请求
 type BuildGraphRequest struct {
-	Namespace *NameSpace         // 图谱命名空间
-	Chunks    []*ChunkForGraph   // 文档 chunks
+	Namespace *NameSpace       // 图谱命名空间
+	Chunks    []*ChunkForGraph // 文档 chunks
 }
 
 // ChunkForGraph 用于图谱构建的 chunk
@@ -150,9 +179,9 @@ func (s *Service) DeleteGraph(ctx context.Context, namespace *NameSpace) error {
 
 // Status GraphRAG 状态
 type Status struct {
-	Enabled     bool   `json:"enabled"`
-	Neo4jURI    string `json:"neo4j_uri"`
-	Connected   bool   `json:"connected"`
+	Enabled   bool   `json:"enabled"`
+	Neo4jURI  string `json:"neo4j_uri"`
+	Connected bool   `json:"connected"`
 }
 
 // GetStatus 获取 GraphRAG 服务状态
@@ -165,7 +194,7 @@ func (s *Service) GetStatus() *Status {
 }
 
 // CreateGraphRetriever 创建图谱检索器
-// 返回的 Retriever 可直接插入 HybridRetriever.graphRetriever
+// 返回的 Retriever 可注入 container.CompositeRetriever 作为图谱信号源
 func (s *Service) CreateGraphRetriever(namespace *NameSpace, topK int) *GraphRetriever {
 	return NewGraphRetriever(&GraphRetrieverConfig{
 		Extractor:  s.extractor,
@@ -199,9 +228,9 @@ func (s *Service) SetExtractorUseLightForBuild(use bool) {
 }
 
 // InitService 初始化 GraphRAG 服务（工厂方法）
-// 从环境变量/配置创建完整的 GraphRAG 服务
+// 按传入配置创建 Neo4j 驱动与完整的 GraphRAG 服务；返回的 Service 拥有该驱动，调用方必须调用 Close。
 func InitService(ctx context.Context, cfg *Config, chatModel model.ChatModel) (*Service, error) {
-	if !cfg.Enabled {
+	if cfg == nil || !cfg.Enabled {
 		return nil, fmt.Errorf("GraphRAG 未启用")
 	}
 
@@ -211,8 +240,9 @@ func InitService(ctx context.Context, cfg *Config, chatModel model.ChatModel) (*
 		return nil, fmt.Errorf("初始化 Neo4j 失败: %w", err)
 	}
 
-	repo := NewNeo4jRepository(driver)
+	repo := NewNeo4jRepository(driver, WithMaxHops(cfg.MaxHops))
 	svc := NewService(cfg, chatModel, repo)
+	svc.driver = driver
 
 	// 确保 Neo4j 索引存在（加速实体名称查询）
 	if neoRepo, ok := repo.(*Neo4jRepository); ok {

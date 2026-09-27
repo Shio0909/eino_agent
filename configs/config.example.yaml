@@ -41,7 +41,8 @@ database:
     password: your-db-password
     dbname: eino_rag
     sslmode: disable
-    milvus_addr: ""
+    # embedding 维度变化时是否清空向量表（需重新索引）；默认拒绝启动以免误删
+    reset_vectors_on_dimension_change: false
 rag:
     top_k: 10
     enable_hybrid: true

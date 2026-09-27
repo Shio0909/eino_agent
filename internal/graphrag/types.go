@@ -13,10 +13,14 @@ import "context"
 
 // GraphNode 图谱节点 — 对应 Neo4j 中的 ENTITY 标签节点
 type GraphNode struct {
-	Name       string   `json:"name,omitempty"`        // 实体名称
-	Type       string   `json:"type,omitempty"`        // 实体类型（Technology/Concept/Component/Person 等）
-	Chunks     []string `json:"chunks,omitempty"`      // 关联的文档 Chunk IDs
-	Attributes []string `json:"attributes,omitempty"`  // 实体属性列表
+	Name       string   `json:"name,omitempty"`       // 实体名称
+	Type       string   `json:"type,omitempty"`       // 实体类型（Technology/Concept/Component/Person 等）
+	Chunks     []string `json:"chunks,omitempty"`     // 关联的文档 Chunk IDs
+	Attributes []string `json:"attributes,omitempty"` // 实体属性列表
+
+	// 以下字段仅在检索结果中填充
+	Hops   int     `json:"hops,omitempty"`   // 距最近的查询命中实体的跳数（0 = 直接命中）
+	Weight float64 `json:"weight,omitempty"` // 路径上关系权重之积（关系无 weight 属性时按 1.0 计）
 }
 
 // GraphRelation 图谱关系
@@ -90,6 +94,7 @@ type Config struct {
 	Neo4jUser   string  `yaml:"neo4j_user"`   // Neo4j 用户名
 	Neo4jPass   string  `yaml:"neo4j_pass"`   // Neo4j 密码
 	ExtractTemp float64 `yaml:"extract_temp"` // 实体抽取的 LLM 温度
+	MaxHops     int     `yaml:"max_hops"`     // 图增强检索的最大遍历跳数（1..3，0 表示默认 2）
 }
 
 // ── Repository 接口 ──

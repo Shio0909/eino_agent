@@ -34,7 +34,9 @@ func NewEmbeddingProvider(ctx context.Context, cfg *config.EmbeddingConfig) (ein
 type hashEmbedder struct{ dimensions int }
 
 func newHashEmbedding(dimensions int) *hashEmbedder {
-	if dimensions <= 0 { dimensions = 128 }
+	if dimensions <= 0 {
+		dimensions = 128
+	}
 	return &hashEmbedder{dimensions: dimensions}
 }
 
@@ -48,9 +50,15 @@ func (e *hashEmbedder) EmbedStrings(_ context.Context, texts []string, _ ...eino
 			vector[j] = (float64(b)/127.5 - 1) * float64((j%7)+1)
 		}
 		var norm float64
-		for _, value := range vector { norm += value * value }
+		for _, value := range vector {
+			norm += value * value
+		}
 		norm = math.Sqrt(norm)
-		if norm > 0 { for j := range vector { vector[j] /= norm } }
+		if norm > 0 {
+			for j := range vector {
+				vector[j] /= norm
+			}
+		}
 		result[i] = vector
 	}
 	return result, nil

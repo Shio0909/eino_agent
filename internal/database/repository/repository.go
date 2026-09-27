@@ -852,11 +852,13 @@ func (r *pgChunkRepo) BatchCreate(ctx context.Context, chunks []*Chunk) error {
 		metadata, _ := json.Marshal(chunk.Metadata)
 
 		err := r.db.QueryRow(ctx, `
-			INSERT INTO chunks (id, knowledge_id, knowledge_base_id, chunk_index, content, content_length, content_hash, metadata)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-			ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, metadata = EXCLUDED.metadata
+			INSERT INTO chunks (id, knowledge_id, knowledge_base_id, chunk_index, content, content_length, content_hash, metadata, start_pos, end_pos)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content, content_length = EXCLUDED.content_length,
+				content_hash = EXCLUDED.content_hash, metadata = EXCLUDED.metadata,
+				chunk_index = EXCLUDED.chunk_index, start_pos = EXCLUDED.start_pos, end_pos = EXCLUDED.end_pos
 			RETURNING id, created_at
-		`, chunk.ID, chunk.KnowledgeID, chunk.KnowledgeBaseID, chunk.ChunkIndex, chunk.Content, len(chunk.Content), chunk.ContentHash, metadata).
+		`, chunk.ID, chunk.KnowledgeID, chunk.KnowledgeBaseID, chunk.ChunkIndex, chunk.Content, len(chunk.Content), chunk.ContentHash, metadata, chunk.StartPos, chunk.EndPos).
 			Scan(&chunk.ID, &chunk.CreatedAt)
 		if err != nil {
 			return fmt.Errorf("插入 chunk %d 失败: %w", chunk.ChunkIndex, err)

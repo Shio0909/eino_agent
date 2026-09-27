@@ -173,8 +173,9 @@ type DatabaseConfig struct {
 	DBName   string `yaml:"dbname"`
 	SSLMode  string `yaml:"sslmode"`
 
-	// Milvus (可选)
-	MilvusAddr string `yaml:"milvus_addr"`
+	// ResetVectorsOnDimensionChange 为 true 时，embedding 维度变化会清空向量表（需要重新索引）；
+	// 默认 false，维度不一致时拒绝启动，防止误删数据。
+	ResetVectorsOnDimensionChange bool `yaml:"reset_vectors_on_dimension_change"`
 }
 
 // RAGConfig RAG 配置
@@ -434,11 +435,12 @@ func Load(path string) (*Config, error) {
 	// 设置默认值
 	setDefaults(&cfg)
 
-	// 安全校验
-	if warnings := cfg.Validate(); len(warnings) > 0 {
-		for _, w := range warnings {
-			log.Printf("[Config] ⚠️  %s", w)
-		}
+	warnings, err := cfg.Validate()
+	for _, w := range warnings {
+		log.Printf("[Config] WARNING: %s", w)
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	return &cfg, nil
@@ -462,6 +464,8 @@ func Save(path string, cfg *Config) error {
 	return nil
 }
 
+const defaultJWTSecret = "change-me-in-production"
+
 // weakPasswords 常见弱密码集合
 var weakPasswords = map[string]bool{
 	"":          true,
@@ -477,36 +481,50 @@ var weakPasswords = map[string]bool{
 	"test123":   true,
 }
 
-// Validate 校验配置安全性，返回警告列表
-func (cfg *Config) Validate() []string {
-	var warnings []string
+// Validate 校验配置。warnings 仅提示；返回的 error 表示配置不安全或不可用，调用方必须拒绝启动。
+// release 模式下认证相关的弱配置视为错误，debug 模式下降级为警告。
+func (cfg *Config) Validate() (warnings []string, err error) {
+	var errs []string
+	release := cfg.Server.Mode == "release"
+	report := func(msg string, fatalInRelease bool) {
+		if fatalInRelease && release {
+			errs = append(errs, msg)
+			return
+		}
+		warnings = append(warnings, msg)
+	}
 
 	if cfg.Auth.Enabled {
-		if cfg.Auth.JWTSecret == "change-me-in-production" || len(cfg.Auth.JWTSecret) < 16 {
-			warnings = append(warnings, "JWT secret 过短或为默认值，请设置至少 16 字符的随机密钥")
+		if cfg.Auth.JWTSecret == defaultJWTSecret || len(cfg.Auth.JWTSecret) < 16 {
+			report("auth.jwt_secret 过短或为默认值，请设置至少 16 字符的随机密钥", true)
 		}
 		if cfg.Auth.AdminPassword == "" {
-			warnings = append(warnings, "auth.admin_password 未配置，认证登录将失败。请在配置文件或 ADMIN_PASSWORD 环境变量中设置")
+			report("auth.admin_password 未配置（可通过 ADMIN_PASSWORD 环境变量设置）", true)
 		} else if weakPasswords[cfg.Auth.AdminPassword] {
-			warnings = append(warnings, "auth.admin_password 使用了弱密码，请设置更强的密码")
+			report("auth.admin_password 使用了弱密码", true)
 		}
-		if cfg.Auth.UserPassword == "" {
-			warnings = append(warnings, "auth.user_password 未配置。请在配置文件或 USER_PASSWORD 环境变量中设置")
-		} else if weakPasswords[cfg.Auth.UserPassword] {
-			warnings = append(warnings, "auth.user_password 使用了弱密码，请设置更强的密码")
+		if cfg.Auth.UserPassword != "" && weakPasswords[cfg.Auth.UserPassword] {
+			report("auth.user_password 使用了弱密码", true)
 		}
+	} else if release {
+		warnings = append(warnings, "release 模式未启用认证（auth.enabled=false），所有接口可匿名访问")
 	}
 
-	if cfg.Server.Mode == "release" {
-		if cfg.Auth.JWTSecret == "change-me-in-production" {
-			warnings = append(warnings, "[FATAL] Release 模式下禁止使用默认 JWT 密钥")
-		}
-		if !cfg.Auth.Enabled {
-			warnings = append(warnings, "Release 模式建议启用认证（auth.enabled: true）")
-		}
+	if cfg.RAG.ChunkOverlap >= cfg.RAG.ChunkSize {
+		errs = append(errs, fmt.Sprintf("rag.chunk_overlap(%d) 必须小于 rag.chunk_size(%d)", cfg.RAG.ChunkOverlap, cfg.RAG.ChunkSize))
+	}
+	if cfg.Embedding.Dimensions <= 0 {
+		errs = append(errs, "embedding.dimensions 必须大于 0")
+	}
+	if cfg.MCPExport.Enabled && cfg.MCPExport.Transport != "stdio" &&
+		len(cfg.MCPExport.APIKeys) == 0 && len(cfg.MCPExport.APIKeyScopes) == 0 {
+		report("mcp_export 通过网络暴露但未配置 api_keys/api_key_scopes，任何人可调用检索工具", true)
 	}
 
-	return warnings
+	if len(errs) > 0 {
+		return warnings, fmt.Errorf("配置校验失败:\n  - %s", strings.Join(errs, "\n  - "))
+	}
+	return warnings, nil
 }
 
 // setDefaults 设置默认值
@@ -522,7 +540,7 @@ func setDefaults(cfg *Config) {
 	}
 
 	if cfg.Auth.JWTSecret == "" {
-		cfg.Auth.JWTSecret = "change-me-in-production"
+		cfg.Auth.JWTSecret = defaultJWTSecret
 	}
 	if cfg.Auth.AccessTokenExpireMinutes == 0 {
 		cfg.Auth.AccessTokenExpireMinutes = 120
@@ -678,6 +696,9 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.ImportQueue.PrefetchCount == 0 {
 		cfg.ImportQueue.PrefetchCount = 1
+	}
+	if cfg.ImportQueue.StateTTLMinutes == 0 {
+		cfg.ImportQueue.StateTTLMinutes = 1440
 	}
 
 	if cfg.HITL.ApprovalTimeoutSeconds == 0 {

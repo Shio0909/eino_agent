@@ -3,10 +3,11 @@ package codegraph
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
+
+	"eino_agent/internal/neo4jutil"
 )
 
 // CodeGraphRepository 代码知识图谱存储接口
@@ -38,11 +39,11 @@ type CodeGraphRepository interface {
 
 // RepoOverview 仓库图谱概览统计
 type RepoOverview struct {
-	Repo       string         `json:"repo"`
-	FileCount  int            `json:"file_count"`
-	EntityCount int           `json:"entity_count"`
-	RelationCount int         `json:"relation_count"`
-	TypeCounts map[string]int `json:"type_counts"`
+	Repo          string         `json:"repo"`
+	FileCount     int            `json:"file_count"`
+	EntityCount   int            `json:"entity_count"`
+	RelationCount int            `json:"relation_count"`
+	TypeCounts    map[string]int `json:"type_counts"`
 }
 
 // Neo4jCodeGraphRepo Neo4j 实现
@@ -50,7 +51,8 @@ type Neo4jCodeGraphRepo struct {
 	driver neo4j.DriverWithContext
 }
 
-// NewNeo4jCodeGraphRepo 创建 Neo4j 代码图谱存储
+// NewNeo4jCodeGraphRepo 创建 Neo4j 代码图谱存储。
+// 驱动由调用方拥有并负责 Close（cmd/server 中与 GraphRAG 共享同一驱动）。
 func NewNeo4jCodeGraphRepo(driver neo4j.DriverWithContext) CodeGraphRepository {
 	return &Neo4jCodeGraphRepo{driver: driver}
 }
@@ -58,33 +60,43 @@ func NewNeo4jCodeGraphRepo(driver neo4j.DriverWithContext) CodeGraphRepository {
 // label 为节点添加仓库标签前缀，与文档图谱隔离
 func codeLabel(repo string, entityType EntityType) string {
 	// 使用 CODE_ 前缀 + 仓库名避免与文档图谱冲突
-	safeRepo := strings.ReplaceAll(repo, "-", "_")
-	safeRepo = strings.ReplaceAll(safeRepo, ".", "_")
-	return fmt.Sprintf("CODE_%s_%s", safeRepo, entityType)
+	return "CODE_" + sanitizeLabelPart(repo) + "_" + string(entityType)
 }
 
 func codeFileLabel(repo string) string {
-	safeRepo := strings.ReplaceAll(repo, "-", "_")
-	safeRepo = strings.ReplaceAll(safeRepo, ".", "_")
-	return fmt.Sprintf("CODE_%s_File", safeRepo)
+	return "CODE_" + sanitizeLabelPart(repo) + "_File"
+}
+
+func sanitizeLabelPart(repo string) string {
+	safe := strings.ReplaceAll(repo, "-", "_")
+	return strings.ReplaceAll(safe, ".", "_")
+}
+
+// qualifiedNodePattern 生成实体匹配模式：QualifiedName 只在包内唯一，带上 file_path 时按文件消歧
+func qualifiedNodePattern(label, filePath string) string {
+	if filePath != "" {
+		return fmt.Sprintf("(n:%s {qualified_name: $qname, file_path: $filePath})", neo4jutil.QuoteIdentifier(label))
+	}
+	return fmt.Sprintf("(n:%s {qualified_name: $qname})", neo4jutil.QuoteIdentifier(label))
 }
 
 func (r *Neo4jCodeGraphRepo) UpsertFile(ctx context.Context, repo string, filePath string, hash string) error {
-	session := r.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	session := neo4jutil.WriteSession(ctx, r.driver)
 	defer session.Close(ctx)
 
-	label := codeFileLabel(repo)
 	cypher := fmt.Sprintf(`
 		MERGE (f:%s {path: $path})
 		SET f.hash = $hash, f.repo = $repo, f.updated_at = datetime()
-	`, label)
+	`, neo4jutil.QuoteIdentifier(codeFileLabel(repo)))
 
-	_, err := session.Run(ctx, cypher, map[string]any{
+	if err := neo4jutil.Exec(ctx, session, cypher, map[string]any{
 		"path": filePath,
 		"hash": hash,
 		"repo": repo,
-	})
-	return err
+	}); err != nil {
+		return fmt.Errorf("codegraph: upsert file %s: %w", filePath, err)
+	}
+	return nil
 }
 
 func (r *Neo4jCodeGraphRepo) UpsertEntities(ctx context.Context, repo string, entities []CodeEntity) error {
@@ -92,25 +104,26 @@ func (r *Neo4jCodeGraphRepo) UpsertEntities(ctx context.Context, repo string, en
 		return nil
 	}
 
-	session := r.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	session := neo4jutil.WriteSession(ctx, r.driver)
 	defer session.Close(ctx)
 
 	for _, e := range entities {
 		label := codeLabel(repo, e.Type)
+		// qualified_name 只在包内唯一，用 file_path 消歧避免跨包同名实体被合并
 		cypher := fmt.Sprintf(`
-			MERGE (n:%s {qualified_name: $qname})
+			MERGE (n:%s {qualified_name: $qname, file_path: $filePath})
 			SET n.name = $name,
-				n.file_path = $filePath,
 				n.line_start = $lineStart,
 				n.line_end = $lineEnd,
 				n.params = $params,
 				n.return_type = $returnType,
 				n.decorators = $decorators,
 				n.class_name = $className,
+				n.package = $package,
 				n.repo = $repo
-		`, label)
+		`, neo4jutil.QuoteIdentifier(label))
 
-		_, err := session.Run(ctx, cypher, map[string]any{
+		params := map[string]any{
 			"qname":      e.QualifiedName,
 			"name":       e.Name,
 			"filePath":   e.FilePath,
@@ -120,36 +133,42 @@ func (r *Neo4jCodeGraphRepo) UpsertEntities(ctx context.Context, repo string, en
 			"returnType": e.ReturnType,
 			"decorators": e.Decorators,
 			"className":  e.ClassName,
+			"package":    e.Package,
 			"repo":       repo,
-		})
-		if err != nil {
-			log.Printf("[codegraph] upsert entity %s error: %v", e.QualifiedName, err)
+		}
+		if err := neo4jutil.Exec(ctx, session, cypher, params); err != nil {
+			return fmt.Errorf("codegraph: upsert entity %s (%s): %w", e.QualifiedName, e.FilePath, err)
 		}
 
 		// 创建 File → DEFINES → Entity 关系
-		fileLabel := codeFileLabel(repo)
 		relCypher := fmt.Sprintf(`
 			MATCH (f:%s {path: $filePath})
-			MATCH (n:%s {qualified_name: $qname})
+			MATCH (n:%s {qualified_name: $qname, file_path: $filePath})
 			MERGE (f)-[:DEFINES]->(n)
-		`, fileLabel, label)
-		_, _ = session.Run(ctx, relCypher, map[string]any{
+		`, neo4jutil.QuoteIdentifier(codeFileLabel(repo)), neo4jutil.QuoteIdentifier(label))
+		if err := neo4jutil.Exec(ctx, session, relCypher, map[string]any{
 			"filePath": e.FilePath,
 			"qname":    e.QualifiedName,
-		})
+		}); err != nil {
+			return fmt.Errorf("codegraph: link file %s defines %s: %w", e.FilePath, e.QualifiedName, err)
+		}
 
-		// Method 属于 Class 的 CONTAINS 关系
+		// Method 属于 Class 的 CONTAINS 关系（Go 方法可与类型定义不同文件，按包消歧）
 		if e.Type == EntityMethod && e.ClassName != "" {
 			classLabel := codeLabel(repo, EntityClass)
 			containsCypher := fmt.Sprintf(`
-				MATCH (c:%s {qualified_name: $className})
-				MATCH (m:%s {qualified_name: $qname})
+				MATCH (c:%s {qualified_name: $className, package: $package})
+				MATCH (m:%s {qualified_name: $qname, file_path: $filePath})
 				MERGE (c)-[:CONTAINS]->(m)
-			`, classLabel, label)
-			_, _ = session.Run(ctx, containsCypher, map[string]any{
+			`, neo4jutil.QuoteIdentifier(classLabel), neo4jutil.QuoteIdentifier(label))
+			if err := neo4jutil.Exec(ctx, session, containsCypher, map[string]any{
 				"className": e.ClassName,
 				"qname":     e.QualifiedName,
-			})
+				"filePath":  e.FilePath,
+				"package":   e.Package,
+			}); err != nil {
+				return fmt.Errorf("codegraph: link class %s contains %s: %w", e.ClassName, e.QualifiedName, err)
+			}
 		}
 	}
 

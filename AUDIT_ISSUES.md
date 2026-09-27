@@ -4,6 +4,28 @@
 > 范围：全项目（~36K 行 Go），从架构分层、eino 框架用法、代码优雅度、数据/基础设施与安全四个角度
 > 优先级：P0 安全/数据（必须立刻修）→ P1 诚信（边际成本极低）→ P2 重构（真正的大改）→ P3 优雅度收尾
 
+## 修复进度（2026-09-27，分支 refactor/overhaul）
+
+**Phase 1 已完成（P0 全部 + P1 大部分）：**
+
+| 条目 | 状态 | 说明 |
+| --- | --- | --- |
+| P0-1 MCP 越权 | ✅ 已修 | `authorizeKnowledgeBase` 做租户归属/共享角色校验（viewer/editor/admin 分级）；裸 API Key 显式 scope 且永不获得管理工具；未配置 key 的网络传输降为只读默认 scope；KB 列表无全局回落 |
+| P0-2 向量检索隔离 | ✅ 已修 | `rag_vectors` 增加 `knowledge_base_id`/`knowledge_id` 生成列+索引，检索过滤下推到 SQL（HNSW ef_search 提升 + pgvector≥0.8 iterative scan）；删除"捞 5000 再内存过滤"；kbRepo 不可用时 fail-closed |
+| P0-3 导入可靠性 | ✅ 已修 | RabbitMQ：publisher confirm、失败重试（Attempt 计数）、DLQ、断线自动重连；chunk ID 改为确定性（knowledgeID+序号+内容哈希 UUIDv5）；写入前清理旧 chunk；PG chunks 与向量写入失败均返回错误触发重试 |
+| P0-4 Neo4j driver 泄漏 | ✅ 已修 | `graphrag.Service` 增加 `Close()` 并持有 driver；新增 `internal/neo4jutil` |
+| P0-5 配置校验 | ✅ 已修 | `Validate()` 在 release 模式下对弱 JWT/弱密码/无 key 的网络 MCP export 直接拒绝启动；移除 Neo4j 硬编码密码与环境变量旁路；Tavily key 优先走配置层；登录改常量时间比较；import state TTL 默认值 1440 |
+| P0-6 健康检查/关闭 | ✅ 已修 | `/health` 并发真探测 PG/向量库/Redis（必需依赖失败返回 503），新增 `/health/live`；关闭顺序改为先排空 HTTP 再取消后台任务再释放依赖；PG 配置后连接失败不再静默降级内存库 |
+| P1-1 检索造假 | ✅ 大部分已修 | 本地 reranker 换成真 BM25（CJK 二元组切分）；jina/cohere/bge 按 provider 预设端点，未知 provider 报错；删除 Milvus 空壳配置；knowledge 工具不再伪造递减分数（schema.Document 带真实 score）；GraphRAG 变长遍历（1..3 跳、确定性排序）；codegraph callee 解析 + CONTAINS/DEFINES 边落地 |
+| P1-1 维度变更误删 | ✅ 已修 | embedding 维度与向量表不一致时默认拒绝启动，显式 `reset_vectors_on_dimension_change: true` 才清空重建 |
+| SSRF | ✅ 已修 | `security.NewHTTPClient`：拨号时校验解析 IP（防 DNS rebinding）+ 重定向校验；接入 docreader local/mineru 与 handler 直接抓取路径；MinerU ParseURL 补上 URL 策略校验 |
+| Prompt Guard | ✅ 已修 | 匹配前做零宽字符/全角规范化，并对疑似 base64 片段解码后二次匹配 |
+| P1-2 demo 硬编码、P1-3 注释造假 | ⏳ Phase 2 | 涉及 pipeline/rag.go、service/chat.go、prompt/repo_manager 的条目随 Phase 2 编排重写一并清除 |
+
+原始清单如下，保留作对照。
+
+---
+
 ## 总判断
 
 项目根本问题：**这是一个"为跑通单一 demo"构建的项目，却穿着"产品"和"eino 框架"两件外衣。** ReAct 那条线（`StreamToolCallChecker` 定制、adk skill 白名单）证明作者真懂 eino 内部——但核心检索能力大量造假，安全有可利用的跨租户越权，eino 在编排层几乎没用上。

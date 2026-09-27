@@ -1,9 +1,11 @@
 package security
 
 import (
+	"encoding/base64"
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // RiskLevel 表示输入风险等级。
@@ -119,8 +121,22 @@ func EvaluatePromptRiskWithConfig(input string, cfg GuardConfig) PromptDecision 
 	runtimeRules = append(runtimeRules, buildConfiguredRules(cfg.HighRiskPatterns, severityHigh, "high")...)
 	runtimeRules = append(runtimeRules, buildConfiguredRules(cfg.MediumRiskPatterns, severityMedium, "medium")...)
 
+	// 规范化 + base64 解码后的候选文本，抵御零宽字符/全角/编码绕过。
+	candidates := []string{text}
+	if normalized := normalizeForMatching(text); normalized != text {
+		candidates = append(candidates, normalized)
+	}
+	candidates = append(candidates, decodeBase64Segments(text)...)
+
 	for _, rule := range runtimeRules {
-		if !rule.re.MatchString(text) {
+		ruleMatched := false
+		for _, candidate := range candidates {
+			if rule.re.MatchString(candidate) {
+				ruleMatched = true
+				break
+			}
+		}
+		if !ruleMatched {
 			continue
 		}
 		matched = append(matched, rule.name)
@@ -149,6 +165,73 @@ func EvaluatePromptRiskWithConfig(input string, cfg GuardConfig) PromptDecision 
 	}
 
 	return decision
+}
+
+// normalizeForMatching 去除零宽字符、全角转半角、折叠连续空白。
+func normalizeForMatching(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	lastSpace := false
+	for _, r := range s {
+		switch {
+		case r == '\u200b' || r == '\u200c' || r == '\u200d' || r == '\u2060' || r == '\ufeff':
+			// 零宽字符，直接丢弃
+			continue
+		case r >= '\uff01' && r <= '\uff5e':
+			// 全角 ASCII 转半角
+			r -= 0xfee0
+		case r == '\u3000':
+			r = ' '
+		}
+		if unicode.IsSpace(r) {
+			if lastSpace {
+				continue
+			}
+			lastSpace = true
+			b.WriteRune(' ')
+			continue
+		}
+		lastSpace = false
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+var base64TokenRe = regexp.MustCompile(`[A-Za-z0-9+/]{16,}={0,2}`)
+
+// decodeBase64Segments 解码文本中疑似 base64 的片段，返回可读的解码结果（最多 4 段）。
+func decodeBase64Segments(s string) []string {
+	matches := base64TokenRe.FindAllString(s, 8)
+	out := make([]string, 0, 4)
+	for _, m := range matches {
+		var decoded []byte
+		var err error
+		for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+			if decoded, err = enc.DecodeString(m); err == nil {
+				break
+			}
+		}
+		if err != nil || !isPrintableText(decoded) {
+			continue
+		}
+		out = append(out, string(decoded))
+		if len(out) >= 4 {
+			break
+		}
+	}
+	return out
+}
+
+func isPrintableText(b []byte) bool {
+	if len(b) == 0 || len(b) > 4096 {
+		return false
+	}
+	for _, r := range string(b) {
+		if r == unicode.ReplacementChar || (!unicode.IsPrint(r) && !unicode.IsSpace(r)) {
+			return false
+		}
+	}
+	return true
 }
 
 func buildConfiguredRules(patterns []string, severity ruleSeverity, prefix string) []promptRule {

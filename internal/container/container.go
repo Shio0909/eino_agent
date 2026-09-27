@@ -47,12 +47,15 @@ type RerankerProvider interface {
 // VectorDBProvider 向量数据库提供者接口
 type VectorDBProvider interface {
 	Upsert(ctx context.Context, docs []*Document) error
-	Search(ctx context.Context, vector []float32, topK int) ([]*Document, error)
+	// Search / SearchKeyword 必须在存储层执行 filter，调用方不再做二次过滤。
+	Search(ctx context.Context, vector []float32, topK int, filter SearchFilter) ([]*Document, error)
+	SearchKeyword(ctx context.Context, query string, topK int, filter SearchFilter) ([]*Document, error)
 	Delete(ctx context.Context, ids []string) error
 	// DeleteByKnowledgeID 删除指定文档的所有向量 chunk
 	DeleteByKnowledgeID(ctx context.Context, knowledgeID string) error
 	// DeleteByKnowledgeBaseID 删除指定知识库的所有向量 chunk
 	DeleteByKnowledgeBaseID(ctx context.Context, kbID string) error
+	Ping(ctx context.Context) error
 	Close() error
 }
 

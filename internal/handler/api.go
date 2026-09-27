@@ -5,8 +5,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	einoembedding "github.com/cloudwego/eino/components/embedding"
@@ -51,6 +52,8 @@ type Handler struct {
 	chatService      *service.ChatService
 	embedding        einoembedding.Embedder
 	vectorDB         container.VectorDBProvider
+	fetchClientOnce  sync.Once
+	fetchClient      *http.Client
 	docReaderCli     *docreader.Client
 	db               *postgres.DB
 	mcpMgr           *mcpmanager.Manager
@@ -226,6 +229,8 @@ func NewHandler(
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	// 健康检查
 	r.GET("/health", h.HealthCheck)
+	r.GET("/health/live", h.LivenessCheck)
+	r.GET("/health/ready", h.HealthCheck)
 
 	// API v1
 	v1 := r.Group("/api/v1")
@@ -323,8 +328,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 
 		eval := protected.Group("/eval")
 		{
-		eval.GET("/reports", h.ListEvalReports)
-		eval.GET("/reports/:name", h.GetEvalReport)
+			eval.GET("/reports", h.ListEvalReports)
+			eval.GET("/reports/:name", h.GetEvalReport)
 		}
 
 		// GraphRAG 管理
@@ -352,35 +357,6 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	legacy.Use(h.AuthRequired())
 	legacy.POST("/chat", h.Chat)
 	legacy.POST("/chat/stream", h.ChatStream)
-}
-
-// HealthCheck 健康检查
-// @Summary 健康检查
-// @Description 检查服务及各组件状态
-// @Tags 系统
-// @Produce json
-// @Success 200 {object} map[string]interface{}
-// @Router /health [get]
-func (h *Handler) HealthCheck(c *gin.Context) {
-	status := gin.H{
-		"status":    "ok",
-		"timestamp": time.Now().Format(time.RFC3339),
-		"version":   "1.0.0",
-		"components": gin.H{
-			"llm":          h.chatService != nil,
-			"embedding":    h.embedding != nil,
-			"vectordb":     h.vectorDB != nil,
-			"database":     h.db != nil,
-			"docreader":    h.docReaderCli != nil,
-			"redis":        h.redisClient != nil && h.redisClient.Status(c.Request.Context()).Available,
-			"import_queue": h.importQueue != nil,
-			"graphrag":     h.graphRAGService != nil,
-		},
-	}
-	if h.redisClient != nil {
-		status["redis"] = h.redisClient.Status(c.Request.Context())
-	}
-	c.JSON(http.StatusOK, status)
 }
 
 // ── GraphRAG Endpoints ──
@@ -1056,7 +1032,9 @@ func (h *Handler) ensureKnowledgeBaseRole(c *gin.Context, id string, required re
 
 func (h *Handler) resolveAuthorizedKnowledgeBaseIDs(c *gin.Context, requested []string) ([]string, bool) {
 	if h.kbRepo == nil {
-		return requested, true
+		// 无数据库时不存在任何知识库记录，fail-closed：返回空范围而不是放行。
+		log.Printf("[Security] kbRepo 不可用，知识库授权解析为空范围")
+		return []string{}, true
 	}
 
 	seen := make(map[string]struct{}, len(requested))
@@ -2324,6 +2302,14 @@ func (h *Handler) uploadWikiDocument(c *gin.Context, kb *repository.KnowledgeBas
 	})
 }
 
+// fetchHTTPClient 返回带 SSRF 防护（拨号时校验 IP + 重定向校验）的 HTTP 客户端。
+func (h *Handler) fetchHTTPClient() *http.Client {
+	h.fetchClientOnce.Do(func() {
+		h.fetchClient = security.NewHTTPClient(h.cfg.Security.URLPolicy, 60*time.Second)
+	})
+	return h.fetchClient
+}
+
 // contentHash 计算内容的 SHA256 哈希
 func contentHash(content string) string {
 	return contentHashBytes([]byte(content))
@@ -2332,6 +2318,26 @@ func contentHash(content string) string {
 func contentHashBytes(content []byte) string {
 	h := sha256.Sum256(content)
 	return hex.EncodeToString(h[:])
+}
+
+// deterministicChunkID 基于文档 ID、序号与内容生成稳定的 chunk ID，使重复导入/重试幂等。
+func deterministicChunkID(knowledgeID string, index int, content string) string {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(fmt.Sprintf("%s:%d:%s", knowledgeID, index, contentHash(content)))).String()
+}
+
+// resetKnowledgeChunks 在全量写入前清理该文档已有的 chunk 与向量，避免重试或重建时残留旧数据。
+func (h *Handler) resetKnowledgeChunks(ctx context.Context, knowledgeID string) error {
+	if h.chunkRepo != nil {
+		if err := h.chunkRepo.DeleteByKnowledgeID(ctx, knowledgeID); err != nil {
+			return fmt.Errorf("清理旧 chunks 失败: %w", err)
+		}
+	}
+	if h.vectorDB != nil {
+		if err := h.vectorDB.DeleteByKnowledgeID(ctx, knowledgeID); err != nil {
+			return fmt.Errorf("清理旧向量失败: %w", err)
+		}
+	}
+	return nil
 }
 
 func (h *Handler) findDuplicateFileByHash(ctx context.Context, kbID, hash string) (*repository.Knowledge, error) {
@@ -2415,8 +2421,12 @@ func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeI
 		return len(chunks), fmt.Errorf("向量化失败: %w", err)
 	}
 
+	if err := h.resetKnowledgeChunks(ctx, knowledgeID); err != nil {
+		return len(chunks), err
+	}
+
 	for i, chunk := range chunks {
-		chunk.ID = uuid.NewString()
+		chunk.ID = deterministicChunkID(knowledgeID, i, chunk.Content)
 		chunk.Vector = vectors[i]
 		chunk.Metadata["knowledge_base_id"] = kbID
 		chunk.Metadata["knowledge_id"] = knowledgeID
@@ -2424,11 +2434,8 @@ func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeI
 		chunk.Metadata["uploaded_at"] = time.Now().Format(time.RFC3339)
 	}
 
-	if err := h.vectorDB.Upsert(ctx, chunks); err != nil {
-		return len(chunks), fmt.Errorf("存储失败: %w", err)
-	}
-
-	// 双写：同步写入 PG chunks 表（供 chunk 预览 + 增量 diff）
+	// PG chunks 是 chunk 预览与增量 diff 的事实来源，先写 PG 再写向量；任一失败都返回错误，
+	// 由调用方重试（chunk ID 确定且写入前会清理旧数据，重试是幂等的）。
 	if h.chunkRepo != nil {
 		pgChunks := make([]*repository.Chunk, len(chunks))
 		for i, ch := range chunks {
@@ -2443,8 +2450,12 @@ func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeI
 			}
 		}
 		if err := h.chunkRepo.BatchCreate(ctx, pgChunks); err != nil {
-			log.Printf("[DualWrite][WARN] PG chunks 写入失败（向量已存储，chunk预览/增量同步将不可用）: knowledge=%s err=%v", knowledgeID, err)
+			return len(chunks), fmt.Errorf("写入 chunks 失败: %w", err)
 		}
+	}
+
+	if err := h.vectorDB.Upsert(ctx, chunks); err != nil {
+		return len(chunks), fmt.Errorf("存储向量失败: %w", err)
 	}
 
 	// 更新文档级内容哈希
@@ -2494,21 +2505,26 @@ func (h *Handler) ProcessImportTask(ctx context.Context, task importqueue.Task) 
 	case "url":
 		chunkCount, err = h.processQueuedURLImport(ctx, task)
 	case "file":
-		chunkCount, err = h.processQueuedFileImport(ctx, task)
+		if _, statErr := os.Stat(task.FilePath); statErr != nil {
+			err = importqueue.Permanent(fmt.Errorf("临时文件不可用: %w", statErr))
+		} else {
+			chunkCount, err = h.processQueuedFileImport(ctx, task)
+		}
 	default:
-		err = fmt.Errorf("unsupported import source type: %s", task.SourceType)
-	}
-
-	if task.SourceType == "file" && task.FilePath != "" {
-		_ = os.Remove(task.FilePath)
+		err = importqueue.Permanent(fmt.Errorf("unsupported import source type: %s", task.SourceType))
 	}
 
 	elapsed := time.Since(start)
+	finalAttempt := err == nil || importqueue.IsPermanent(err) || task.Attempt >= importqueue.MaxAttempts
+	// 可重试的失败保留临时文件，供下一次投递使用。
+	if finalAttempt && task.SourceType == "file" && task.FilePath != "" {
+		_ = os.Remove(task.FilePath)
+	}
 
 	if err != nil {
-		log.Printf("[ImportWorker] 失败: %s (%v) [%v]", task.FileName, err, elapsed)
+		log.Printf("[ImportWorker] 失败 (attempt %d/%d): %s (%v) [%v]", task.Attempt, importqueue.MaxAttempts, task.FileName, err, elapsed)
 		h.markKnowledgeFailed(ctx, task.KnowledgeID, chunkCount, err)
-		return nil
+		return err
 	}
 
 	log.Printf("[ImportWorker] 完成: %s → %d chunks [%v]", task.FileName, chunkCount, elapsed)
@@ -2589,7 +2605,10 @@ func (h *Handler) processQueuedURLImport(ctx context.Context, task importqueue.T
 
 	// docreader 不可用时，直接 HTTP 抓取并按纯文本处理
 	log.Printf("[ImportWorker] docreader 不可用，使用 HTTP 直接抓取: %s", task.SourceURL)
-	client := &http.Client{Timeout: 60 * time.Second}
+	if _, err := security.ValidateExternalURL(task.SourceURL, h.cfg.Security.URLPolicy); err != nil {
+		return 0, importqueue.Permanent(fmt.Errorf("URL 安全检查失败: %w", err))
+	}
+	client := h.fetchHTTPClient()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, task.SourceURL, nil)
 	if err != nil {
 		return 0, fmt.Errorf("构建请求失败: %w", err)
@@ -2746,10 +2765,14 @@ func (h *Handler) processAndStoreChunks(ctx context.Context, kbID, knowledgeID, 
 	})
 
 	// 转换为内部格式
+	if err := h.resetKnowledgeChunks(ctx, knowledgeID); err != nil {
+		return err
+	}
+
 	docs := make([]*container.Document, len(chunks))
 	contents := make([]string, len(chunks))
 	for i, chunk := range chunks {
-		chunkID := uuid.NewString()
+		chunkID := deterministicChunkID(knowledgeID, i, chunk.Content)
 		docs[i] = &container.Document{
 			ID:      chunkID,
 			Content: chunk.Content,
@@ -2791,12 +2814,6 @@ func (h *Handler) processAndStoreChunks(ctx context.Context, kbID, knowledgeID, 
 		doc.Vector = vectors[i]
 	}
 
-	// 存储
-	if err := h.vectorDB.Upsert(ctx, docs); err != nil {
-		return err
-	}
-
-	// 双写：同步写入 PG chunks 表（供 chunk 预览 + 增量 diff）
 	if h.chunkRepo != nil {
 		pgChunks := make([]*repository.Chunk, len(docs))
 		for i, d := range docs {
@@ -2813,8 +2830,12 @@ func (h *Handler) processAndStoreChunks(ctx context.Context, kbID, knowledgeID, 
 			}
 		}
 		if err := h.chunkRepo.BatchCreate(ctx, pgChunks); err != nil {
-			log.Printf("[DualWrite][WARN] PG chunks 写入失败（向量已存储，chunk预览/增量同步将不可用）: knowledge=%s err=%v", knowledgeID, err)
+			return fmt.Errorf("写入 chunks 失败: %w", err)
 		}
+	}
+
+	if err := h.vectorDB.Upsert(ctx, docs); err != nil {
+		return fmt.Errorf("存储向量失败: %w", err)
 	}
 
 	// 异步构建 GraphRAG 图谱
@@ -3159,31 +3180,59 @@ func (h *Handler) UpdateDocumentChunk(c *gin.Context) {
 }
 
 func (h *Handler) ListChunkRevisions(c *gin.Context) {
-	if _, ok := h.ensureKnowledgeBaseAccess(c, c.Param("id")); !ok { return }
-	if !h.chunkBelongsToDocument(c, c.Param("id"), c.Param("docId"), c.Param("chunkId")) { c.JSON(http.StatusNotFound, gin.H{"error": "chunk 不存在"}); return }
+	if _, ok := h.ensureKnowledgeBaseAccess(c, c.Param("id")); !ok {
+		return
+	}
+	if !h.chunkBelongsToDocument(c, c.Param("id"), c.Param("docId"), c.Param("chunkId")) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "chunk 不存在"})
+		return
+	}
 	editor, ok := h.chunkRepo.(repository.ChunkEditor)
-	if !ok { c.JSON(http.StatusNotImplemented, gin.H{"error": "chunk revision 未启用"}); return }
+	if !ok {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "chunk revision 未启用"})
+		return
+	}
 	revisions, err := editor.ListRevisions(c.Request.Context(), c.Param("chunkId"))
-	if err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()}); return }
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"revisions": revisions, "total": len(revisions)})
 }
 
 func (h *Handler) RestoreChunkRevision(c *gin.Context) {
-	if _, ok := h.ensureKnowledgeBaseWriteAccess(c, c.Param("id")); !ok { return }
-	if !h.chunkBelongsToDocument(c, c.Param("id"), c.Param("docId"), c.Param("chunkId")) { c.JSON(http.StatusNotFound, gin.H{"error": "chunk 不存在"}); return }
+	if _, ok := h.ensureKnowledgeBaseWriteAccess(c, c.Param("id")); !ok {
+		return
+	}
+	if !h.chunkBelongsToDocument(c, c.Param("id"), c.Param("docId"), c.Param("chunkId")) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "chunk 不存在"})
+		return
+	}
 	editor, ok := h.chunkRepo.(repository.ChunkEditor)
-	if !ok { c.JSON(http.StatusNotImplemented, gin.H{"error": "chunk revision 未启用"}); return }
+	if !ok {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "chunk revision 未启用"})
+		return
+	}
 	updated, err := editor.RestoreRevision(c.Request.Context(), c.Param("chunkId"), c.Param("revisionId"))
-	if err != nil { c.JSON(http.StatusNotFound, gin.H{"error": err.Error()}); return }
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"chunk": updated, "reindex_required": true})
 }
 
 func (h *Handler) chunkBelongsToDocument(c *gin.Context, kbID, docID, chunkID string) bool {
-	if h.chunkRepo == nil { return false }
+	if h.chunkRepo == nil {
+		return false
+	}
 	chunks, err := h.chunkRepo.GetByKnowledgeID(c.Request.Context(), docID)
-	if err != nil { return false }
+	if err != nil {
+		return false
+	}
 	for _, chunk := range chunks {
-		if chunk != nil && chunk.ID == chunkID && chunk.KnowledgeBaseID == kbID { return true }
+		if chunk != nil && chunk.ID == chunkID && chunk.KnowledgeBaseID == kbID {
+			return true
+		}
 	}
 	return false
 }
@@ -3192,25 +3241,40 @@ func (h *Handler) chunkBelongsToDocument(c *gin.Context, kbID, docID, chunkID st
 // content, so a manual edit is not overwritten by re-parsing the source file.
 func (h *Handler) ReindexEditedChunk(c *gin.Context) {
 	kbID, docID, chunkID := c.Param("id"), c.Param("docId"), c.Param("chunkId")
-	if _, ok := h.ensureKnowledgeBaseWriteAccess(c, kbID); !ok { return }
+	if _, ok := h.ensureKnowledgeBaseWriteAccess(c, kbID); !ok {
+		return
+	}
 	if h.chunkRepo == nil || h.embedding == nil || h.vectorDB == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "向量索引组件未启用"})
 		return
 	}
 	chunks, err := h.chunkRepo.GetByKnowledgeID(c.Request.Context(), docID)
-	if err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()}); return }
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	var target *repository.Chunk
 	for _, chunk := range chunks {
-		if chunk != nil && chunk.ID == chunkID && chunk.KnowledgeBaseID == kbID { target = chunk; break }
+		if chunk != nil && chunk.ID == chunkID && chunk.KnowledgeBaseID == kbID {
+			target = chunk
+			break
+		}
 	}
-	if target == nil { c.JSON(http.StatusNotFound, gin.H{"error": "chunk 不存在"}); return }
+	if target == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "chunk 不存在"})
+		return
+	}
 	vectors, err := container.BatchEmbedFloat32(c.Request.Context(), h.embedding, []string{target.Content})
-	if err != nil { c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("embedding 失败: %v", err)}); return }
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("embedding 失败: %v", err)})
+		return
+	}
 	doc := &container.Document{ID: target.ID, Content: target.Content, Vector: vectors[0], Metadata: map[string]interface{}{
 		"knowledge_base_id": kbID, "knowledge_id": docID, "chunk_index": target.ChunkIndex,
 	}}
 	if err := h.vectorDB.Upsert(c.Request.Context(), []*container.Document{doc}); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()}); return
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
 	c.JSON(http.StatusOK, gin.H{"chunk_id": chunkID, "indexed": true})
 }
@@ -3610,7 +3674,10 @@ func (h *Handler) fetchDocumentContent(ctx context.Context, k *repository.Knowle
 		if sourceURL == "" {
 			return nil, fmt.Errorf("无法获取原始 URL")
 		}
-		client := &http.Client{Timeout: 60 * time.Second}
+		if _, err := security.ValidateExternalURL(sourceURL, h.cfg.Security.URLPolicy); err != nil {
+			return nil, fmt.Errorf("URL 安全检查失败: %w", err)
+		}
+		client := h.fetchHTTPClient()
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
 		if err != nil {
 			return nil, err
@@ -4632,10 +4699,13 @@ func (h *Handler) buildImportServerConfig(provider string, req MCPImportRequest)
 	case "tavily":
 		apiKey := strings.TrimSpace(req.APIKey)
 		if apiKey == "" {
+			apiKey = strings.TrimSpace(h.cfg.Agent.TavilyAPIKey)
+		}
+		if apiKey == "" {
 			apiKey = strings.TrimSpace(os.Getenv("TAVILY_API_KEY"))
 		}
 		if apiKey == "" {
-			return config.MCPServerConfig{}, fmt.Errorf("tavily 导入需要 api_key 或环境变量 TAVILY_API_KEY")
+			return config.MCPServerConfig{}, fmt.Errorf("tavily 导入需要 api_key、agent.tavily_api_key 或环境变量 TAVILY_API_KEY")
 		}
 
 		name := strings.TrimSpace(req.Name)
@@ -4785,11 +4855,20 @@ func (h *Handler) GetEvalReport(c *gin.Context) {
 	}
 	path := filepath.Join("docs", "eval_reports", name)
 	data, err := os.ReadFile(path)
-	if os.IsNotExist(err) { c.JSON(http.StatusNotFound, gin.H{"error": "报告不存在"}); return }
-	if err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()}); return }
+	if os.IsNotExist(err) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "报告不存在"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	if strings.HasSuffix(strings.ToLower(name), ".json") {
 		var report any
-		if err := json.Unmarshal(data, &report); err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": "报告 JSON 无效"}); return }
+		if err := json.Unmarshal(data, &report); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "报告 JSON 无效"})
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"name": name, "report": report})
 		return
 	}

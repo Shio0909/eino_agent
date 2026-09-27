@@ -1,18 +1,20 @@
 // Package graphrag - 图谱检索器
 //
-// 实现 Eino retriever.Retriever 接口，可直接插入 HybridRetriever 的 graphRetriever 插槽
+// 实现 Eino retriever.Retriever 接口，由 container.CompositeRetriever 作为图谱信号源调用
 //
 // 【查询流程】
-// 1. 用 LLM 从用户 query 中抽取实体
-// 2. 用实体名称在 Neo4j 中搜索匹配节点及其关系
-// 3. 将命中的关联 chunk ID 作为 Document 返回
-// 4. HybridRetriever 的 RRF 融合机制自动将结果与向量/关键词检索结果合并
+//  1. 用 LLM 从用户 query 中抽取实体
+//  2. 用实体名称在 Neo4j 中搜索种子节点，并做有界变长遍历找到相关实体
+//  3. 按跳数/关系权重给关联 chunk 打分，确定性排序后取 topK 作为 Document 返回
+//  4. 调用方（CompositeRetriever）不把这些结果送入 RRF：命中 chunk 只作为已融合结果的加分信号，
+//     实体/关系摘要（ID 为 graph-context 的文档）作为附加上下文注入最终结果
 package graphrag
 
 import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 
 	"github.com/cloudwego/eino/components/retriever"
@@ -22,10 +24,10 @@ import (
 // GraphRetriever 图谱检索器
 // 实现 Eino retriever.Retriever 接口
 type GraphRetriever struct {
-	extractor  *Extractor       // 实体抽取器（查询时抽取实体）
-	repository GraphRepository  // Neo4j 存储
-	namespace  *NameSpace       // 图谱命名空间（知识库隔离）
-	topK       int              // 最大返回 chunk 数
+	extractor  *Extractor      // 实体抽取器（查询时抽取实体）
+	repository GraphRepository // Neo4j 存储
+	namespace  *NameSpace      // 图谱命名空间（知识库隔离）
+	topK       int             // 最大返回 chunk 数
 }
 
 // GraphRetrieverConfig 图谱检索器配置
@@ -68,21 +70,101 @@ func (g *GraphRetriever) Retrieve(ctx context.Context, query string, opts ...ret
 	log.Printf("[GraphRetriever] 抽取到实体: %v", entityNames(entities))
 
 	// 2. 在 Neo4j 中搜索实体及关系
-	graphData, err := g.repository.SearchNode(ctx, *g.namespace, entities)
+	namespace := NameSpace{}
+	if g.namespace != nil {
+		namespace = *g.namespace
+	}
+	graphData, err := g.repository.SearchNode(ctx, namespace, entities)
 	if err != nil {
 		log.Printf("[GraphRetriever] Neo4j 搜索失败: %v", err)
 		return nil, nil // 图谱搜索失败不影响主流程
 	}
+	if graphData == nil {
+		return nil, nil
+	}
 
-	// 3. 收集所有关联的 chunk ID（去重）
-	chunkSet := make(map[string]struct{})
-	entityInfo := make([]string, 0) // 用于构建上下文
+	docs := buildGraphDocuments(graphData, g.topK)
+	log.Printf("[GraphRetriever] 发现 %d 个实体, %d 个关系, 返回 %d 个文档",
+		len(graphData.Node), len(graphData.Relation), len(docs))
+	return docs, nil
+}
 
-	for _, node := range graphData.Node {
-		for _, chunk := range node.Chunks {
-			chunkSet[chunk] = struct{}{}
+// scoredChunk 图谱命中的 chunk 及其得分
+type scoredChunk struct {
+	ID    string
+	Score float64
+	Hops  int
+}
+
+// rankGraphChunks 汇总实体关联的 chunk 得分并确定性排序：
+// 每个实体贡献 weight/(1+hops)（直接命中得 1，一跳邻居得 1/2 ……），
+// 同一 chunk 被多个实体引用时得分累加；按得分降序、chunk ID 升序排列后截取 topK。
+func rankGraphChunks(nodes []*GraphNode, topK int) []scoredChunk {
+	byID := make(map[string]*scoredChunk)
+	for _, node := range nodes {
+		if node == nil {
+			continue
 		}
-		// 构建实体描述（包含类型信息）
+		weight := node.Weight
+		if weight <= 0 {
+			weight = 1.0
+		}
+		contribution := weight / float64(1+node.Hops)
+		seen := make(map[string]bool, len(node.Chunks))
+		for _, chunkID := range node.Chunks {
+			if chunkID == "" || seen[chunkID] {
+				continue
+			}
+			seen[chunkID] = true
+			sc, ok := byID[chunkID]
+			if !ok {
+				byID[chunkID] = &scoredChunk{ID: chunkID, Score: contribution, Hops: node.Hops}
+				continue
+			}
+			sc.Score += contribution
+			if node.Hops < sc.Hops {
+				sc.Hops = node.Hops
+			}
+		}
+	}
+
+	ranked := make([]scoredChunk, 0, len(byID))
+	for _, sc := range byID {
+		ranked = append(ranked, *sc)
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].Score != ranked[j].Score {
+			return ranked[i].Score > ranked[j].Score
+		}
+		return ranked[i].ID < ranked[j].ID
+	})
+	if topK > 0 && len(ranked) > topK {
+		ranked = ranked[:topK]
+	}
+	return ranked
+}
+
+// buildGraphDocuments 把检索到的子图转换为 chunk 文档 + 实体关系上下文文档
+func buildGraphDocuments(graphData *GraphData, topK int) []*schema.Document {
+	docs := make([]*schema.Document, 0)
+	for _, sc := range rankGraphChunks(graphData.Node, topK) {
+		doc := &schema.Document{
+			ID:      sc.ID,
+			Content: "", // chunk 内容由下游补充
+			MetaData: map[string]any{
+				"match_type": "graph",
+				"source":     "graphrag",
+				"graph_hops": sc.Hops,
+			},
+		}
+		docs = append(docs, doc.WithScore(sc.Score))
+	}
+
+	entityInfo := make([]string, 0, len(graphData.Node))
+	for _, node := range graphData.Node {
+		if node == nil {
+			continue
+		}
 		desc := node.Name
 		if node.Type != "" && node.Type != "Other" {
 			desc = fmt.Sprintf("[%s]%s", node.Type, node.Name)
@@ -93,37 +175,14 @@ func (g *GraphRetriever) Retrieve(ctx context.Context, query string, opts ...ret
 		entityInfo = append(entityInfo, desc)
 	}
 
-	// 4. 构建关系描述
 	relationInfo := make([]string, 0, len(graphData.Relation))
 	for _, rel := range graphData.Relation {
+		if rel == nil {
+			continue
+		}
 		relationInfo = append(relationInfo, fmt.Sprintf("%s -[%s]-> %s", rel.Node1, rel.Type, rel.Node2))
 	}
 
-	log.Printf("[GraphRetriever] 发现 %d 个实体, %d 个关系, %d 个关联 chunk",
-		len(graphData.Node), len(graphData.Relation), len(chunkSet))
-
-	// 5. 构建结果文档
-	// 策略：将图谱上下文作为附加文档返回，让 RRF 融合决定最终排序
-	docs := make([]*schema.Document, 0)
-
-	// 5a. 如果有命中 chunk，将 chunk ID 作为文档返回（由下游检索 chunk 内容）
-	i := 0
-	for chunkID := range chunkSet {
-		if i >= g.topK {
-			break
-		}
-		docs = append(docs, &schema.Document{
-			ID:      chunkID,
-			Content: "", // chunk 内容由下游补充
-			MetaData: map[string]any{
-				"match_type": "graph",
-				"source":     "graphrag",
-			},
-		})
-		i++
-	}
-
-	// 5b. 将图谱关系上下文作为额外文档（提供实体关系信息增强回答）
 	if len(entityInfo) > 0 || len(relationInfo) > 0 {
 		var contextParts []string
 		if len(entityInfo) > 0 {
@@ -132,11 +191,9 @@ func (g *GraphRetriever) Retrieve(ctx context.Context, query string, opts ...ret
 		if len(relationInfo) > 0 {
 			contextParts = append(contextParts, "【实体关系】"+strings.Join(relationInfo, "; "))
 		}
-		graphContext := strings.Join(contextParts, "\n")
-
 		docs = append(docs, &schema.Document{
 			ID:      "graph-context",
-			Content: graphContext,
+			Content: strings.Join(contextParts, "\n"),
 			MetaData: map[string]any{
 				"match_type": "graph_context",
 				"source":     "graphrag",
@@ -145,8 +202,7 @@ func (g *GraphRetriever) Retrieve(ctx context.Context, query string, opts ...ret
 			},
 		})
 	}
-
-	return docs, nil
+	return docs
 }
 
 // entityNames 从 QueryEntity 列表中提取名称列表（用于日志输出）

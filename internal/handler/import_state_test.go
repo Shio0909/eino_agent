@@ -196,7 +196,13 @@ func (v *memoryVectorDB) Upsert(_ context.Context, docs []*container.Document) e
 	v.upserted = append(v.upserted, docs...)
 	return nil
 }
-func (v *memoryVectorDB) Search(context.Context, []float32, int) ([]*container.Document, error) {
+func (v *memoryVectorDB) Ping(context.Context) error { return nil }
+
+func (v *memoryVectorDB) SearchKeyword(context.Context, string, int, container.SearchFilter) ([]*container.Document, error) {
+	return nil, nil
+}
+
+func (v *memoryVectorDB) Search(context.Context, []float32, int, container.SearchFilter) ([]*container.Document, error) {
 	return nil, nil
 }
 func (v *memoryVectorDB) Delete(_ context.Context, ids []string) error {

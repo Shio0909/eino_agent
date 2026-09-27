@@ -75,7 +75,7 @@ type graphRAGProvider interface {
 
 // kbWriteProvider 定义知识库写入能力（创建 KB、导入 URL 等）
 type kbWriteProvider interface {
-	MCPCreateKB(ctx context.Context, name, desc, mode string) (*repository.KnowledgeBase, error)
+	MCPCreateKB(ctx context.Context, tenantID int, name, desc, mode string) (*repository.KnowledgeBase, error)
 	MCPImportURL(ctx context.Context, kbID, url, title string) (string, int, error)
 	MCPDeleteKB(ctx context.Context, kbID string) error
 	MCPListDocuments(ctx context.Context, kbID string) ([]map[string]any, error)
@@ -90,25 +90,34 @@ type Server struct {
 	config          *config.Config
 	chatSvc         chatProvider
 	kbRepo          repository.KnowledgeBaseRepository
-	kbWriter        kbWriteProvider               // 可选：知识库写入（创建 KB、导入 URL）
-	codeTool        codeSearchProvider            // 可选：代码搜索工具
-	graphRAG        graphRAGProvider              // 可选：GraphRAG 服务
-	codeGraph       codegraph.CodeGraphRepository // 可选：代码知识图谱
-	approvalManager *approval.Manager             // HITL 审批运行时
-	apiKeySet       map[string]struct{}           // 已配置的 API Key 集合，为空则不验证
-	scopes          map[string]mcpScope           // API Key 对应的访问范围
+	kbWriter        kbWriteProvider                    // 可选：知识库写入（创建 KB、导入 URL）
+	codeTool        codeSearchProvider                 // 可选：代码搜索工具
+	graphRAG        graphRAGProvider                   // 可选：GraphRAG 服务
+	codeGraph       codegraph.CodeGraphRepository      // 可选：代码知识图谱
+	approvalManager *approval.Manager                  // HITL 审批运行时
+	accessRepo      repository.AccessControlRepository // 可选：知识库共享角色
+	apiKeySet       map[string]struct{}                // 已配置的 API Key 集合，为空则不验证
+	scopes          map[string]mcpScope                // API Key 对应的访问范围
 }
 
 func buildAPIKeyScopes(cfg config.MCPExportConfig) (map[string]struct{}, map[string]mcpScope) {
 	keySet := make(map[string]struct{}, len(cfg.APIKeys)+len(cfg.APIKeyScopes))
 	scopes := make(map[string]mcpScope, len(cfg.APIKeyScopes))
 
+	// 未绑定范围的裸 API Key 继承默认租户/知识库范围，但永远不能调用管理工具。
+	defaultIDs := normalizeKnowledgeBaseIDs(cfg.DefaultKnowledgeBaseIDs)
 	for _, key := range cfg.APIKeys {
 		key = strings.TrimSpace(key)
 		if key == "" {
 			continue
 		}
 		keySet[key] = struct{}{}
+		scopes[key] = mcpScope{
+			tenantID:         cfg.DefaultTenantID,
+			userID:           strings.TrimSpace(cfg.DefaultUserID),
+			knowledgeBaseIDs: defaultIDs,
+			kbRestricted:     len(defaultIDs) > 0,
+		}
 	}
 
 	for _, item := range cfg.APIKeyScopes {
@@ -185,6 +194,11 @@ func (s *Server) SetCodeGraph(repo codegraph.CodeGraphRepository) { s.codeGraph 
 
 // SetKBWriter 注入知识库写入能力（可选）
 func (s *Server) SetKBWriter(w kbWriteProvider) { s.kbWriter = w }
+
+// SetAccessControlRepository 注入知识库共享/角色仓储（可选，未注入时仅按租户归属校验）
+func (s *Server) SetAccessControlRepository(repo repository.AccessControlRepository) {
+	s.accessRepo = repo
+}
 
 // SetApprovalManager 注入 HITL 审批运行时（可选）
 func (s *Server) SetApprovalManager(manager *approval.Manager) {
@@ -514,6 +528,10 @@ func (s *Server) scopeFromContext(ctx context.Context) mcpScope {
 	if scope, ok := ctx.Value(ctxKeyScope).(mcpScope); ok {
 		return scope
 	}
+	return s.defaultScope()
+}
+
+func (s *Server) defaultScope() mcpScope {
 	if s.config == nil {
 		return mcpScope{}
 	}
@@ -526,54 +544,112 @@ func (s *Server) scopeFromContext(ctx context.Context) mcpScope {
 	}
 }
 
+// resolveKnowledgeBaseIDs 返回当前凭据可访问的知识库 ID。
+// requested 为空时返回全部可访问知识库；非空时逐个校验，任一越权即报错。
 func (s *Server) resolveKnowledgeBaseIDs(ctx context.Context, requested []string, level accessLevel) ([]string, error) {
-	_ = level
 	requested = normalizeKnowledgeBaseIDs(requested)
 	scope := s.scopeFromContext(ctx)
-	if !scope.kbRestricted {
-		if len(requested) > 0 {
-			return requested, nil
-		}
-		if scope.tenantID > 0 && s.kbRepo != nil {
-			kbs, err := s.kbRepo.ListAccessible(ctx, scope.tenantID, scope.userID, 0, 1000)
-			if err != nil {
+
+	if len(requested) > 0 {
+		for _, id := range requested {
+			if err := s.authorizeKnowledgeBase(ctx, id, level); err != nil {
 				return nil, err
 			}
-			ids := make([]string, 0, len(kbs))
-			for _, kb := range kbs {
-				ids = append(ids, kb.ID)
-			}
-			return ids, nil
 		}
+		return requested, nil
+	}
+
+	if scope.kbRestricted {
+		ids := make([]string, 0, len(scope.knowledgeBaseIDs))
+		for _, id := range scope.knowledgeBaseIDs {
+			if err := s.authorizeKnowledgeBase(ctx, id, level); err == nil {
+				ids = append(ids, id)
+			}
+		}
+		return ids, nil
+	}
+	if s.kbRepo == nil {
 		return nil, nil
 	}
-
-	allowed := make(map[string]struct{}, len(scope.knowledgeBaseIDs))
-	for _, id := range scope.knowledgeBaseIDs {
-		allowed[id] = struct{}{}
+	kbs, err := s.kbRepo.ListAccessible(ctx, scope.tenantID, scope.userID, 0, 1000)
+	if err != nil {
+		return nil, err
 	}
-
-	if len(requested) == 0 {
-		return append([]string(nil), scope.knowledgeBaseIDs...), nil
+	ids := make([]string, 0, len(kbs))
+	for _, kb := range kbs {
+		ids = append(ids, kb.ID)
 	}
-
-	for _, id := range requested {
-		if _, ok := allowed[id]; !ok {
-			return nil, fmt.Errorf("知识库 %s 不在当前 MCP 凭据授权范围内", id)
-		}
-	}
-	return requested, nil
+	return ids, nil
 }
 
-func (s *Server) authorizeKnowledgeBase(ctx context.Context, kbID string, level accessLevel) error {
-	ids, err := s.resolveKnowledgeBaseIDs(ctx, []string{kbID}, level)
-	if err != nil {
-		return err
+func requiredRole(level accessLevel) repository.AccessRole {
+	switch level {
+	case accessLevelAdmin:
+		return repository.AccessRoleAdmin
+	case accessLevelWrite:
+		return repository.AccessRoleEditor
+	default:
+		return repository.AccessRoleViewer
 	}
-	if len(ids) == 0 {
+}
+
+// authorizeKnowledgeBase 校验当前凭据对指定知识库的访问权限：
+// 写/管理级别要求凭据允许管理工具；受限凭据只能访问白名单内的知识库；
+// 绑定租户的凭据还需通过知识库归属/共享角色校验。
+func (s *Server) authorizeKnowledgeBase(ctx context.Context, kbID string, level accessLevel) error {
+	kbID = strings.TrimSpace(kbID)
+	if kbID == "" {
+		return fmt.Errorf("知识库 ID 不能为空")
+	}
+	scope := s.scopeFromContext(ctx)
+
+	if level != accessLevelRead && !scope.allowAdminTools {
+		return fmt.Errorf("当前 MCP 凭据无权修改知识库 %s", kbID)
+	}
+	if scope.kbRestricted && !containsString(scope.knowledgeBaseIDs, kbID) {
+		return fmt.Errorf("知识库 %s 不在当前 MCP 凭据授权范围内", kbID)
+	}
+	if scope.tenantID <= 0 {
 		return nil
 	}
+
+	role, err := s.knowledgeBaseRole(ctx, scope, kbID)
+	if err != nil {
+		return fmt.Errorf("校验知识库 %s 权限失败: %w", kbID, err)
+	}
+	if role == "" {
+		return fmt.Errorf("知识库 %s 不存在或无权访问", kbID)
+	}
+	if !role.Allows(requiredRole(level)) {
+		return fmt.Errorf("当前 MCP 凭据对知识库 %s 的权限不足（需要 %s）", kbID, requiredRole(level))
+	}
 	return nil
+}
+
+func (s *Server) knowledgeBaseRole(ctx context.Context, scope mcpScope, kbID string) (repository.AccessRole, error) {
+	if s.accessRepo != nil {
+		return s.accessRepo.GetKnowledgeBaseRole(ctx, scope.tenantID, scope.userID, kbID)
+	}
+	if s.kbRepo == nil {
+		return "", fmt.Errorf("知识库仓储不可用")
+	}
+	kb, err := s.kbRepo.GetByID(ctx, kbID)
+	if err != nil {
+		return "", err
+	}
+	if kb == nil || kb.TenantID != scope.tenantID {
+		return "", nil
+	}
+	return repository.AccessRoleAdmin, nil
+}
+
+func containsString(values []string, target string) bool {
+	for _, v := range values {
+		if v == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) authorizeAdminTool(ctx context.Context) error {
@@ -800,20 +876,13 @@ func (s *Server) handleListKnowledgeBases(ctx context.Context, _ mcpProto.CallTo
 	}
 
 	var kbs []*repository.KnowledgeBase
-	if len(ids) > 0 {
-		for _, id := range ids {
-			kb, err := s.kbRepo.GetByID(ctx, id)
-			if err != nil {
-				return mcpProto.NewToolResultError(fmt.Sprintf("获取知识库 %s 失败: %v", id, err)), nil
-			}
-			if kb != nil {
-				kbs = append(kbs, kb)
-			}
-		}
-	} else {
-		kbs, err = s.kbRepo.List(ctx, 0, 0, 100)
+	for _, id := range ids {
+		kb, err := s.kbRepo.GetByID(ctx, id)
 		if err != nil {
-			return mcpProto.NewToolResultError(fmt.Sprintf("获取知识库列表失败: %v", err)), nil
+			return mcpProto.NewToolResultError(fmt.Sprintf("获取知识库 %s 失败: %v", id, err)), nil
+		}
+		if kb != nil {
+			kbs = append(kbs, kb)
 		}
 	}
 
@@ -1140,7 +1209,11 @@ func (s *Server) handleCreateKnowledgeBase(ctx context.Context, request mcpProto
 		return result, nil
 	}
 
-	kb, err := s.kbWriter.MCPCreateKB(ctx, name, desc, mode)
+	tenantID := s.scopeFromContext(ctx).tenantID
+	if tenantID <= 0 && s.config != nil {
+		tenantID = s.config.Auth.AdminTenantID
+	}
+	kb, err := s.kbWriter.MCPCreateKB(ctx, tenantID, name, desc, mode)
 	if err != nil {
 		return mcpProto.NewToolResultError(fmt.Sprintf("创建知识库失败: %v", err)), nil
 	}
@@ -1376,8 +1449,11 @@ func (s *Server) extractAPIKey(r *http.Request) string {
 func (s *Server) httpContextFunc() func(ctx context.Context, r *http.Request) context.Context {
 	return func(ctx context.Context, r *http.Request) context.Context {
 		if len(s.apiKeySet) == 0 {
-			// 未配置 API Keys，放行所有请求
-			return context.WithValue(ctx, ctxKeyAuthenticated, true)
+			// 未配置 API Key 的网络传输只允许默认范围内的只读访问，管理工具仅在 stdio 本地模式下可用。
+			scope := s.defaultScope()
+			scope.allowAdminTools = false
+			ctx = context.WithValue(ctx, ctxKeyAuthenticated, true)
+			return context.WithValue(ctx, ctxKeyScope, scope)
 		}
 		key := s.extractAPIKey(r)
 		_, valid := s.apiKeySet[key]
@@ -1393,10 +1469,7 @@ func (s *Server) httpContextFunc() func(ctx context.Context, r *http.Request) co
 
 // ServeSSE 启动 SSE 传输的 MCP Server
 func (s *Server) ServeSSE(addr string) error {
-	opts := []mcpServer.SSEOption{}
-	if len(s.apiKeySet) > 0 {
-		opts = append(opts, mcpServer.WithSSEContextFunc(s.httpContextFunc()))
-	}
+	opts := []mcpServer.SSEOption{mcpServer.WithSSEContextFunc(s.httpContextFunc())}
 	sseServer := mcpServer.NewSSEServer(s.mcpSrv, opts...)
 	log.Printf("[MCP Server] SSE 模式启动于 %s (认证: %v)", addr, len(s.apiKeySet) > 0)
 	return sseServer.Start(addr)
@@ -1404,10 +1477,7 @@ func (s *Server) ServeSSE(addr string) error {
 
 // ServeStreamableHTTP 启动 Streamable HTTP 传输的 MCP Server
 func (s *Server) ServeStreamableHTTP(addr string) error {
-	opts := []mcpServer.StreamableHTTPOption{}
-	if len(s.apiKeySet) > 0 {
-		opts = append(opts, mcpServer.WithHTTPContextFunc(s.httpContextFunc()))
-	}
+	opts := []mcpServer.StreamableHTTPOption{mcpServer.WithHTTPContextFunc(s.httpContextFunc())}
 	httpServer := mcpServer.NewStreamableHTTPServer(s.mcpSrv, opts...)
 	log.Printf("[MCP Server] Streamable HTTP 模式启动于 %s (认证: %v)", addr, len(s.apiKeySet) > 0)
 	return httpServer.Start(addr)

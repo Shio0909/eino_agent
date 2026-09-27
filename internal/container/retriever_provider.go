@@ -32,24 +32,12 @@ type CompositeRetriever struct {
 	retrievalCache        cachepkg.RetrievalCache
 	graphRetriever        einoretriever.Retriever
 	graphRetrieverFactory GraphRetrieverFactory // 用于按 KB 动态创建图谱检索器
+	filter                SearchFilter
 }
 
 // GraphRetrieverFactory 按命名空间创建图谱检索器（由 graphRAG Service 实现）
 type GraphRetrieverFactory interface {
 	CreateScopedGraphRetriever(knowledgeBaseID string, topK int) einoretriever.Retriever
-}
-
-type scopedKeywordSearcher interface {
-	SearchKeyword(ctx context.Context, query string, topK int) ([]*Document, error)
-}
-
-type keywordSearcher interface {
-	SearchKeyword(ctx context.Context, query string, topK int) ([]*Document, error)
-}
-
-type knowledgeBaseScopedVectorDB struct {
-	base  VectorDBProvider
-	kbSet map[string]struct{}
 }
 
 // NewRetrieverProvider 创建检索器提供者
@@ -100,7 +88,7 @@ func (r *CompositeRetriever) Retrieve(ctx context.Context, query string, opts ..
 	}
 
 	vectorStart := time.Now()
-	docs, err := r.vectorDB.Search(ctx, queryVector, topK*2)
+	docs, err := r.vectorDB.Search(ctx, queryVector, topK*2, r.filter)
 	tracing.Emit(ctx, retrievalSourceEvent("vector", query, docs, vectorStart, err))
 	if err != nil {
 		return nil, fmt.Errorf("向量检索失败: %w", err)
@@ -127,23 +115,18 @@ func (r *CompositeRetriever) retrieveWithHybrid(ctx context.Context, query strin
 	}
 
 	vectorStart := time.Now()
-	vectorDocs, err := r.vectorDB.Search(ctx, queryVector, topK*2)
+	vectorDocs, err := r.vectorDB.Search(ctx, queryVector, topK*2, r.filter)
 	tracing.Emit(ctx, retrievalSourceEvent("vector", query, vectorDocs, vectorStart, err))
 	if err != nil {
 		return nil, fmt.Errorf("向量检索失败: %w", err)
 	}
 
-	var keywordDocs []*Document
-	if ks, ok := r.vectorDB.(keywordSearcher); ok {
-		keywordStart := time.Now()
-		keywordDocs, err = ks.SearchKeyword(ctx, query, topK*2)
-		tracing.Emit(ctx, retrievalSourceEvent("keyword", query, keywordDocs, keywordStart, err))
-		if err != nil {
-			log.Printf("[Retriever] 关键词检索失败（降级继续）: %v", err)
-			keywordDocs = nil // 降级：仅使用向量检索结果
-		}
-	} else {
-		tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "keyword_recall", Summary: "keyword search unavailable", Metadata: map[string]any{"source": "keyword", "available": false}})
+	keywordStart := time.Now()
+	keywordDocs, err := r.vectorDB.SearchKeyword(ctx, query, topK*2, r.filter)
+	tracing.Emit(ctx, retrievalSourceEvent("keyword", query, keywordDocs, keywordStart, err))
+	if err != nil {
+		log.Printf("[Retriever] 关键词检索失败（降级继续）: %v", err)
+		keywordDocs = nil
 	}
 
 	// 图谱检索（如果启用）
@@ -218,38 +201,31 @@ func (r *CompositeRetriever) retrieveWithHybrid(ctx context.Context, query strin
 	return toSchemaDocuments(fused), nil
 }
 
+// WithKnowledgeBaseScope 返回限定到指定知识库的检索器；ids 为空时返回受限且无结果的检索器。
 func (r *CompositeRetriever) WithKnowledgeBaseScope(ids []string) einoretriever.Retriever {
-	if len(ids) == 0 {
-		return r
-	}
+	return r.WithScope(SearchFilter{KnowledgeBaseIDs: ids, Scoped: true})
+}
 
-	kbSet := make(map[string]struct{}, len(ids))
-	for _, id := range ids {
-		if id == "" {
-			continue
-		}
-		kbSet[id] = struct{}{}
-	}
-	if len(kbSet) == 0 {
-		return r
-	}
-
+// WithScope 返回带存储层过滤条件的检索器副本。
+func (r *CompositeRetriever) WithScope(filter SearchFilter) *CompositeRetriever {
+	filter = filter.Normalized()
 	clone := *r
-	clone.vectorDB = &knowledgeBaseScopedVectorDB{
-		base:  r.vectorDB,
-		kbSet: kbSet,
-	}
+	clone.filter = filter
 
-	// 如果有 GraphRetriever 工厂，按第一个 KB ID 创建作用域图谱检索器
-	if r.graphRetrieverFactory != nil && len(ids) > 0 {
+	if r.graphRetrieverFactory != nil && len(filter.KnowledgeBaseIDs) > 0 {
 		topK := r.cfg.TopK
 		if topK <= 0 {
 			topK = 10
 		}
-		clone.graphRetriever = r.graphRetrieverFactory.CreateScopedGraphRetriever(ids[0], topK)
-		log.Printf("[Retriever] 为 KB=%s 创建了作用域图谱检索器", ids[0])
+		// 图谱按知识库命名空间隔离，只能针对单个 KB 建立作用域；多 KB 时禁用图谱召回，避免跨库泄漏。
+		if len(filter.KnowledgeBaseIDs) == 1 {
+			clone.graphRetriever = r.graphRetrieverFactory.CreateScopedGraphRetriever(filter.KnowledgeBaseIDs[0], topK)
+		} else {
+			clone.graphRetriever = nil
+		}
+	} else if !filter.IsZero() {
+		clone.graphRetriever = nil
 	}
-
 	return &clone
 }
 
@@ -321,11 +297,11 @@ func toSchemaDocuments(docs []*Document) []*schema.Document {
 		if doc == nil {
 			continue
 		}
-		result = append(result, &schema.Document{
+		result = append(result, (&schema.Document{
 			ID:       doc.ID,
 			Content:  doc.Content,
 			MetaData: doc.Metadata,
-		})
+		}).WithScore(doc.Score))
 	}
 	return result
 }
@@ -604,7 +580,7 @@ func (r *CompositeRetriever) RetrieveWithMode(ctx context.Context, query string,
 			return nil, fmt.Errorf("生成查询向量失败: %w", err)
 		}
 		started := time.Now()
-		docs, err := r.vectorDB.Search(ctx, queryVector, topK*2)
+		docs, err := r.vectorDB.Search(ctx, queryVector, topK*2, r.filter)
 		tracing.Emit(ctx, retrievalSourceEvent("vector", query, docs, started, err))
 		if err != nil {
 			return nil, fmt.Errorf("语义检索失败: %w", err)
@@ -615,14 +591,8 @@ func (r *CompositeRetriever) RetrieveWithMode(ctx context.Context, query string,
 		return toSchemaDocuments(docs), nil
 
 	case "exact":
-		ks, ok := r.vectorDB.(keywordSearcher)
-		if !ok {
-			log.Printf("[Retriever] exact 模式不可用（无关键词检索器），降级为 auto")
-			tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "keyword_recall", Summary: "keyword search unavailable", Metadata: map[string]any{"source": "keyword", "available": false, "fallback": "auto"}})
-			return r.Retrieve(ctx, query)
-		}
 		started := time.Now()
-		docs, err := ks.SearchKeyword(ctx, query, topK*2)
+		docs, err := r.vectorDB.SearchKeyword(ctx, query, topK*2, r.filter)
 		tracing.Emit(ctx, retrievalSourceEvent("keyword", query, docs, started, err))
 		if err != nil {
 			return nil, fmt.Errorf("关键词检索失败: %w", err)
@@ -646,100 +616,4 @@ func (r *CompositeRetriever) RetrieveWithMode(ctx context.Context, query string,
 	default: // "auto" 或其他
 		return r.Retrieve(ctx, query)
 	}
-}
-
-func (db *knowledgeBaseScopedVectorDB) Upsert(ctx context.Context, docs []*Document) error {
-	return db.base.Upsert(ctx, docs)
-}
-
-func (db *knowledgeBaseScopedVectorDB) Delete(ctx context.Context, ids []string) error {
-	return db.base.Delete(ctx, ids)
-}
-
-func (db *knowledgeBaseScopedVectorDB) DeleteByKnowledgeID(ctx context.Context, knowledgeID string) error {
-	return db.base.DeleteByKnowledgeID(ctx, knowledgeID)
-}
-
-func (db *knowledgeBaseScopedVectorDB) DeleteByKnowledgeBaseID(ctx context.Context, kbID string) error {
-	return db.base.DeleteByKnowledgeBaseID(ctx, kbID)
-}
-
-func (db *knowledgeBaseScopedVectorDB) Close() error {
-	return db.base.Close()
-}
-
-func (db *knowledgeBaseScopedVectorDB) Search(ctx context.Context, vector []float32, topK int) ([]*Document, error) {
-	candidateK := topK * 50
-	if candidateK < 200 {
-		candidateK = 200
-	}
-
-	docs, err := db.base.Search(ctx, vector, candidateK)
-	if err != nil {
-		return nil, err
-	}
-
-	filtered := db.filterDocs(docs, topK)
-	if len(filtered) >= topK || candidateK >= 5000 {
-		return filtered, nil
-	}
-
-	docs, err = db.base.Search(ctx, vector, 5000)
-	if err != nil {
-		return nil, err
-	}
-
-	return db.filterDocs(docs, topK), nil
-}
-
-func (db *knowledgeBaseScopedVectorDB) SearchKeyword(ctx context.Context, query string, topK int) ([]*Document, error) {
-	searcher, ok := db.base.(scopedKeywordSearcher)
-	if !ok {
-		return nil, nil
-	}
-
-	candidateK := topK * 20
-	if candidateK < 100 {
-		candidateK = 100
-	}
-
-	docs, err := searcher.SearchKeyword(ctx, query, candidateK)
-	if err != nil {
-		return nil, err
-	}
-
-	return db.filterDocs(docs, topK), nil
-}
-
-func (db *knowledgeBaseScopedVectorDB) filterDocs(docs []*Document, topK int) []*Document {
-	limit := topK
-	if limit <= 0 || limit > len(docs) {
-		limit = len(docs)
-	}
-	filtered := make([]*Document, 0, limit)
-	for _, doc := range docs {
-		if doc == nil {
-			continue
-		}
-		if !db.matchKB(doc) {
-			continue
-		}
-		filtered = append(filtered, doc)
-		if topK > 0 && len(filtered) >= topK {
-			break
-		}
-	}
-	return filtered
-}
-
-func (db *knowledgeBaseScopedVectorDB) matchKB(doc *Document) bool {
-	if doc == nil || doc.Metadata == nil {
-		return false
-	}
-	kbID, _ := doc.Metadata["knowledge_base_id"].(string)
-	if kbID == "" {
-		return false
-	}
-	_, ok := db.kbSet[kbID]
-	return ok
 }

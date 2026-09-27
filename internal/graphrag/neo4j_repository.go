@@ -10,23 +10,62 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
-	"time"
 
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
+
+	"eino_agent/internal/neo4jutil"
+)
+
+const (
+	// DefaultMaxHops 图增强检索默认遍历跳数
+	DefaultMaxHops = 2
+	// MaxAllowedHops 允许的最大遍历跳数（变长路径展开代价随跳数指数增长）
+	MaxAllowedHops = 3
+
+	searchSeedLimit   = 20
+	searchResultLimit = 200
 )
 
 // Neo4jRepository Neo4j 图存储实现
 type Neo4jRepository struct {
 	driver     neo4j.DriverWithContext
 	nodePrefix string
+	maxHops    int
 }
 
-// NewNeo4jRepository 创建 Neo4j Repository
-func NewNeo4jRepository(driver neo4j.DriverWithContext) GraphRepository {
-	return &Neo4jRepository{driver: driver, nodePrefix: "ENTITY"}
+// RepositoryOption Neo4jRepository 可选配置
+type RepositoryOption func(*Neo4jRepository)
+
+// WithMaxHops 设置图增强检索的最大遍历跳数；<=0 使用默认值，超过上限时截断为 MaxAllowedHops。
+func WithMaxHops(hops int) RepositoryOption {
+	return func(r *Neo4jRepository) {
+		r.maxHops = normalizeMaxHops(hops)
+	}
+}
+
+// NewNeo4jRepository 创建 Neo4j Repository。
+// 驱动由调用方拥有，Repository 不负责关闭。
+func NewNeo4jRepository(driver neo4j.DriverWithContext, opts ...RepositoryOption) GraphRepository {
+	r := &Neo4jRepository{driver: driver, nodePrefix: "ENTITY", maxHops: DefaultMaxHops}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
+}
+
+func normalizeMaxHops(hops int) int {
+	if hops <= 0 {
+		return DefaultMaxHops
+	}
+	if hops > MaxAllowedHops {
+		log.Printf("[GraphRAG] max_hops=%d 超过上限，截断为 %d", hops, MaxAllowedHops)
+		return MaxAllowedHops
+	}
+	return hops
 }
 
 // removeHyphen 去除连字符（Neo4j 标签不支持连字符）
@@ -66,10 +105,14 @@ func (r *Neo4jRepository) Labels(namespace NameSpace) []string {
 	return res
 }
 
-// Label 返回命名空间对应的标签表达式（用于 Cypher）
+// Label 返回命名空间对应的标签表达式（用于 Cypher），每个标签都经过反引号转义
 func (r *Neo4jRepository) Label(namespace NameSpace) string {
 	labels := r.Labels(namespace)
-	return strings.Join(labels, ":")
+	quoted := make([]string, len(labels))
+	for i, label := range labels {
+		quoted[i] = neo4jutil.QuoteIdentifier(label)
+	}
+	return strings.Join(quoted, ":")
 }
 
 // AddGraph 将图数据写入 Neo4j
@@ -88,7 +131,7 @@ func (r *Neo4jRepository) AddGraph(ctx context.Context, namespace NameSpace, gra
 }
 
 func (r *Neo4jRepository) addGraph(ctx context.Context, namespace NameSpace, graph *GraphData) error {
-	session := r.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	session := neo4jutil.WriteSession(ctx, r.driver)
 	defer session.Close(ctx)
 
 	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
@@ -161,38 +204,41 @@ func (r *Neo4jRepository) DelGraph(ctx context.Context, namespaces []NameSpace) 
 	if r.driver == nil {
 		return nil
 	}
-	session := r.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	session := neo4jutil.WriteSession(ctx, r.driver)
 	defer session.Close(ctx)
 
+	// 内层语句以参数形式传给 apoc.periodic.iterate，避免在字符串字面量里拼接标签
+	const batchDelete = `
+		CALL apoc.periodic.iterate(
+			$iterate,
+			$action,
+			{batchSize: 1000, parallel: true, params: {knowledge_id: $knowledge_id}}
+		) YIELD batches, total
+		RETURN total
+	`
 	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
 		for _, namespace := range namespaces {
 			labelExpr := r.Label(namespace)
+			if labelExpr == "" {
+				// 无标签时 MATCH 会跨越所有命名空间，拒绝执行以免误删
+				return nil, fmt.Errorf("删除图谱需要非空命名空间")
+			}
+			nodePattern := "(n:" + labelExpr + " {kg: $knowledge_id})"
+			peerPattern := "(m:" + labelExpr + " {kg: $knowledge_id})"
 
 			// 先删关系
-			deleteRelsQuery := `
-				CALL apoc.periodic.iterate(
-					"MATCH (n:` + labelExpr + ` {kg: $knowledge_id})-[r]-(m:` + labelExpr + ` {kg: $knowledge_id}) RETURN r",
-					"DELETE r",
-					{batchSize: 1000, parallel: true, params: {knowledge_id: $knowledge_id}}
-				) YIELD batches, total
-				RETURN total
-			`
-			if _, err := tx.Run(ctx, deleteRelsQuery, map[string]interface{}{
+			if _, err := tx.Run(ctx, batchDelete, map[string]interface{}{
+				"iterate":      "MATCH " + nodePattern + "-[r]-" + peerPattern + " RETURN r",
+				"action":       "DELETE r",
 				"knowledge_id": namespace.Knowledge,
 			}); err != nil {
 				return nil, fmt.Errorf("删除关系失败: %w", err)
 			}
 
 			// 再删节点
-			deleteNodesQuery := `
-				CALL apoc.periodic.iterate(
-					"MATCH (n:` + labelExpr + ` {kg: $knowledge_id}) RETURN n",
-					"DELETE n",
-					{batchSize: 1000, parallel: true, params: {knowledge_id: $knowledge_id}}
-				) YIELD batches, total
-				RETURN total
-			`
-			if _, err := tx.Run(ctx, deleteNodesQuery, map[string]interface{}{
+			if _, err := tx.Run(ctx, batchDelete, map[string]interface{}{
+				"iterate":      "MATCH " + nodePattern + " RETURN n",
+				"action":       "DELETE n",
 				"knowledge_id": namespace.Knowledge,
 			}); err != nil {
 				return nil, fmt.Errorf("删除节点失败: %w", err)
@@ -207,8 +253,50 @@ func (r *Neo4jRepository) DelGraph(ctx context.Context, namespaces []NameSpace) 
 	return nil
 }
 
+// buildSearchNodeQuery 构建图增强检索语句：
+//  1. 用名称 CONTAINS 匹配出种子实体（最多 $maxSeeds 个）
+//  2. 从种子出发做 1..maxHops 跳的无向变长遍历，路径上所有节点都必须在同一命名空间
+//  3. 每个 (种子, 相关实体) 只保留最短、关系权重最高的一条路径
+//  4. 按跳数升序、权重降序排序
+//
+// labelExpr 必须来自 Label()（已转义）；maxHops 只能是 1..MaxAllowedHops 的整数，
+// 因为 Cypher 不支持参数化变长路径的上下界。
+func buildSearchNodeQuery(labelExpr string, maxHops int) (string, error) {
+	if maxHops < 1 || maxHops > MaxAllowedHops {
+		return "", fmt.Errorf("max hops must be within 1..%d, got %d", MaxAllowedHops, maxHops)
+	}
+	inNamespace := func(v string) string {
+		if labelExpr == "" {
+			return "ANY(lbl IN labels(" + v + ") WHERE lbl STARTS WITH 'ENTITY')"
+		}
+		return v + ":" + labelExpr
+	}
+	return `
+		MATCH (n)
+		WHERE ` + inNamespace("n") + `
+		  AND ANY(nodeText IN $nodes WHERE size(nodeText) >= 2 AND (toLower(n.name) CONTAINS toLower(nodeText) OR (size(n.name) >= 2 AND toLower(nodeText) CONTAINS toLower(n.name))))
+		WITH n ORDER BY n.name ASC LIMIT $maxSeeds
+		OPTIONAL MATCH p = (n)-[*1..` + strconv.Itoa(maxHops) + `]-(m)
+		WHERE m <> n AND ALL(x IN nodes(p) WHERE ` + inNamespace("x") + `)
+		WITH n, m, p,
+		     CASE WHEN p IS NULL THEN 0 ELSE length(p) END AS hops,
+		     CASE WHEN p IS NULL THEN 1.0 ELSE reduce(w = 1.0, rel IN relationships(p) | w * coalesce(toFloat(rel.weight), 1.0)) END AS weight
+		ORDER BY hops ASC, weight DESC
+		WITH n, m, head(collect({
+		       hops: hops,
+		       weight: weight,
+		       rels: [rel IN coalesce(relationships(p), []) | {type: type(rel), source: startNode(rel).name, target: endNode(rel).name}]
+		     })) AS best
+		RETURN n {.name, .entity_type, .chunks, .attributes} AS seed,
+		       CASE WHEN m IS NULL THEN null ELSE m {.name, .entity_type, .chunks, .attributes} END AS related,
+		       best.hops AS hops, best.weight AS weight, best.rels AS rels
+		ORDER BY hops ASC, weight DESC, seed.name ASC, related.name ASC
+		LIMIT $maxResults
+	`, nil
+}
+
 // SearchNode 根据实体列表在 Neo4j 中检索（支持类型约束过滤）
-// 使用 CONTAINS 匹配，返回匹配节点及其关系和关联的 Chunk IDs
+// 名称 CONTAINS 匹配种子实体后做有界变长遍历，返回相关实体（带跳数/权重）、关系及关联 Chunk IDs
 func (r *Neo4jRepository) SearchNode(
 	ctx context.Context,
 	namespace NameSpace,
@@ -217,153 +305,182 @@ func (r *Neo4jRepository) SearchNode(
 	if r.driver == nil {
 		return nil, nil
 	}
-	session := r.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
-	defer session.Close(ctx)
 
-	// 提取实体名称列表用于 Cypher 匹配
 	entityNames := make([]string, len(entities))
-	// 构建名称→类型映射，用于后过滤
-	entityTypeMap := make(map[string]string)
 	for i, e := range entities {
 		entityNames[i] = e.Name
-		if e.Type != "" && e.Type != "Other" {
-			entityTypeMap[strings.ToLower(e.Name)] = e.Type
-		}
 	}
 
+	query, err := buildSearchNodeQuery(r.Label(namespace), normalizeMaxHops(r.maxHops))
+	if err != nil {
+		return nil, err
+	}
+
+	session := neo4jutil.ReadSession(ctx, r.driver)
+	defer session.Close(ctx)
+
 	result, err := session.ExecuteRead(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
-		labelExpr := r.Label(namespace)
-		var nodeMatch string
-		if labelExpr == "" {
-			nodeMatch = "(n)"
-		} else {
-			nodeMatch = "(n:" + labelExpr + ")"
-		}
-
-		matchExpr := `ANY(nodeText IN $nodes WHERE size(nodeText) >= 2 AND (toLower(n.name) CONTAINS toLower(nodeText) OR (size(n.name) >= 2 AND toLower(nodeText) CONTAINS toLower(n.name))))`
-
-		var query string
-		if labelExpr == "" {
-			query = `
-				MATCH ` + nodeMatch + `-[r]-(m)
-				WHERE ANY(lbl IN labels(n) WHERE lbl STARTS WITH 'ENTITY')
-				AND ` + matchExpr + `
-				RETURN n, r, m
-				LIMIT $maxResults
-			`
-		} else {
-			query = `
-				MATCH ` + nodeMatch + `-[r]-(m)
-				WHERE ` + matchExpr + `
-				RETURN n, r, m
-				LIMIT $maxResults
-			`
-		}
-		params := map[string]interface{}{"nodes": entityNames, "maxResults": 200}
-		result, err := tx.Run(ctx, query, params)
+		res, err := tx.Run(ctx, query, map[string]interface{}{
+			"nodes":      entityNames,
+			"maxSeeds":   searchSeedLimit,
+			"maxResults": searchResultLimit,
+		})
 		if err != nil {
 			return nil, fmt.Errorf("Cypher 查询失败: %w", err)
 		}
-
-		graphData := &GraphData{}
-		nodeSeen := make(map[string]bool)
-		for result.Next(ctx) {
-			record := result.Record()
-			node, _ := record.Get("n")
-			rel, _ := record.Get("r")
-			targetNode, _ := record.Get("m")
-
-			nodeData := node.(neo4j.Node)
-			targetNodeData := targetNode.(neo4j.Node)
-
-			// 收集节点（去重）
-			for _, n := range []neo4j.Node{nodeData, targetNodeData} {
-				nameStr, _ := n.Props["name"].(string)
-				if nameStr == "" {
-					continue
-				}
-				if !nodeSeen[nameStr] {
-					nodeSeen[nameStr] = true
-					entityType, _ := n.Props["entity_type"].(string)
-					graphData.Node = append(graphData.Node, &GraphNode{
-						Name:       nameStr,
-						Type:       entityType,
-						Chunks:     listToStrings(n.Props["chunks"]),
-						Attributes: listToStrings(n.Props["attributes"]),
-					})
-				}
-			}
-
-			// 收集关系
-			relData := rel.(neo4j.Relationship)
-			sourceName, _ := nodeData.Props["name"].(string)
-			targetName, _ := targetNodeData.Props["name"].(string)
-			graphData.Relation = append(graphData.Relation, &GraphRelation{
-				Node1: sourceName,
-				Node2: targetName,
-				Type:  relData.Type,
-			})
+		acc := newSearchAccumulator()
+		for res.Next(ctx) {
+			rec := res.Record()
+			seed, _ := rec.Get("seed")
+			related, _ := rec.Get("related")
+			hops, _ := rec.Get("hops")
+			weight, _ := rec.Get("weight")
+			rels, _ := rec.Get("rels")
+			acc.add(seed, related, neo4jutil.ToInt(hops), neo4jutil.ToFloat(weight), rels)
 		}
-
-		// 类型后过滤：如果查询实体指定了类型，降低不匹配类型的节点优先级
-		if len(entityTypeMap) > 0 {
-			filtered := make([]*GraphNode, 0, len(graphData.Node))
-			for _, node := range graphData.Node {
-				// 检查此节点是否匹配了某个带类型的查询实体
-				nameLower := strings.ToLower(node.Name)
-				matched := false
-				for queryName, queryType := range entityTypeMap {
-					if strings.Contains(nameLower, queryName) || strings.Contains(queryName, nameLower) {
-						if node.Type != "" && node.Type != queryType {
-							continue // 类型不匹配，跳过
-						}
-						matched = true
-						break
-					}
-				}
-				// 保留：类型匹配的、没有类型约束的、以及通过关系连接的邻居节点
-				if matched || node.Type == "" {
-					filtered = append(filtered, node)
-				} else {
-					// 非直接匹配的节点（邻居节点）保留
-					isDirectMatch := false
-					for _, name := range entityNames {
-						if strings.Contains(nameLower, strings.ToLower(name)) || strings.Contains(strings.ToLower(name), nameLower) {
-							isDirectMatch = true
-							break
-						}
-					}
-					if !isDirectMatch {
-						filtered = append(filtered, node) // 邻居节点不过滤
-					}
-				}
-			}
-			graphData.Node = filtered
+		if err := res.Err(); err != nil {
+			return nil, fmt.Errorf("读取 Cypher 结果失败: %w", err)
 		}
-
-		return graphData, nil
+		return acc.graph(), nil
 	})
 	if err != nil {
 		log.Printf("[GraphRAG] SearchNode 失败: %v", err)
 		return nil, err
 	}
-	return result.(*GraphData), nil
+
+	graphData := result.(*GraphData)
+	graphData.Node = filterSeedsByType(graphData.Node, entities)
+	return graphData, nil
 }
 
-// listToStrings 将 Neo4j 返回的 []interface{} 转为 []string
-func listToStrings(v interface{}) []string {
-	if v == nil {
-		return nil
+// searchAccumulator 合并多条路径记录：同名实体保留最小跳数/最大权重，关系去重
+type searchAccumulator struct {
+	nodes    map[string]*GraphNode
+	relSeen  map[string]bool
+	relOrder []*GraphRelation
+}
+
+func newSearchAccumulator() *searchAccumulator {
+	return &searchAccumulator{nodes: map[string]*GraphNode{}, relSeen: map[string]bool{}}
+}
+
+func (a *searchAccumulator) add(seed, related any, hops int, weight float64, rels any) {
+	a.addNode(seed, 0, 1.0)
+	if related != nil {
+		a.addNode(related, hops, weight)
 	}
-	list, ok := v.([]interface{})
-	if !ok {
-		return nil
-	}
-	result := make([]string, 0, len(list))
+	list, _ := rels.([]any)
 	for _, item := range list {
-		result = append(result, fmt.Sprintf("%v", item))
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		rel := &GraphRelation{
+			Node1: stringProp(m, "source"),
+			Node2: stringProp(m, "target"),
+			Type:  stringProp(m, "type"),
+		}
+		key := rel.Node1 + "\x00" + rel.Type + "\x00" + rel.Node2
+		if a.relSeen[key] {
+			continue
+		}
+		a.relSeen[key] = true
+		a.relOrder = append(a.relOrder, rel)
 	}
-	return result
+}
+
+func (a *searchAccumulator) addNode(v any, hops int, weight float64) {
+	props, ok := v.(map[string]any)
+	if !ok {
+		return
+	}
+	name := stringProp(props, "name")
+	if name == "" {
+		return
+	}
+	if weight <= 0 {
+		weight = 1.0
+	}
+	if existing, ok := a.nodes[name]; ok {
+		if hops < existing.Hops || (hops == existing.Hops && weight > existing.Weight) {
+			existing.Hops = hops
+			existing.Weight = weight
+		}
+		return
+	}
+	a.nodes[name] = &GraphNode{
+		Name:       name,
+		Type:       stringProp(props, "entity_type"),
+		Chunks:     neo4jutil.ToStrings(props["chunks"]),
+		Attributes: neo4jutil.ToStrings(props["attributes"]),
+		Hops:       hops,
+		Weight:     weight,
+	}
+}
+
+func (a *searchAccumulator) graph() *GraphData {
+	nodes := make([]*GraphNode, 0, len(a.nodes))
+	for _, n := range a.nodes {
+		nodes = append(nodes, n)
+	}
+	sort.Slice(nodes, func(i, j int) bool {
+		if nodes[i].Hops != nodes[j].Hops {
+			return nodes[i].Hops < nodes[j].Hops
+		}
+		if nodes[i].Weight != nodes[j].Weight {
+			return nodes[i].Weight > nodes[j].Weight
+		}
+		return nodes[i].Name < nodes[j].Name
+	})
+	return &GraphData{Node: nodes, Relation: a.relOrder}
+}
+
+func stringProp(m map[string]any, key string) string {
+	s, _ := m[key].(string)
+	return s
+}
+
+// filterSeedsByType 按查询实体的类型约束过滤直接命中的种子实体。
+// 种子只有在"名称命中的带类型查询实体全部类型不符，且没有其它查询实体认可它"时才被剔除；
+// 通过关系遍历得到的邻居实体（Hops>0）不过滤。
+func filterSeedsByType(nodes []*GraphNode, entities []QueryEntity) []*GraphNode {
+	hasTyped := false
+	for _, e := range entities {
+		if isTypedEntity(e) {
+			hasTyped = true
+			break
+		}
+	}
+	if !hasTyped {
+		return nodes
+	}
+	filtered := make([]*GraphNode, 0, len(nodes))
+	for _, node := range nodes {
+		if node.Hops > 0 || keepSeed(node, entities) {
+			filtered = append(filtered, node)
+		}
+	}
+	return filtered
+}
+
+func isTypedEntity(e QueryEntity) bool {
+	return e.Type != "" && e.Type != "Other"
+}
+
+func keepSeed(node *GraphNode, entities []QueryEntity) bool {
+	nameLower := strings.ToLower(node.Name)
+	conflict := false
+	for _, e := range entities {
+		queryLower := strings.ToLower(e.Name)
+		if queryLower == "" || !(strings.Contains(nameLower, queryLower) || strings.Contains(queryLower, nameLower)) {
+			continue
+		}
+		if !isTypedEntity(e) || node.Type == "" || node.Type == e.Type {
+			return true
+		}
+		conflict = true
+	}
+	return !conflict
 }
 
 // GetGraphForVis 获取可视化用的子图数据
@@ -376,7 +493,7 @@ func (r *Neo4jRepository) GetGraphForVis(ctx context.Context, namespace NameSpac
 		limit = 200
 	}
 
-	session := r.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
+	session := neo4jutil.ReadSession(ctx, r.driver)
 	defer session.Close(ctx)
 
 	result, err := session.ExecuteRead(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
@@ -390,7 +507,7 @@ func (r *Neo4jRepository) GetGraphForVis(ctx context.Context, namespace NameSpac
 			MATCH (n:` + labelExpr + `)
 			OPTIONAL MATCH (n)-[r]-()
 			WITH n, count(r) AS degree
-			ORDER BY degree DESC
+			ORDER BY degree DESC, n.name ASC
 			LIMIT $limit
 			RETURN n.name AS name, degree, n.chunks AS chunks
 		`
@@ -400,30 +517,24 @@ func (r *Neo4jRepository) GetGraphForVis(ctx context.Context, namespace NameSpac
 		}
 
 		vis := &VisGraph{}
+		names := make([]string, 0, limit)
 		nodeSet := make(map[string]bool)
 
 		for nodeResult.Next(ctx) {
 			rec := nodeResult.Record()
-			name, _ := rec.Get("name")
-			degree, _ := rec.Get("degree")
-			chunks, _ := rec.Get("chunks")
-
-			nameStr, _ := name.(string)
-			if nameStr == "" {
+			nameStr := neo4jutil.String(rec, "name")
+			if nameStr == "" || nodeSet[nameStr] {
 				continue
 			}
-			degreeInt, _ := degree.(int64)
-			chunkCount := 0
-			if cl, ok := chunks.([]interface{}); ok {
-				chunkCount = len(cl)
-			}
+			chunks, _ := rec.Get("chunks")
 
 			nodeSet[nameStr] = true
+			names = append(names, nameStr)
 			vis.Nodes = append(vis.Nodes, VisNode{
 				ID:         nameStr,
 				Label:      nameStr,
-				Degree:     int(degreeInt),
-				ChunkCount: chunkCount,
+				Degree:     neo4jutil.Int(rec, "degree"),
+				ChunkCount: len(neo4jutil.ToStrings(chunks)),
 			})
 		}
 
@@ -438,10 +549,6 @@ func (r *Neo4jRepository) GetGraphForVis(ctx context.Context, namespace NameSpac
 			RETURN DISTINCT n.name AS source, m.name AS target, type(r) AS relType
 			LIMIT $edgeLimit
 		`
-		names := make([]string, 0, len(nodeSet))
-		for n := range nodeSet {
-			names = append(names, n)
-		}
 		edgeLimit := limit * 2
 		if edgeLimit > 1000 {
 			edgeLimit = 1000
@@ -457,18 +564,10 @@ func (r *Neo4jRepository) GetGraphForVis(ctx context.Context, namespace NameSpac
 
 		for edgeResult.Next(ctx) {
 			rec := edgeResult.Record()
-			source, _ := rec.Get("source")
-			target, _ := rec.Get("target")
-			relType, _ := rec.Get("relType")
-
-			sourceStr, _ := source.(string)
-			targetStr, _ := target.(string)
-			relStr, _ := relType.(string)
-
 			vis.Edges = append(vis.Edges, VisEdge{
-				Source: sourceStr,
-				Target: targetStr,
-				Label:  relStr,
+				Source: neo4jutil.String(rec, "source"),
+				Target: neo4jutil.String(rec, "target"),
+				Label:  neo4jutil.String(rec, "relType"),
 			})
 		}
 
@@ -486,7 +585,7 @@ func (r *Neo4jRepository) EnsureIndexes(ctx context.Context) error {
 	if r.driver == nil {
 		return nil
 	}
-	session := r.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	session := neo4jutil.WriteSession(ctx, r.driver)
 	defer session.Close(ctx)
 
 	// 创建 name 属性索引（IF NOT EXISTS 保证幂等）
@@ -494,11 +593,11 @@ func (r *Neo4jRepository) EnsureIndexes(ctx context.Context) error {
 		`CREATE TEXT INDEX entity_name_text IF NOT EXISTS FOR (n:ENTITY) ON (n.name)`,
 	}
 	for _, q := range queries {
-		if _, err := session.Run(ctx, q, nil); err != nil {
+		if err := neo4jutil.Exec(ctx, session, q, nil); err != nil {
 			log.Printf("[GraphRAG] 创建索引警告（可忽略）: %v", err)
 			// 不同 Neo4j 版本可能不支持 TEXT INDEX，尝试普通索引
 			fallback := `CREATE INDEX entity_name IF NOT EXISTS FOR (n:ENTITY) ON (n.name)`
-			if _, err2 := session.Run(ctx, fallback, nil); err2 != nil {
+			if err2 := neo4jutil.Exec(ctx, session, fallback, nil); err2 != nil {
 				log.Printf("[GraphRAG] 创建备选索引也失败: %v", err2)
 			}
 		}
@@ -509,62 +608,21 @@ func (r *Neo4jRepository) EnsureIndexes(ctx context.Context) error {
 
 // ── Neo4j 连接工厂 ──
 
-// InitNeo4jDriver 初始化 Neo4j 驱动（带重试）
-// 优先使用 Config 字段，环境变量作为备选
+// InitNeo4jDriver 初始化 Neo4j 驱动（带重试）。
+// 凭据只来自传入的 cfg：URI 与密码必填，用户名缺省为 "neo4j"。
+// 调用方拥有返回的驱动，必须在退出时调用 driver.Close(ctx)。
 func InitNeo4jDriver(ctx context.Context, cfg *Config) (neo4j.DriverWithContext, error) {
-	uri := cfg.Neo4jURI
-	if uri == "" {
-		uri = os.Getenv("NEO4J_URI")
+	if cfg == nil {
+		return nil, fmt.Errorf("graphrag: config is nil")
 	}
-	username := cfg.Neo4jUser
-	if username == "" {
-		username = os.Getenv("NEO4J_USERNAME")
+	driver, err := neo4jutil.Connect(ctx, neo4jutil.ConnectConfig{
+		URI:       cfg.Neo4jURI,
+		Username:  cfg.Neo4jUser,
+		Password:  cfg.Neo4jPass,
+		LogPrefix: "[GraphRAG]",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("graphrag: %w", err)
 	}
-	password := cfg.Neo4jPass
-	if password == "" {
-		password = os.Getenv("NEO4J_PASSWORD")
-	}
-
-	if uri == "" {
-		uri = "bolt://localhost:7687"
-	}
-	if username == "" {
-		username = "neo4j"
-	}
-	if password == "" {
-		password = "password"
-	}
-
-	maxRetries := 5
-	retryInterval := 2 * time.Second
-
-	var driver neo4j.DriverWithContext
-	var err error
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		driver, err = neo4j.NewDriverWithContext(uri, neo4j.BasicAuth(username, password, ""))
-		if err != nil {
-			log.Printf("[GraphRAG] 创建 Neo4j 驱动失败 (尝试 %d/%d): %v", attempt, maxRetries, err)
-			time.Sleep(retryInterval)
-			continue
-		}
-
-		err = driver.VerifyConnectivity(ctx)
-		if err == nil {
-			if attempt > 1 {
-				log.Printf("[GraphRAG] Neo4j 连接成功 (经过 %d 次尝试)", attempt)
-			} else {
-				log.Printf("[GraphRAG] Neo4j 连接成功: %s", uri)
-			}
-			return driver, nil
-		}
-
-		log.Printf("[GraphRAG] Neo4j 连接验证失败 (尝试 %d/%d): %v", attempt, maxRetries, err)
-		driver.Close(ctx)
-		time.Sleep(retryInterval)
-	}
-
-	return nil, fmt.Errorf("Neo4j 连接失败 (尝试 %d 次): %w", maxRetries, err)
+	return driver, nil
 }
-
-

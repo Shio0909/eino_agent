@@ -37,18 +37,22 @@ type fetchResult struct {
 }
 
 func newLocalEngine(cfg *Config) Engine {
+	policy := buildURLPolicy(cfg)
+	maxRedirects := cfg.MaxRedirects
+	if maxRedirects <= 0 {
+		maxRedirects = 5
+	}
+	httpClient := security.NewHTTPClient(policy, cfg.RequestTimeout)
+	httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= maxRedirects {
+			return fmt.Errorf("too many redirects")
+		}
+		_, err := security.ValidateExternalURL(req.URL.String(), policy)
+		return err
+	}
 	return &localEngine{
-		config: cfg,
-		httpClient: &http.Client{
-			Timeout: cfg.RequestTimeout,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				if len(via) >= cfg.MaxRedirects {
-					return fmt.Errorf("too many redirects")
-				}
-				_, err := security.ValidateExternalURL(req.URL.String(), buildURLPolicy(cfg))
-				return err
-			},
-		},
+		config:     cfg,
+		httpClient: httpClient,
 	}
 }
 
@@ -493,4 +497,3 @@ func needsBrowserRendering(fetch *fetchResult) bool {
 	body := strings.ToLower(string(fetch.Content))
 	return strings.Contains(body, "__next") || strings.Contains(body, "data-reactroot") || strings.Contains(body, "window.__")
 }
-

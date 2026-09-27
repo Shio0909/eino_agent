@@ -55,7 +55,15 @@ func (m *mockKBRepo) GetByID(_ context.Context, id string) (*repository.Knowledg
 	if m.getErr != nil {
 		return nil, m.getErr
 	}
-	return m.kb, nil
+	if m.kb != nil {
+		return m.kb, nil
+	}
+	for _, kb := range m.kbs {
+		if kb.ID == id {
+			return kb, nil
+		}
+	}
+	return nil, nil
 }
 func (m *mockKBRepo) List(_ context.Context, _ int, _, _ int) ([]*repository.KnowledgeBase, error) {
 	return m.kbs, m.err
@@ -94,7 +102,7 @@ type mockMCPWriter struct {
 	importCalled bool
 }
 
-func (m *mockMCPWriter) MCPCreateKB(_ context.Context, name, desc, mode string) (*repository.KnowledgeBase, error) {
+func (m *mockMCPWriter) MCPCreateKB(_ context.Context, _ int, name, desc, mode string) (*repository.KnowledgeBase, error) {
 	return &repository.KnowledgeBase{ID: "kb-created", Name: name, Description: desc, Mode: mode}, nil
 }
 func (m *mockMCPWriter) MCPImportURL(_ context.Context, _ string, _ string, _ string) (string, int, error) {
@@ -664,7 +672,7 @@ func TestHandleListKnowledgeBases_DBError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	assertToolError(t, result, "获取知识库列表失败")
+	assertToolError(t, result, "获取知识库授权范围失败")
 }
 
 func TestShouldExposeAnswerTool_DefaultFalse(t *testing.T) {
@@ -1010,7 +1018,7 @@ func TestHandleImportURLReturnsApprovalRequiredWhenConfigured(t *testing.T) {
 
 func TestHandleImportURLExecutesAfterApprovalIDRetry(t *testing.T) {
 	writer := &mockMCPWriter{}
-	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{kbs: []*repository.KnowledgeBase{{ID: "kb-1", TenantID: 1}}})
 	s.config.MCPExport.EnableAdminTools = true
 	s.config.MCPExport.RequireApprovalForAdminTools = true
 	s.kbWriter = writer
@@ -1290,4 +1298,48 @@ func findSubstring(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+func TestAuthorizeKnowledgeBaseRejectsOtherTenant(t *testing.T) {
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{kbs: []*repository.KnowledgeBase{{ID: "kb-other", TenantID: 2}}})
+	ctx := context.WithValue(context.Background(), ctxKeyScope, mcpScope{tenantID: 1, userID: "u"})
+	if err := s.authorizeKnowledgeBase(ctx, "kb-other", accessLevelRead); err == nil {
+		t.Fatal("expected cross-tenant access to be rejected")
+	}
+	if err := s.authorizeKnowledgeBase(ctx, "kb-missing", accessLevelRead); err == nil {
+		t.Fatal("expected missing KB to be rejected")
+	}
+}
+
+func TestAuthorizeKnowledgeBaseWriteRequiresAdminScope(t *testing.T) {
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{kbs: []*repository.KnowledgeBase{{ID: "kb-1", TenantID: 1}}})
+	ctx := context.WithValue(context.Background(), ctxKeyScope, mcpScope{tenantID: 1, userID: "u"})
+	if err := s.authorizeKnowledgeBase(ctx, "kb-1", accessLevelRead); err != nil {
+		t.Fatalf("read should be allowed: %v", err)
+	}
+	if err := s.authorizeKnowledgeBase(ctx, "kb-1", accessLevelWrite); err == nil {
+		t.Fatal("write without admin scope should be rejected")
+	}
+}
+
+func TestBareAPIKeyNeverGrantsAdminTools(t *testing.T) {
+	cfg := config.MCPExportConfig{APIKeys: []string{"bare"}, EnableAdminTools: true}
+	_, scopes := buildAPIKeyScopes(cfg)
+	scope, ok := scopes["bare"]
+	if !ok {
+		t.Fatal("bare key should have an explicit scope")
+	}
+	if scope.allowAdminTools {
+		t.Fatal("bare API key must not grant admin tools")
+	}
+}
+
+func TestHTTPWithoutAPIKeysDisablesAdminTools(t *testing.T) {
+	s := newTestServer(&mockChatProvider{}, &mockKBRepo{})
+	s.config.MCPExport.EnableAdminTools = true
+	req, _ := http.NewRequest(http.MethodPost, "http://localhost/mcp", nil)
+	ctx := s.httpContextFunc()(context.Background(), req)
+	if err := s.authorizeAdminTool(ctx); err == nil {
+		t.Fatal("admin tools must be disabled for unauthenticated network transports")
+	}
 }
