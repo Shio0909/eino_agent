@@ -57,6 +57,9 @@ type ChatResponse struct {
 	SessionID string      `json:"session_id,omitempty"`
 	TraceID   string      `json:"trace_id,omitempty"`
 	Trace     []TraceStep `json:"trace,omitempty"`
+	// GroundingStatus is set when the pipeline evidence gate made an explicit
+	// decision (pipeline.GroundingStatusGrounded / GroundingStatusInsufficient).
+	GroundingStatus string `json:"grounding_status,omitempty"`
 }
 
 // TraceStep captures one observable stage in a chat request.

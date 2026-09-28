@@ -28,11 +28,11 @@ type codeGraphInput struct {
 }
 
 type codeGraphOutput struct {
-	Action   string                  `json:"action"`
-	Results  []codeGraphResult       `json:"results,omitempty"`
-	Overview *codegraph.RepoOverview `json:"overview,omitempty"`
+	Action   string                   `json:"action"`
+	Results  []codeGraphResult        `json:"results,omitempty"`
+	Overview *codegraph.RepoOverview  `json:"overview,omitempty"`
 	Progress *codegraph.IndexProgress `json:"progress,omitempty"`
-	Summary  string                  `json:"summary"`
+	Summary  string                   `json:"summary"`
 }
 
 type codeGraphResult struct {
@@ -68,7 +68,7 @@ func (t *CodeGraphTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
 			},
 			"repo": {
 				Type:     schema.String,
-				Desc:     "仓库名称，如 deer-flow",
+				Desc:     "仓库目录名（repos 目录下的子目录）",
 				Required: true,
 			},
 			"name": {

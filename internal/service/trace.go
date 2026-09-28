@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/cloudwego/eino/components/retriever"
@@ -11,10 +12,14 @@ import (
 	"eino_agent/internal/tracing"
 )
 
+// traceCollector is written from the request goroutine, streaming goroutines
+// and tool callbacks concurrently, so all access to steps is locked.
 type traceCollector struct {
 	traceID string
 	started time.Time
-	steps   []TraceStep
+
+	mu    sync.Mutex
+	steps []TraceStep
 }
 
 func newTraceCollector(traceID string) *traceCollector {
@@ -28,6 +33,8 @@ func (t *traceCollector) add(step TraceStep) TraceStep {
 	if step.TraceID == "" {
 		step.TraceID = t.traceID
 	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if step.Seq == 0 {
 		step.Seq = len(t.steps) + 1
 	}
@@ -104,17 +111,18 @@ func (t *traceCollector) summary(mode, status string, latencyMs int64, sourceCou
 	if t == nil {
 		return repository.JSON{}
 	}
+	steps := t.snapshot()
 	summary := repository.JSON{
 		"mode":         mode,
 		"status":       status,
 		"latency_ms":   latencyMs,
 		"source_count": sourceCount,
-		"step_count":   len(t.steps),
+		"step_count":   len(steps),
 	}
 	if errText != "" {
 		summary["error"] = errText
 	}
-	for _, step := range t.steps {
+	for _, step := range steps {
 		if step.Stage == "request" && step.Metadata != nil {
 			if query, ok := step.Metadata["query"].(string); ok && query != "" {
 				summary["query"] = query
@@ -128,7 +136,12 @@ func (t *traceCollector) summary(mode, status string, latencyMs int64, sourceCou
 }
 
 func (t *traceCollector) snapshot() []TraceStep {
-	if t == nil || len(t.steps) == 0 {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.steps) == 0 {
 		return nil
 	}
 	out := make([]TraceStep, len(t.steps))

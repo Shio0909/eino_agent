@@ -446,24 +446,6 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// Save 保存配置到文件（YAML）
-func Save(path string, cfg *Config) error {
-	if cfg == nil {
-		return fmt.Errorf("config is nil")
-	}
-
-	data, err := yaml.Marshal(cfg)
-	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
-	}
-
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return fmt.Errorf("write config file: %w", err)
-	}
-
-	return nil
-}
-
 const defaultJWTSecret = "change-me-in-production"
 
 // weakPasswords 常见弱密码集合

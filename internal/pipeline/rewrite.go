@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cloudwego/eino/components/prompt"
 	"github.com/cloudwego/eino/components/model"
+	"github.com/cloudwego/eino/components/prompt"
 	"github.com/cloudwego/eino/schema"
 )
 
@@ -68,7 +68,26 @@ func (r *LLMRewriter) Rewrite(ctx context.Context, query string) (string, error)
 		return query, err
 	}
 
-	return resp.Content, nil
+	if cleaned := cleanRewrittenQuery(resp.Content); cleaned != "" {
+		return cleaned, nil
+	}
+	return query, nil
+}
+
+// cleanRewrittenQuery strips the label, quotes and trailing explanations that
+// chat models often wrap around a rewritten query.
+func cleanRewrittenQuery(raw string) string {
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		for _, prefix := range []string{"优化后的查询：", "优化后的查询:", "查询：", "查询:", "Query:", "query:"} {
+			line = strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		}
+		line = strings.Trim(line, "\"'“”‘’`")
+		if line != "" {
+			return line
+		}
+	}
+	return ""
 }
 
 // WithQueryHistory 将上文上下文注入 ctx，供 Rewrite 使用。

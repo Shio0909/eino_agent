@@ -76,7 +76,7 @@ func (t *CodeSearchTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
 			},
 			"repo": {
 				Type: schema.String,
-				Desc: "指定仓库目录名。当前项目可用 eino_agent 或留空；测试仓库如 deer-flow、pydantic-ai 必须显式填写对应 repo。",
+				Desc: "仓库目录名（repos 目录下的子目录）。留空使用默认仓库。",
 			},
 			"file_glob": {
 				Type: schema.String,

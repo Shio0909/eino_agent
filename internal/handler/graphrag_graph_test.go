@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"eino_agent/internal/config"
+	"eino_agent/internal/database/repository"
 	"eino_agent/internal/graphrag"
 )
 
@@ -37,7 +38,8 @@ func (r fakeGraphRepository) GetGraphForVis(context.Context, graphrag.NameSpace,
 func TestGetGraphRAGGraphReturnsVisualizationData(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	h := &Handler{
-		cfg: &config.Config{},
+		cfg:    &config.Config{},
+		kbRepo: &fakeKnowledgeBaseRepo{items: map[string]*repository.KnowledgeBase{"kb-1": {ID: "kb-1", TenantID: 1}}},
 		graphRAGService: graphrag.NewService(&graphrag.Config{Enabled: true}, nil, fakeGraphRepository{graph: &graphrag.VisGraph{
 			Nodes: []graphrag.VisNode{{ID: "go", Label: "Go", Degree: 2, ChunkCount: 3}},
 			Edges: []graphrag.VisEdge{{Source: "go", Target: "gc", Label: "HAS_CONCEPT"}},
@@ -46,8 +48,8 @@ func TestGetGraphRAGGraphReturnsVisualizationData(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/v1/graphrag/kb-1/graph?limit=50", nil)
-	ctx.Params = gin.Params{{Key: "kbId", Value: "kb-1"}}
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/v1/knowledge-bases/kb-1/graph?limit=50", nil)
+	ctx.Params = gin.Params{{Key: "id", Value: "kb-1"}}
 
 	h.GetGraphRAGGraph(ctx)
 

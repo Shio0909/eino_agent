@@ -3,7 +3,6 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"sort"
@@ -372,7 +371,7 @@ func (s *ChatService) buildRuntimeInstruction(ctx context.Context, req *ChatRequ
 
 func codeQueryInstruction(message string) string {
 	lower := strings.ToLower(message)
-	keywords := []string{"code", "function", "tool_call", "function_call", "源码", "代码", "函数", "实现", "调用链", "工具调用", "deer-flow", "pydantic-ai", "normalize", "path_not_found"}
+	keywords := []string{"code", "function", "method", "tool_call", "function_call", "源码", "代码", "函数", "方法", "实现", "调用链", "工具调用"}
 	matched := false
 	for _, keyword := range keywords {
 		if strings.Contains(lower, strings.ToLower(keyword)) {
@@ -383,7 +382,7 @@ func codeQueryInstruction(message string) string {
 	if !matched {
 		return ""
 	}
-	return "【代码查询约束】这是代码实现类问题。必须优先使用 code_search，最多执行 4 次 code_search 调用：第 1 次 grep 精确运行时/函数关键词，第 2-3 次 read 最相关文件，第 4 次仅在路径错误时 find 或 grep 纠错。当前项目使用 repo=\"eino_agent\" 或留空；deer-flow、pydantic-ai 等测试仓库必须显式填写 repo。除非用户明确问构建或格式化配置，不要优先读取 Makefile、go.mod、package.json、prettier、eslint、配置文件。已有足够文件证据后必须停止调用工具并直接回答。"
+	return "【代码查询约束】这是代码实现类问题。必须优先使用 code_search，最多执行 4 次 code_search 调用：第 1 次 grep 精确运行时/函数关键词，第 2-3 次 read 最相关文件，第 4 次仅在路径错误时 find 或 grep 纠错。repo 参数填写目标仓库目录名，问题未指明仓库时留空使用默认仓库。除非用户明确问构建或格式化配置，不要优先读取 Makefile、go.mod、package.json、prettier、eslint、配置文件。已有足够文件证据后必须停止调用工具并直接回答。"
 }
 
 func (s *ChatService) agenticProjectContextRecoveryInstruction(ctx context.Context, req *ChatRequest) string {
@@ -419,7 +418,7 @@ func (s *ChatService) agenticProjectContextRecoveryDecision(ctx context.Context,
 }
 
 func agenticProjectContextRecoveryText(webSearchEnabled bool) string {
-	steps := "1. 先用 knowledge_search 对原问题执行 auto 检索；2. 改用 exact/semantic 模式检索 `README`、`架构`、`项目介绍`、`Eino Agent`、`RAG Pipeline Agentic MCP code_search` 等关键词；3. 如果仍缺证据，使用 query_decompose 拆成项目定位、核心模块、整体架构等子问题后分别检索；4. 再尝试 HyDE 风格检索：把用户问题改写成一段可能存在于项目说明中的假设文档摘要，并用该摘要关键词检索。"
+	steps := "1. 先用 knowledge_search 对原问题执行 auto 检索；2. 改用 exact/semantic 模式检索 `README`、`架构`、`项目介绍`、`overview`、`architecture` 以及问题中出现的项目名等关键词；3. 如果仍缺证据，使用 query_decompose 拆成项目定位、核心模块、整体架构等子问题后分别检索；4. 再尝试 HyDE 风格检索：把用户问题改写成一段可能存在于项目说明中的假设文档摘要，并用该摘要关键词检索。"
 	if webSearchEnabled {
 		steps += "5. 知识库策略全部失败后，才允许使用 web_search 或其他外部工具补充，并在答案中明确标注外部来源不是知识库证据。"
 	} else {
@@ -477,10 +476,10 @@ type projectContextRecoveryQuery struct {
 func agenticProjectContextRecoveryQueries(original string) []projectContextRecoveryQuery {
 	return []projectContextRecoveryQuery{
 		{Query: original, Mode: "auto"},
-		{Query: "README 架构 项目介绍 Eino Agent", Mode: "exact"},
-		{Query: "Eino Agent RAG Pipeline Agentic MCP code_search 项目整体架构", Mode: "semantic"},
-		{Query: "项目定位 核心模块 整体架构 检索增强生成 工具调用", Mode: "auto"},
-		{Query: "本项目是一个基于 Go 和 Eino 的 RAG 知识库系统，包含 Pipeline、Agentic、MCP、Code Search、GraphRAG、文档导入和 trace 观测能力。", Mode: "semantic"},
+		{Query: "README 项目介绍 项目概述 overview", Mode: "exact"},
+		{Query: "architecture 整体架构 系统架构 核心模块", Mode: "semantic"},
+		{Query: "项目定位 核心功能 主要模块 技术栈", Mode: "auto"},
+		{Query: "本项目是一个系统，主要功能、核心模块和整体架构如下。", Mode: "semantic"},
 	}
 }
 
@@ -886,6 +885,7 @@ func appendInstructionPart(instruction, part string) string {
 type Source struct {
 	Content  string                 `json:"content"`
 	DocID    string                 `json:"doc_id"`
+	Score    float64                `json:"score,omitempty"`
 	Metadata map[string]interface{} `json:"metadata,omitempty"`
 }
 
@@ -1101,101 +1101,6 @@ func (s *ChatService) prepareChatContext(ctx context.Context, req *ChatRequest) 
 	}
 }
 
-func (s *ChatService) tryCodeSearchFastPath(ctx context.Context, req *ChatRequest, sessionID, traceID string, trace *traceCollector) (*ChatResponse, bool) {
-	if req == nil || !shouldUseCodeSearchFastPath(req.Message) || s.config.Agent.CodeSearchReposDir == "" {
-		return nil, false
-	}
-	pattern := codeSearchPatternFromMessage(req.Message)
-	if pattern == "" {
-		return nil, false
-	}
-	repo := codeSearchRepoFromMessage(req.Message)
-	codeTool := internalTool.NewCodeSearchTool(s.config.Agent.CodeSearchReposDir)
-	input := fmt.Sprintf(`{"action":"grep","repo":%q,"pattern":%q,"file_glob":"*.go"}`, repo, pattern)
-	trace.add(TraceStep{Type: "action", Stage: "code_search_fast_path", ToolName: "code_search", ToolInput: input})
-	out, err := codeTool.InvokableRun(ctx, input)
-	if err != nil {
-		trace.add(TraceStep{Type: "error", Stage: "code_search_fast_path", Error: err.Error()})
-		return nil, false
-	}
-	trace.add(TraceStep{Type: "observation", Stage: "code_search_fast_path", ToolName: "code_search", Content: out})
-	answer, sources := summarizeCodeSearchJSON(out)
-	return &ChatResponse{
-		Answer:    answer,
-		Sources:   sources,
-		SessionID: sessionID,
-		TraceID:   traceID,
-		Trace:     trace.snapshot(),
-	}, true
-}
-
-func shouldUseCodeSearchFastPath(message string) bool {
-	lower := strings.ToLower(message)
-	return strings.Contains(lower, "code_search") || strings.Contains(lower, "代码") || strings.Contains(lower, "源码") || strings.Contains(lower, "函数") || strings.Contains(lower, "工具调用")
-}
-
-func codeSearchRepoFromMessage(message string) string {
-	lower := strings.ToLower(message)
-	for _, repo := range []string{"deer-flow", "pydantic-ai", "eino_agent"} {
-		if strings.Contains(lower, repo) {
-			return repo
-		}
-	}
-	return "eino_agent"
-}
-
-func codeSearchPatternFromMessage(message string) string {
-	lower := strings.ToLower(message)
-	candidates := []string{"normalizeReadPath", "path_not_found", "isPathInside", "tool_call", "function_call", "ToolNode", "bind_tools"}
-	selected := make([]string, 0, len(candidates))
-	for _, candidate := range candidates {
-		if strings.Contains(lower, strings.ToLower(candidate)) {
-			selected = append(selected, candidate)
-		}
-	}
-	if len(selected) == 0 && strings.Contains(lower, "工具调用") {
-		selected = append(selected, "tool_call", "function_call", "ToolNode", "bind_tools")
-	}
-	return strings.Join(selected, "|")
-}
-
-func summarizeCodeSearchJSON(output string) (string, []Source) {
-	var payload struct {
-		Summary string `json:"summary"`
-		Results []struct {
-			File    string `json:"file"`
-			Line    int    `json:"line"`
-			Content string `json:"content"`
-		} `json:"results"`
-	}
-	if err := json.Unmarshal([]byte(output), &payload); err != nil || len(payload.Results) == 0 {
-		return "⚠️ code_search 没有返回足够代码证据。", nil
-	}
-	var sb strings.Builder
-	sources := make([]Source, 0, len(payload.Results))
-	sb.WriteString("基于 code_search 的代码证据：")
-	for i, result := range payload.Results {
-		line := ""
-		if result.Line > 0 {
-			line = fmt.Sprintf(":%d", result.Line)
-		}
-		path := result.File + line
-		content := strings.TrimSpace(result.Content)
-		sb.WriteString(fmt.Sprintf("\n- `%s`：%s", path, content))
-		sources = append(sources, Source{
-			Content: content,
-			DocID:   fmt.Sprintf("code:%s", path),
-			Metadata: map[string]any{
-				"source":      result.File,
-				"line":        result.Line,
-				"source_type": "code",
-				"rank":        i + 1,
-			},
-		})
-	}
-	return sb.String(), sources
-}
-
 func isAgentMaxStepsError(err error) bool {
 	if err == nil {
 		return false
@@ -1277,11 +1182,6 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 			}
 			cc.runtimeInstruction = appendInstructionPart(cc.runtimeInstruction, agenticProjectContextRecoveryText(recoveryDecision.WebSearchEnabled))
 			cc.messageWithInst = appendInstructionToMessage(req.Message, cc.runtimeInstruction)
-		}
-		if fastResp, ok := s.tryCodeSearchFastPath(ctx, req, cc.sessionID, traceID, trace); ok {
-			resp = fastResp
-			mode = "agentic_code_search_fast_path"
-			goto finalizeChat
 		}
 		mode = "agentic"
 		modeStart := time.Now()
@@ -1407,17 +1307,19 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 			sources[i] = Source{
 				Content:  src.Content,
 				DocID:    src.DocID,
+				Score:    src.Score,
 				Metadata: src.Metadata,
 			}
 			trace.add(TraceStep{Type: "source", Stage: "source", Content: src.Content, DocID: src.DocID, Metadata: src.Metadata})
 		}
 
 		resp = &ChatResponse{
-			Answer:    pipeResp.Answer,
-			Sources:   sources,
-			SessionID: cc.sessionID,
-			TraceID:   traceID,
-			Trace:     trace.snapshot(),
+			Answer:          pipeResp.Answer,
+			Sources:         sources,
+			SessionID:       cc.sessionID,
+			TraceID:         traceID,
+			Trace:           trace.snapshot(),
+			GroundingStatus: pipeResp.Metadata[pipeline.MetadataKeyGroundingStatus],
 		}
 
 		// 记录 Prometheus 指标 & 审计日志（pipeline 无 token usage，记 0）
@@ -1554,7 +1456,8 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			if respMsg != nil {
 				answer = respMsg.Content
 			}
-			// Strip think-tag content, then fake-stream the final answer rune by rune.
+			// The ReAct agent runs via Generate, so the final answer arrives as one
+			// content event instead of being re-chunked to imitate token streaming.
 			answer = filter.StripThinkTags(answer)
 			var sources []Source
 			if kt != nil {
@@ -1566,10 +1469,8 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			trace.add(TraceStep{Type: "status", Stage: "agent_generate", LatencyMs: time.Since(startTime).Milliseconds()})
 			if answer != "" {
 				log.Printf("[Timing][ChatService] mode=agentic stage=first_token duration_ms=%d", time.Since(startTime).Milliseconds())
-				for _, r := range []rune(answer) {
-					if !trySend(StreamEvent{Type: "content", Content: string(r)}) {
-						return
-					}
+				if !trySend(StreamEvent{Type: "content", Content: answer}) {
+					return
 				}
 				fullResponse.WriteString(answer)
 			}
@@ -1653,7 +1554,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 					}
 				} else {
 					if chunk.Type == pipeline.ChunkTypeSource {
-						sources = append(sources, Source{Content: chunk.Content, DocID: chunk.DocID, Metadata: chunk.Metadata})
+						sources = append(sources, Source{Content: chunk.Content, DocID: chunk.DocID, Score: chunk.Score, Metadata: chunk.Metadata})
 					}
 					event := StreamEvent{
 						Type:     string(chunk.Type),

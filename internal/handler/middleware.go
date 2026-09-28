@@ -3,6 +3,7 @@ package handler
 
 import (
 	"log/slog"
+	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -54,19 +55,67 @@ func RequestLogger() gin.HandlerFunc {
 	}
 }
 
-// ErrorResponse 统一错误响应格式
+// APIError is the body of every error response:
+//
+//	{"error": {"code": "not_found", "message": "...", "trace_id": "..."}}
+type APIError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	TraceID string `json:"trace_id,omitempty"`
+	Details any    `json:"details,omitempty"`
+}
+
+// ErrorResponse wraps APIError.
 type ErrorResponse struct {
-	Error   string `json:"error"`
-	Code    int    `json:"code,omitempty"`
-	Details string `json:"details,omitempty"`
+	Error APIError `json:"error"`
 }
 
-// respondError 统一错误响应辅助函数
+func errorCodeForStatus(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "invalid_argument"
+	case http.StatusUnauthorized:
+		return "unauthenticated"
+	case http.StatusForbidden:
+		return "permission_denied"
+	case http.StatusNotFound:
+		return "not_found"
+	case http.StatusConflict:
+		return "conflict"
+	case http.StatusRequestEntityTooLarge:
+		return "payload_too_large"
+	case http.StatusUnprocessableEntity:
+		return "unprocessable"
+	case http.StatusTooManyRequests:
+		return "rate_limited"
+	case http.StatusBadGateway:
+		return "upstream_error"
+	case http.StatusServiceUnavailable:
+		return "unavailable"
+	case http.StatusGatewayTimeout:
+		return "upstream_timeout"
+	default:
+		if status >= 500 {
+			return "internal"
+		}
+		return "error"
+	}
+}
+
+func newErrorResponse(c *gin.Context, status int, message string, details any) ErrorResponse {
+	traceID, _ := c.Get(ginTraceIDKey)
+	id, _ := traceID.(string)
+	return ErrorResponse{Error: APIError{Code: errorCodeForStatus(status), Message: message, TraceID: id, Details: details}}
+}
+
 func respondError(c *gin.Context, status int, message string) {
-	c.JSON(status, ErrorResponse{Error: message, Code: status})
+	c.JSON(status, newErrorResponse(c, status, message, nil))
 }
 
-// respondErrorWithDetails 带详情的错误响应
-func respondErrorWithDetails(c *gin.Context, status int, message, details string) {
-	c.JSON(status, ErrorResponse{Error: message, Code: status, Details: details})
+func respondErrorWithDetails(c *gin.Context, status int, message string, details any) {
+	c.JSON(status, newErrorResponse(c, status, message, details))
+}
+
+func abortWithError(c *gin.Context, status int, message string) {
+	c.AbortWithStatusJSON(status, newErrorResponse(c, status, message, nil))
 }

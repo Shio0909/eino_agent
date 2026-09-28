@@ -103,10 +103,7 @@ func RateLimitMiddleware(cfg RateLimiterConfig) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		key := c.ClientIP()
 		if !limiter.allow(key) {
-			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-				"error": "请求过于频繁，请稍后再试",
-				"code":  http.StatusTooManyRequests,
-			})
+			abortWithError(c, http.StatusTooManyRequests, "请求过于频繁，请稍后再试")
 			return
 		}
 		c.Next()
@@ -124,10 +121,7 @@ func AuthRateLimitMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		key := c.ClientIP()
 		if !limiter.allow(key) {
-			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-				"error": "登录尝试过于频繁，请稍后再试",
-				"code":  http.StatusTooManyRequests,
-			})
+			abortWithError(c, http.StatusTooManyRequests, "登录尝试过于频繁，请稍后再试")
 			return
 		}
 		c.Next()

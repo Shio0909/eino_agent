@@ -17,6 +17,7 @@ import (
 	"eino_agent/internal/database/postgres"
 	"eino_agent/internal/database/repository"
 	"eino_agent/internal/docreader"
+
 	einoembedding "github.com/cloudwego/eino/components/embedding"
 	"github.com/gin-gonic/gin"
 )

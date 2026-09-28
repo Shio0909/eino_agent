@@ -50,7 +50,7 @@ func (h *Handler) ListCodeRepos(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{"repos": []codeRepoInfo{}})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("read repos dir: %v", err)})
+		respondError(c, http.StatusInternalServerError, fmt.Sprintf("read repos dir: %v", err))
 		return
 	}
 
@@ -118,11 +118,11 @@ func (h *Handler) CloneCodeRepo(c *gin.Context) {
 		Name string `json:"name"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		respondError(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.URL == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "url is required"})
+		respondError(c, http.StatusBadRequest, "url is required")
 		return
 	}
 
@@ -131,7 +131,7 @@ func (h *Handler) CloneCodeRepo(c *gin.Context) {
 		repoName = extractRepoNameFromURL(req.URL)
 	}
 	if repoName == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot extract repo name from url"})
+		respondError(c, http.StatusBadRequest, "cannot extract repo name from url")
 		return
 	}
 
@@ -139,12 +139,12 @@ func (h *Handler) CloneCodeRepo(c *gin.Context) {
 	repoPath := filepath.Join(reposDir, repoName)
 
 	if _, err := os.Stat(repoPath); err == nil {
-		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("repo %s already exists", repoName)})
+		respondError(c, http.StatusConflict, fmt.Sprintf("repo %s already exists", repoName))
 		return
 	}
 
 	if err := os.MkdirAll(reposDir, 0755); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("create repos dir: %v", err)})
+		respondError(c, http.StatusInternalServerError, fmt.Sprintf("create repos dir: %v", err))
 		return
 	}
 
@@ -156,7 +156,7 @@ func (h *Handler) CloneCodeRepo(c *gin.Context) {
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("git clone failed: %s", strings.TrimSpace(string(output)))})
+		respondError(c, http.StatusInternalServerError, fmt.Sprintf("git clone failed: %s", strings.TrimSpace(string(output))))
 		return
 	}
 
@@ -170,25 +170,25 @@ func (h *Handler) CloneCodeRepo(c *gin.Context) {
 func (h *Handler) IndexCodeRepo(c *gin.Context) {
 	name := c.Param("name")
 	if name == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "repo name is required"})
+		respondError(c, http.StatusBadRequest, "repo name is required")
 		return
 	}
 
 	reposDir := h.getCodeReposDir()
 	repoPath := filepath.Join(reposDir, name)
 	if _, err := os.Stat(repoPath); os.IsNotExist(err) {
-		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("repo %s not found", name)})
+		respondError(c, http.StatusNotFound, fmt.Sprintf("repo %s not found", name))
 		return
 	}
 
 	if h.codeIndexer == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "code graph indexer not initialized"})
+		respondError(c, http.StatusServiceUnavailable, "code graph indexer not initialized")
 		return
 	}
 
 	progress, err := h.codeIndexer.IndexRepo(c.Request.Context(), name)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("indexing failed: %v", err)})
+		respondError(c, http.StatusInternalServerError, fmt.Sprintf("indexing failed: %v", err))
 		return
 	}
 
@@ -209,14 +209,14 @@ func (h *Handler) IndexCodeRepo(c *gin.Context) {
 func (h *Handler) PullCodeRepo(c *gin.Context) {
 	name := c.Param("name")
 	if name == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "repo name is required"})
+		respondError(c, http.StatusBadRequest, "repo name is required")
 		return
 	}
 
 	reposDir := h.getCodeReposDir()
 	repoPath := filepath.Join(reposDir, name)
 	if _, err := os.Stat(repoPath); os.IsNotExist(err) {
-		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("repo %s not found", name)})
+		respondError(c, http.StatusNotFound, fmt.Sprintf("repo %s not found", name))
 		return
 	}
 
@@ -227,7 +227,7 @@ func (h *Handler) PullCodeRepo(c *gin.Context) {
 	cmd.Dir = repoPath
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	if out, err := cmd.CombinedOutput(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("git fetch failed: %s", strings.TrimSpace(string(out)))})
+		respondError(c, http.StatusInternalServerError, fmt.Sprintf("git fetch failed: %s", strings.TrimSpace(string(out))))
 		return
 	}
 
@@ -252,7 +252,7 @@ func (h *Handler) PullCodeRepo(c *gin.Context) {
 		cmd = exec.CommandContext(ctx, "git", "reset", "--hard", "FETCH_HEAD")
 		cmd.Dir = repoPath
 		if out2, err2 := cmd.CombinedOutput(); err2 != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("pull failed: %s, reset failed: %s", strings.TrimSpace(string(out)), strings.TrimSpace(string(out2)))})
+			respondError(c, http.StatusInternalServerError, fmt.Sprintf("pull failed: %s, reset failed: %s", strings.TrimSpace(string(out)), strings.TrimSpace(string(out2))))
 			return
 		}
 	}
@@ -267,28 +267,28 @@ func (h *Handler) PullCodeRepo(c *gin.Context) {
 func (h *Handler) DeleteCodeRepo(c *gin.Context) {
 	name := c.Param("name")
 	if name == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "repo name is required"})
+		respondError(c, http.StatusBadRequest, "repo name is required")
 		return
 	}
 
 	reposDir := h.getCodeReposDir()
 	repoPath := filepath.Join(reposDir, name)
 	if _, err := os.Stat(repoPath); os.IsNotExist(err) {
-		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("repo %s not found", name)})
+		respondError(c, http.StatusNotFound, fmt.Sprintf("repo %s not found", name))
 		return
 	}
 
 	// Delete graph data if available
 	if h.codeGraphRepo != nil {
 		if err := h.codeGraphRepo.DeleteRepoGraph(c.Request.Context(), name); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("delete graph data failed: %v", err)})
+			respondError(c, http.StatusInternalServerError, fmt.Sprintf("delete graph data failed: %v", err))
 			return
 		}
 	}
 
 	// Delete directory
 	if err := os.RemoveAll(repoPath); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("delete repo directory failed: %v", err)})
+		respondError(c, http.StatusInternalServerError, fmt.Sprintf("delete repo directory failed: %v", err))
 		return
 	}
 

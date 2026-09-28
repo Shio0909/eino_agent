@@ -165,7 +165,7 @@ func (m *Manager) registerDefaults() {
 - **简单问题**：直接调用 knowledge_search(query, mode="auto")
 - **复杂问题**：先 query_decompose 分解，再对每个子查询分别检索
 - **代码问题**：如果问题涉及代码仓库、函数实现、代码结构，使用 code_search 工具
-  - 先判断目标仓库：当前项目使用 repo="eino_agent" 或留空；deer-flow/pydantic-ai 等测试仓库必须显式填写 repo
+  - 先判断目标仓库：问题指明仓库时填写对应 repo 目录名，否则留空使用默认仓库
   - 先 grep 精确运行时术语，再 read 命中文件；不要先查 Makefile、go.mod、package.json、prettier、eslint 等配置文件，除非用户明确问配置
   - grep: 搜索代码内容（函数定义、变量、import 等）
   - find: 按文件名查找（如 *.py, *config*）

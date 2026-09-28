@@ -20,7 +20,13 @@
 | P1-1 维度变更误删 | ✅ 已修 | embedding 维度与向量表不一致时默认拒绝启动，显式 `reset_vectors_on_dimension_change: true` 才清空重建 |
 | SSRF | ✅ 已修 | `security.NewHTTPClient`：拨号时校验解析 IP（防 DNS rebinding）+ 重定向校验；接入 docreader local/mineru 与 handler 直接抓取路径；MinerU ParseURL 补上 URL 策略校验 |
 | Prompt Guard | ✅ 已修 | 匹配前做零宽字符/全角规范化，并对疑似 base64 片段解码后二次匹配 |
-| P1-2 demo 硬编码、P1-3 注释造假 | ⏳ Phase 2 | 涉及 pipeline/rag.go、service/chat.go、prompt/repo_manager 的条目随 Phase 2 编排重写一并清除 |
+| P1-2 demo 硬编码 | ✅ 已修 | 删除 code_search fast path（硬编码符号/仓库）；证据门禁改为通用项目描述信号（文件名/自述句式），不再匹配 `eino agent`/`终极复习文档`；工具描述与 prompt 去掉 deer-flow/pydantic-ai；项目概述恢复查询去掉项目名 |
+| P1-3 注释造假 / 编排 | ✅ 已修 | `pipeline` 改为真正的 `compose.Graph`（rewrite→retrieve→rerank→evidence_gate 分支→build_context→generate），Invoke/Stream 共用同一张图；流式路径也经过证据门禁；Sources 使用真实检索/重排分数（`ScoredReranker`）；上下文编号与 prompt 统一为 `[来源N]`；节点耗时经 `callbacks.Handler` 记录 |
+| 回答依据判定 | ✅ 已修 | handler 不再匹配回答文本判断"依据不足"，改用 pipeline 输出的 `grounding_status` |
+| Agentic 假流式 | ✅ 已修 | 不再逐 rune 伪造 token 流，最终回答作为一个 content 事件下发 |
+| trace 并发 | ✅ 已修 | `traceCollector` 加锁（`go test -race` 通过） |
+| 设置更新 | ✅ 已修 | 先校验后提交（副本上应用），依赖重建失败不改动运行时；设置/模型/MCP 变更串行化；embedder 替换加锁；`config.Save` 改为合并写回：保留注释与 `${ENV}` 引用、密钥不落盘明文、原子写 0600 |
+| API 层 | ✅ 已修 | `handler/api.go`（4.9k 行）按领域拆分；统一错误体 `{"error":{"code","message","trace_id"}}`；删除 `/api/chat` 旧路由；图谱接口并入 `/knowledge-bases/:id/graph` 并补齐知识库权限校验、改为服务端读取已存 chunk 构建；模型/代码仓库变更接口要求 admin；系统信息版本号读取构建信息 |
 
 原始清单如下，保留作对照。
 

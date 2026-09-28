@@ -36,13 +36,13 @@ type loginRequest struct {
 
 func (h *Handler) Login(c *gin.Context) {
 	if !h.cfg.Auth.Enabled {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "auth 未启用，请先设置 AUTH_ENABLED=true"})
+		respondError(c, http.StatusBadRequest, "auth 未启用，请先设置 AUTH_ENABLED=true")
 		return
 	}
 
 	var req loginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -58,7 +58,7 @@ func (h *Handler) Login(c *gin.Context) {
 	}
 
 	if role == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "用户名或密码错误"})
+		respondError(c, http.StatusUnauthorized, "用户名或密码错误")
 		return
 	}
 	if tenantID <= 0 {
@@ -76,7 +76,7 @@ func (h *Handler) Login(c *gin.Context) {
 	}
 	accessToken, err := h.signToken(claims)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "生成 token 失败"})
+		respondError(c, http.StatusInternalServerError, "生成 token 失败")
 		return
 	}
 
@@ -123,14 +123,14 @@ func (h *Handler) AuthRequired() gin.HandlerFunc {
 
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "缺少 Bearer token"})
+			abortWithError(c, http.StatusUnauthorized, "缺少 Bearer token")
 			return
 		}
 
 		token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
 		claims, err := h.parseToken(token)
 		if err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+			abortWithError(c, http.StatusUnauthorized, err.Error())
 			return
 		}
 
@@ -155,7 +155,7 @@ func (h *Handler) RequireRole(roles ...string) gin.HandlerFunc {
 				return
 			}
 		}
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "权限不足"})
+		abortWithError(c, http.StatusForbidden, "权限不足")
 	}
 }
 

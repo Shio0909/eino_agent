@@ -23,9 +23,9 @@ type RepoManagerTool struct {
 
 type repoManagerInput struct {
 	Action string `json:"action"`           // clone, pull, list, status
-	URL    string `json:"url,omitempty"`     // clone 时的仓库 URL
-	Repo   string `json:"repo,omitempty"`    // pull/status 时的仓库名
-	Branch string `json:"branch,omitempty"`  // clone 时指定分支
+	URL    string `json:"url,omitempty"`    // clone 时的仓库 URL
+	Repo   string `json:"repo,omitempty"`   // pull/status 时的仓库名
+	Branch string `json:"branch,omitempty"` // clone 时指定分支
 }
 
 type repoManagerOutput struct {
@@ -65,11 +65,11 @@ func (t *RepoManagerTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
 			},
 			"url": {
 				Type: schema.String,
-				Desc: "仓库 URL（clone 时必填），如 https://github.com/bytedance/deer-flow.git",
+				Desc: "仓库 URL（clone 时必填），如 https://github.com/owner/project.git",
 			},
 			"repo": {
 				Type: schema.String,
-				Desc: "仓库名称（pull/status 时使用），如 deer-flow",
+				Desc: "仓库名称（pull/status 时使用），即 clone 后的目录名",
 			},
 			"branch": {
 				Type: schema.String,
@@ -347,7 +347,7 @@ func (t *RepoManagerTool) doStatus(ctx context.Context, params repoManagerInput)
 
 // extractRepoName 从 URL 提取仓库名
 func extractRepoName(url string) string {
-	// https://github.com/bytedance/deer-flow.git → deer-flow
+	// https://github.com/owner/project.git → project
 	url = strings.TrimSuffix(url, ".git")
 	url = strings.TrimSuffix(url, "/")
 	parts := strings.Split(url, "/")

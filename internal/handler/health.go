@@ -69,7 +69,7 @@ func (h *Handler) HealthCheck(c *gin.Context) {
 	wg.Wait()
 
 	results["llm"] = presence(h.chatService != nil, true)
-	results["embedding"] = presence(h.embedding != nil, true)
+	results["embedding"] = presence(h.currentEmbedder() != nil, true)
 	results["docreader"] = presence(h.docReaderCli != nil, false)
 	results["import_queue"] = presence(h.importQueue != nil, false)
 	results["graphrag"] = presence(h.graphRAGService != nil, false)
