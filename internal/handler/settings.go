@@ -247,10 +247,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if err := config.Save(h.configPath, h.cfg); err != nil {
 		log.Printf("[Settings] 持久化配置失败: %v", err)
 		h.audit(c, "settings.update", "settings", false, map[string]interface{}{"error": err.Error(), "changed": changed})
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error":   "配置已在运行时更新，但持久化到配置文件失败",
-			"changed": changed,
-		})
+		respondErrorWithDetails(c, http.StatusInternalServerError, "配置已在运行时更新，但持久化到配置文件失败", gin.H{"changed": changed})
 		return
 	}
 	h.audit(c, "settings.update", "settings", true, map[string]interface{}{"changed": changed})

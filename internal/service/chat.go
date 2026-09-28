@@ -1553,6 +1553,10 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 						}
 					}
 				} else {
+					if chunk.Type == pipeline.ChunkTypeError {
+						finishError("pipeline", "pipeline_run", chunk.Content)
+						return
+					}
 					if chunk.Type == pipeline.ChunkTypeSource {
 						sources = append(sources, Source{Content: chunk.Content, DocID: chunk.DocID, Score: chunk.Score, Metadata: chunk.Metadata})
 					}

@@ -61,11 +61,16 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		return
 	}
 
+	allowedKBIDs, ok := h.resolveAuthorizedKnowledgeBaseIDs(c, req.KnowledgeBaseIDs)
+	if !ok {
+		return
+	}
+
 	session := &repository.Session{
 		TenantID:            h.getTenantID(c),
 		UserID:              h.getUserID(c),
 		Title:               req.Title,
-		KnowledgeBaseIDs:    req.KnowledgeBaseIDs,
+		KnowledgeBaseIDs:    allowedKBIDs,
 		SimilarityThreshold: 0.7,
 		TopK:                5,
 	}

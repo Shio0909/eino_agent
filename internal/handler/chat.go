@@ -25,8 +25,6 @@ type ChatRequest struct {
 	KnowledgeBaseIDs []string `json:"knowledge_base_ids"`
 	DocumentIDs      []string `json:"document_ids,omitempty"`
 	Mode             string   `json:"mode"`
-	TopK             int      `json:"top_k"`
-	Temperature      float64  `json:"temperature"`
 	ForceCitation    bool     `json:"force_citation,omitempty"`
 	EnableLongTerm   *bool    `json:"enable_long_term,omitempty"`
 	// EnableSkills / SelectedSkills 已废弃：skills 由 Eino 原生中间件自动管理
@@ -44,12 +42,10 @@ func (r *ChatRequest) GetMessage() string {
 type ChatResponse struct {
 	Answer     string              `json:"answer"`
 	References []ReferenceDocument `json:"references,omitempty"`
-	Sources    []ReferenceDocument `json:"sources,omitempty"`
 	Evidence   []EvidenceDocument  `json:"evidence,omitempty"`
 	Grounding  GroundingResult     `json:"grounding"`
 	SessionID  string              `json:"session_id,omitempty"`
 	TraceID    string              `json:"trace_id,omitempty"`
-	TokensUsed int                 `json:"tokens_used,omitempty"`
 	LatencyMs  int64               `json:"latency_ms"`
 	Trace      []service.TraceStep `json:"trace,omitempty"`
 }
@@ -230,7 +226,6 @@ func (h *Handler) Chat(c *gin.Context) {
 	c.JSON(http.StatusOK, ChatResponse{
 		Answer:     resp.Answer,
 		References: references,
-		Sources:    references,
 		Evidence:   evidence,
 		Grounding:  grounding,
 		SessionID:  resp.SessionID,
@@ -269,17 +264,18 @@ func (h *Handler) ChatStream(c *gin.Context) {
 		return
 	}
 
-	// 设置 SSE headers
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Header("X-Accel-Buffering", "no")
-
 	if req.SessionID != "" && h.sessionRepo != nil {
 		if _, ok := h.ensureSessionAccess(c, req.SessionID); !ok {
 			return
 		}
 	}
+
+	// SSE headers go out only after every check that can still fail with a
+	// JSON error response.
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
 
 	// 使用流式响应
 	var useAgent bool
@@ -312,9 +308,16 @@ func (h *Handler) ChatStream(c *gin.Context) {
 		return
 	}
 
+	doneSent := false
 	c.Stream(func(w io.Writer) bool {
 		if event, ok := <-ch; ok {
 			data := gin.H{"type": event.Type}
+			if event.Type == "error" {
+				if event.Error == "" {
+					event.Error = event.Content
+				}
+				event.Content = ""
+			}
 			if event.Content != "" {
 				data["content"] = event.Content
 			}
@@ -375,10 +378,15 @@ func (h *Handler) ChatStream(c *gin.Context) {
 			if len(event.TraceSnapshot) > 0 {
 				data["trace_snapshot"] = event.TraceSnapshot
 			}
+			if event.Type == "done" {
+				doneSent = true
+			}
 			c.SSEvent("message", data)
 			return true
 		}
-		c.SSEvent("done", gin.H{})
+		if !doneSent {
+			c.SSEvent("message", gin.H{"type": "done"})
+		}
 		return false
 	})
 }
@@ -391,8 +399,9 @@ func (h *Handler) toReferences(sources []service.Source) []ReferenceDocument {
 	for _, src := range sources {
 		refs = append(refs, ReferenceDocument{
 			ID:       src.DocID,
-			Source:   src.DocID,
+			Source:   firstEvidenceSource(src.Metadata, src.DocID),
 			Content:  src.Content,
+			Score:    src.Score,
 			Metadata: src.Metadata,
 		})
 	}
