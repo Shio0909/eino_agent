@@ -9,7 +9,7 @@
 #   4. make up-frontend     (启动核心 + 前端 UI)
 #   5. 访问 http://localhost
 
-.PHONY: help up down build dev test test-core frontend-build check-demo
+.PHONY: help up down build dev test test-core frontend-build check-demo vuln workspace-image-smoke
 
 # 默认目标
 help:
@@ -34,6 +34,8 @@ help:
 	@echo "    make dev            本地运行 app (连接容器 DB)"
 	@echo "    make test           运行测试"
 	@echo "    make lint           代码检查"
+	@echo "    make vuln           govulncheck: 依赖与标准库的已知漏洞"
+	@echo "    make workspace-image-smoke  构建 workspace 镜像并做冒烟(崩溃自恢复/停止)"
 	@echo ""
 	@echo "  数据库："
 	@echo "    make migrate        运行迁移"
@@ -163,6 +165,15 @@ check-demo:
 # 代码检查
 lint:
 	golangci-lint run ./...
+
+# 已知漏洞扫描（只报告代码实际可达的）
+vuln:
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+# all-in-one workspace 镜像冒烟：PostgreSQL 被 SIGKILL 后容器自行重启、数据保留、干净停止
+workspace-image-smoke:
+	docker build -f docker/Dockerfile.workspace -t eino-agent-workspace:local .
+	scripts/workspace-image-smoke.sh
 
 # 格式化代码
 fmt:
