@@ -3,6 +3,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -1220,7 +1221,7 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 		}
 		llmCtx, llmCancel := context.WithTimeout(ctx, time.Duration(s.config.Agent.LLMTimeout)*time.Second)
 		defer llmCancel()
-		respMsg, agentErr := runtimeAgent.Generate(llmCtx, messages)
+		respMsg, agentErr := runtimeAgent.agent.Generate(llmCtx, messages)
 		if agentErr != nil {
 			if isAgentMaxStepsError(agentErr) {
 				trace.add(TraceStep{Type: "guardrail", Stage: "agent_max_steps", Error: agentErr.Error(), Metadata: map[string]any{"max_steps": s.config.Agent.MaxSteps}})
@@ -1464,40 +1465,70 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			messages := []*schema.Message{
 				{Role: schema.User, Content: cc.messageWithInst},
 			}
-			// Use Generate (not Stream) because our tools only implement InvokableTool,
-			// not StreamableTool. The ReAct graph in streaming mode tries to stream-invoke
-			// tools, which fails. Generate runs the full ReAct loop correctly.
-			// Action/observation events still fire via eventSink during tool execution.
+			// Stream the run. Tools that only implement InvokableTool are fine: the
+			// event wrappers declare only what their base can do, and Eino turns an
+			// invokable tool into a streaming one itself. Action/observation events
+			// fire via eventSink during tool execution, the answer text as it is written.
 			llmCtx, llmCancel := context.WithTimeout(ctx, time.Duration(s.config.Agent.LLMTimeout)*time.Second)
-			respMsg, agentErr := runtimeAgent.Generate(llmCtx, messages)
+			var sources []Source
+			sourcesSent := -1
+			sendSources := func() bool {
+				if kt == nil {
+					return true
+				}
+				sources = sourcesFromDocuments(kt.LastDocs(), s.config.RAG.TopK)
+				if len(sources) == sourcesSent || (len(sources) == 0 && sourcesSent < 0) {
+					return true
+				}
+				sourcesSent = len(sources)
+				return trySend(StreamEvent{Type: "sources", Sources: sources, SourceCount: len(sources)})
+			}
+			started := false
+			emit := func(delta string) bool {
+				out := thinkFilter.Filter(delta)
+				if !started {
+					out = strings.TrimLeft(out, " \t\r\n")
+				}
+				if out == "" {
+					return true
+				}
+				if !started {
+					started = true
+					// Sources go out before the first words of the answer, as in pipeline mode.
+					if !sendSources() {
+						return false
+					}
+					log.Printf("[Timing][ChatService] mode=agentic stage=first_token duration_ms=%d", time.Since(startTime).Milliseconds())
+				}
+				fullResponse.WriteString(out)
+				return trySend(StreamEvent{Type: "content", Content: out})
+			}
+			respMsg, agentErr := streamAgent(llmCtx, runtimeAgent, messages, emit)
 			llmCancel()
-			if agentErr != nil {
-				finishError(mode, "agent_generate", agentErr.Error())
+			if errors.Is(agentErr, errStreamConsumerGone) {
 				return
 			}
-
-			answer := ""
-			if respMsg != nil {
-				answer = respMsg.Content
+			if agentErr != nil {
+				finishError(mode, "agent_stream", agentErr.Error())
+				return
 			}
-			// The ReAct agent runs via Generate, so the final answer arrives as one
-			// content event instead of being re-chunked to imitate token streaming.
-			answer = filter.StripThinkTags(answer)
-			var sources []Source
-			if kt != nil {
-				sources = sourcesFromDocuments(kt.LastDocs(), s.config.RAG.TopK)
-				if len(sources) > 0 && !trySend(StreamEvent{Type: "sources", Sources: sources, SourceCount: len(sources)}) {
-					return
+			if rest := thinkFilter.Flush(); rest != "" {
+				if !started {
+					rest = strings.TrimLeft(rest, " \t\r\n")
 				}
+				if rest != "" {
+					started = true
+					fullResponse.WriteString(rest)
+					if !trySend(StreamEvent{Type: "content", Content: rest}) {
+						return
+					}
+				}
+			}
+			// Tools that ran after the answer had started add sources the early event lacked.
+			if !sendSources() {
+				return
 			}
 			trace.add(TraceStep{Type: "status", Stage: "agent_generate", LatencyMs: time.Since(startTime).Milliseconds()})
-			if answer != "" {
-				log.Printf("[Timing][ChatService] mode=agentic stage=first_token duration_ms=%d", time.Since(startTime).Milliseconds())
-				if !trySend(StreamEvent{Type: "content", Content: answer}) {
-					return
-				}
-				fullResponse.WriteString(answer)
-			}
 
 			// 记录流式 agentic 模式的指标和审计日志
 			duration := time.Since(startTime)
@@ -1523,7 +1554,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			latencyMs := time.Since(startTime).Milliseconds()
 			trace.add(TraceStep{Type: "status", Stage: "complete", LatencyMs: latencyMs, Metadata: map[string]any{"mode": mode}})
 			snapshot := trace.snapshot()
-			messageID := s.saveAssistantMessageWithTrace(ctx, cc.sessionID, fullResponse.String(), 0, latencyMs, snapshot, sources)
+			messageID := s.saveAssistantMessageWithTrace(ctx, cc.sessionID, strings.TrimSpace(fullResponse.String()), 0, latencyMs, snapshot, sources)
 			s.recordRequestTrace(traceID, req, cc.sessionID, messageID, mode, "completed", latencyMs, snapshot, trace.summary(mode, "completed", latencyMs, len(sources), ""), "")
 			trySend(StreamEvent{Type: "trace_snapshot", TraceSnapshot: snapshot})
 			trySend(StreamEvent{Type: "done"})

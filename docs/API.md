@@ -277,7 +277,7 @@ Agentic mode (`mode: "agentic"` and agent enabled):
 | `approval_resolved` / `approval_rejected` / `approval_expired` | same fields as `approval_required`; `content` is the decision reason | Approval outcome |
 | `warning` | `content` | Guardrail warning (e.g. repeated identical tool calls) |
 | `sources` | `sources` (array of ReferenceDocument), `source_count` | Retrieved sources from the knowledge tool |
-| `content` | `content` | Final answer, delivered as a **single** frame (agentic runs the ReAct loop non-streamed, so there is no token-by-token streaming) |
+| `content` | `content` | Final answer, in the pieces the model produces it (the ReAct loop runs in streaming mode). The first piece is held back until the model has written `agent.stream_peek_chars` characters (default 256) or ended its turn, because that is how long it takes to tell an answer from a turn of tool calls; a negative value waits for the whole turn. Text a model writes before a tool call is part of the answer if it is longer than that window |
 | `error` | `error` (string), `trace_step` | Fatal error; followed by `trace_snapshot`, no `done` payload frame |
 | `trace_snapshot` | `trace_snapshot` | Full trace; always sent at the end |
 | `done` | — | Normal completion |

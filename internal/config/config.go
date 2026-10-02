@@ -250,6 +250,11 @@ type AgentConfig struct {
 	// 超时配置
 	LLMTimeout int `yaml:"llm_timeout"` // Agent LLM 调用超时（秒），0=使用默认值 180s
 
+	// StreamPeekChars 是流式 Agent 判断"这一轮是答案还是工具调用"前最多读取的文本字符数：
+	// 工具调用先到，或文本不足该长度就出现工具调用，则这一轮不当作答案；文本超过该长度后
+	// 才后到的工具调用会被执行并继续运行。0=默认 256；负数=读完整轮再判断（答案不能边生成边返回）。
+	StreamPeekChars int `yaml:"stream_peek_chars"`
+
 	// 轻量模型配置：用于 query_decompose / conflict detection 等辅助工具。
 	LightLLM *LLMConfig `yaml:"light_llm,omitempty"`
 }
@@ -599,6 +604,9 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Agent.LLMTimeout == 0 {
 		cfg.Agent.LLMTimeout = 180
+	}
+	if cfg.Agent.StreamPeekChars == 0 {
+		cfg.Agent.StreamPeekChars = 256
 	}
 
 	if cfg.Security.PromptGuard.Enabled == nil {

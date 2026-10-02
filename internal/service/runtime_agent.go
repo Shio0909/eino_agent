@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/adk/middlewares/skill"
@@ -21,23 +22,41 @@ import (
 	internalTool "eino_agent/internal/tool"
 )
 
-// allChunksStreamToolCallChecker reads all chunks before deciding whether the model
-// issued a tool call. Models like MiniMax M2.7 emit text content BEFORE the tool_call
-// object, so the default Eino checker (which bails on the first non-empty text chunk)
-// would incorrectly route to END. This checker drains the full stream and returns true
-// if any chunk carries a ToolCall.
-func allChunksStreamToolCallChecker(_ context.Context, sr *schema.StreamReader[*schema.Message]) (bool, error) {
-	defer sr.Close()
-	for {
-		msg, err := sr.Recv()
-		if err == io.EOF {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		if msg != nil && len(msg.ToolCalls) > 0 {
-			return true, nil
+// newStreamToolCallChecker decides, from the start of a model turn's stream,
+// whether the turn is tool calls (the agent loops) or the answer (the agent
+// ends). Eino routes the stream only after this returns, so the answer cannot
+// reach the caller before it does.
+//
+// Models differ in where the call sits: some send it first, some write a
+// sentence of text before it (the default Eino checker, which stops at the
+// first text, would then drop the call). So the checker reads until a tool
+// call shows up, or until peekRunes of text have gone by without one. A
+// peekRunes of zero or less reads the whole turn, which is always right and
+// delays the answer until the model has finished writing it.
+func newStreamToolCallChecker(peekRunes int) func(context.Context, *schema.StreamReader[*schema.Message]) (bool, error) {
+	return func(_ context.Context, sr *schema.StreamReader[*schema.Message]) (bool, error) {
+		defer sr.Close()
+		seen := 0
+		for {
+			msg, err := sr.Recv()
+			if err == io.EOF {
+				return false, nil
+			}
+			if err != nil {
+				return false, err
+			}
+			if msg == nil {
+				continue
+			}
+			if len(msg.ToolCalls) > 0 {
+				return true, nil
+			}
+			if peekRunes > 0 {
+				seen += utf8.RuneCountInString(msg.Content)
+				if seen >= peekRunes {
+					return false, nil
+				}
+			}
 		}
 	}
 }
@@ -131,7 +150,7 @@ func (s *ChatService) buildRuntimeAgentForRequest(
 	runtimeRetriever retriever.Retriever,
 	req *ChatRequest,
 	eventSink func(StreamEvent),
-) (*react.Agent, *internalTool.KnowledgeTool, error) {
+) (*agentRun, *internalTool.KnowledgeTool, error) {
 	toolCallingModel, ok := any(s.chatModel).(model.ToolCallingChatModel)
 	if !ok {
 		return nil, nil, fmt.Errorf("agent mode requires ToolCallingChatModel, current model type: %T", s.chatModel)
@@ -151,16 +170,6 @@ func (s *ChatService) buildRuntimeAgentForRequest(
 	}
 	if eventSink != nil {
 		tools = s.wrapAgentToolsForRequest(tools, req, eventSink)
-		tracker := newToolCallTracker()
-		wrappedTools := make([]einotool.BaseTool, len(tools))
-		for i, wt := range tools {
-			if et, ok := wt.(*eventTool); ok {
-				wrappedTools[i] = &trackerEventTool{eventTool: et, tracker: tracker}
-			} else {
-				wrappedTools[i] = wt
-			}
-		}
-		tools = wrappedTools
 	}
 
 	systemInstruction := s.buildAgentInstructionForRequest(req, runtimeSkill)
@@ -168,7 +177,7 @@ func (s *ChatService) buildRuntimeAgentForRequest(
 		ToolsConfig:           compose.ToolsNodeConfig{Tools: tools},
 		MaxStep:               s.config.Agent.MaxSteps,
 		ToolCallingModel:      toolCallingModel,
-		StreamToolCallChecker: allChunksStreamToolCallChecker,
+		StreamToolCallChecker: newStreamToolCallChecker(streamPeekRunes(s.config.Agent.StreamPeekChars)),
 		MessageModifier: func(ctx context.Context, input []*schema.Message) []*schema.Message {
 			if len(input) == 0 {
 				return []*schema.Message{{Role: schema.System, Content: systemInstruction}}
@@ -183,7 +192,28 @@ func (s *ChatService) buildRuntimeAgentForRequest(
 		return nil, nil, err
 	}
 
-	return agent, kt, nil
+	return &agentRun{agent: agent, tools: tools}, kt, nil
+}
+
+// agentRun is a built ReAct agent together with the tools it runs, which a
+// streamed run needs again when a model calls a tool after it already started
+// writing its answer (see streamAgent).
+type agentRun struct {
+	agent *react.Agent
+	tools []einotool.BaseTool
+}
+
+// streamPeekRunes maps AgentConfig.StreamPeekChars to the checker's window:
+// unset means the default, negative means read the whole model turn.
+func streamPeekRunes(configured int) int {
+	switch {
+	case configured < 0:
+		return 0
+	case configured == 0:
+		return 256
+	default:
+		return configured
+	}
 }
 
 type eventTool struct {
@@ -192,6 +222,33 @@ type eventTool struct {
 	sink            func(StreamEvent)
 	approvalManager *approval.Manager
 	approvalRequest approval.Request
+	tracker         *toolCallTracker
+}
+
+// eventToolFor wraps base so that its calls emit action/observation events and
+// go through approval and repeat-call tracking. The wrapper declares only the
+// ways of running that base has. Eino calls the streaming entry point of a tool
+// that declares one, and turns an invokable-only tool into a streaming one by
+// itself, so a wrapper that declared both would make every streamed run fail on
+// a tool that cannot stream. A base that is neither is returned as it is.
+func eventToolFor(base einotool.BaseTool, e *eventTool) einotool.BaseTool {
+	_, invokable := base.(einotool.InvokableTool)
+	_, streamable := base.(einotool.StreamableTool)
+	name := "tool"
+	if info, err := base.Info(context.Background()); err == nil && info != nil && strings.TrimSpace(info.Name) != "" {
+		name = strings.TrimSpace(info.Name)
+	}
+	e.name, e.base = name, base
+	switch {
+	case invokable && streamable:
+		return invokableStreamableEventTool{e}
+	case invokable:
+		return invokableEventTool{e}
+	case streamable:
+		return streamableEventTool{e}
+	default:
+		return base
+	}
 }
 
 func (s *ChatService) wrapAgentToolsForRequest(tools []einotool.BaseTool, req *ChatRequest, sink func(StreamEvent)) []einotool.BaseTool {
@@ -199,25 +256,14 @@ func (s *ChatService) wrapAgentToolsForRequest(tools []einotool.BaseTool, req *C
 		return tools
 	}
 
+	tracker := newToolCallTracker()
 	wrapped := make([]einotool.BaseTool, 0, len(tools))
 	for _, base := range tools {
-		if _, ok := base.(einotool.InvokableTool); !ok {
-			if _, ok := base.(einotool.StreamableTool); !ok {
-				wrapped = append(wrapped, base)
-				continue
-			}
+		e := &eventTool{sink: sink, approvalManager: s.approvalManager, tracker: tracker}
+		wrapped = append(wrapped, eventToolFor(base, e))
+		if e.name != "" {
+			e.approvalRequest = s.approvalRequestForTool(req, e.name)
 		}
-		name := "tool"
-		if info, err := base.Info(context.Background()); err == nil && info != nil && strings.TrimSpace(info.Name) != "" {
-			name = strings.TrimSpace(info.Name)
-		}
-		wrapped = append(wrapped, &eventTool{
-			name:            name,
-			base:            base,
-			sink:            sink,
-			approvalManager: s.approvalManager,
-			approvalRequest: s.approvalRequestForTool(req, name),
-		})
 	}
 	return wrapped
 }
@@ -276,17 +322,7 @@ func wrapAgentTools(tools []einotool.BaseTool, sink func(StreamEvent)) []einotoo
 
 	wrapped := make([]einotool.BaseTool, 0, len(tools))
 	for _, base := range tools {
-		if _, ok := base.(einotool.InvokableTool); !ok {
-			if _, ok := base.(einotool.StreamableTool); !ok {
-				wrapped = append(wrapped, base)
-				continue
-			}
-		}
-		name := "tool"
-		if info, err := base.Info(context.Background()); err == nil && info != nil && strings.TrimSpace(info.Name) != "" {
-			name = strings.TrimSpace(info.Name)
-		}
-		wrapped = append(wrapped, &eventTool{name: name, base: base, sink: sink})
+		wrapped = append(wrapped, eventToolFor(base, &eventTool{sink: sink}))
 	}
 	return wrapped
 }
@@ -295,12 +331,13 @@ func (t *eventTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
 	return t.base.Info(ctx)
 }
 
-func (t *eventTool) InvokableRun(ctx context.Context, argumentsInJSON string, opts ...einotool.Option) (string, error) {
+func (t *eventTool) invoke(ctx context.Context, argumentsInJSON string, opts ...einotool.Option) (string, error) {
 	it, ok := t.base.(einotool.InvokableTool)
 	if !ok {
 		return "", fmt.Errorf("tool %s is not invokable", t.name)
 	}
 
+	t.track(argumentsInJSON)
 	started := time.Now()
 	t.emit("action", argumentsInJSON, "", 0, nil, map[string]any{"args_chars": len(argumentsInJSON)})
 	if proceed, observation, waitErr := t.waitForApproval(ctx, argumentsInJSON, started); !proceed {
@@ -322,12 +359,13 @@ func (t *eventTool) InvokableRun(ctx context.Context, argumentsInJSON string, op
 	return result, nil
 }
 
-func (t *eventTool) StreamableRun(ctx context.Context, argumentsInJSON string, opts ...einotool.Option) (*schema.StreamReader[string], error) {
+func (t *eventTool) stream(ctx context.Context, argumentsInJSON string, opts ...einotool.Option) (*schema.StreamReader[string], error) {
 	st, ok := t.base.(einotool.StreamableTool)
 	if !ok {
 		return nil, fmt.Errorf("tool %s is not streamable", t.name)
 	}
 
+	t.track(argumentsInJSON)
 	started := time.Now()
 	t.emit("action", argumentsInJSON, "", 0, nil, map[string]any{"args_chars": len(argumentsInJSON), "streamable": true})
 	if proceed, observation, waitErr := t.waitForApproval(ctx, argumentsInJSON, started); !proceed {
@@ -470,8 +508,47 @@ func summarizeToolOutput(output string) string {
 	return trimmed
 }
 
-var _ einotool.InvokableTool = (*eventTool)(nil)
-var _ einotool.StreamableTool = (*eventTool)(nil)
+// track records a call and passes on the repeat-call warning, if any, to the
+// event sink.
+func (t *eventTool) track(argumentsInJSON string) {
+	if t.tracker == nil {
+		return
+	}
+	if warning := t.tracker.record(t.name, argumentsInJSON); warning != "" && t.sink != nil {
+		t.sink(StreamEvent{Type: "warning", Content: warning})
+	}
+}
+
+// The three wrappers differ only in which entry points they expose. eventTool
+// itself has none, so embedding it adds no method by accident.
+type invokableEventTool struct{ *eventTool }
+
+func (t invokableEventTool) InvokableRun(ctx context.Context, args string, opts ...einotool.Option) (string, error) {
+	return t.invoke(ctx, args, opts...)
+}
+
+type streamableEventTool struct{ *eventTool }
+
+func (t streamableEventTool) StreamableRun(ctx context.Context, args string, opts ...einotool.Option) (*schema.StreamReader[string], error) {
+	return t.stream(ctx, args, opts...)
+}
+
+type invokableStreamableEventTool struct{ *eventTool }
+
+func (t invokableStreamableEventTool) InvokableRun(ctx context.Context, args string, opts ...einotool.Option) (string, error) {
+	return t.invoke(ctx, args, opts...)
+}
+
+func (t invokableStreamableEventTool) StreamableRun(ctx context.Context, args string, opts ...einotool.Option) (*schema.StreamReader[string], error) {
+	return t.stream(ctx, args, opts...)
+}
+
+var (
+	_ einotool.InvokableTool  = invokableEventTool{}
+	_ einotool.StreamableTool = streamableEventTool{}
+	_ einotool.InvokableTool  = invokableStreamableEventTool{}
+	_ einotool.StreamableTool = invokableStreamableEventTool{}
+)
 
 // toolCallRecord 记录单次工具调用
 type toolCallRecord struct {
@@ -542,26 +619,4 @@ func (t *toolCallTracker) reset() {
 	defer t.mu.Unlock()
 	t.history = nil
 	t.warned = false
-}
-
-// trackerEventTool 带有调用追踪的 eventTool
-type trackerEventTool struct {
-	*eventTool
-	tracker *toolCallTracker
-}
-
-func (t *trackerEventTool) InvokableRun(ctx context.Context, argumentsInJSON string, opts ...einotool.Option) (string, error) {
-	warning := t.tracker.record(t.name, argumentsInJSON)
-	if warning != "" && t.eventTool.sink != nil {
-		t.eventTool.sink(StreamEvent{Type: "warning", Content: warning})
-	}
-	return t.eventTool.InvokableRun(ctx, argumentsInJSON, opts...)
-}
-
-func (t *trackerEventTool) StreamableRun(ctx context.Context, argumentsInJSON string, opts ...einotool.Option) (*schema.StreamReader[string], error) {
-	warning := t.tracker.record(t.name, argumentsInJSON)
-	if warning != "" && t.eventTool.sink != nil {
-		t.eventTool.sink(StreamEvent{Type: "warning", Content: warning})
-	}
-	return t.eventTool.StreamableRun(ctx, argumentsInJSON, opts...)
 }
