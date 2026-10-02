@@ -120,7 +120,7 @@ func (dl *DirectoryLoader) Load(ctx context.Context, dirPath string) ([]*RawDocu
 
 		loadedDocs, err := loader.Load(ctx, path)
 		if err != nil {
-			fmt.Printf("警告: 加载文件 %s 失败: %v\n", path, err)
+			log.Printf("[Documents] 加载文件 %s 失败,已跳过: %v", path, err)
 			return nil
 		}
 
