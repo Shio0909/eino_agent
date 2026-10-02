@@ -64,12 +64,36 @@ unset PGPASSWORD
 cd /app
 /app/server -config /app/configs/config.workspace.yaml -migrate
 
+# pg_ctl daemonizes postgres, so there is no child to wait on. If the postmaster
+# dies (OOM kill, a crash) the server would stay up with every query failing and
+# /health/ready at 503, and recovery would depend on whatever polls it. Exit
+# instead: the container restarts, postgres replays its WAL, and the volume
+# (sessions, knowledge bases, usage) is intact. A zombie counts as dead, since
+# the postmaster is reparented to this shell and nothing reaps it.
+postgres_alive() {
+    pid=$(head -n 1 "$PGDATA/postmaster.pid" 2>/dev/null) || return 1
+    [ -n "$pid" ] || return 1
+    state=$(sed -n 's/^[0-9]* (.*) \(.\) .*/\1/p' "/proc/$pid/stat" 2>/dev/null)
+    [ -n "$state" ] && [ "$state" != Z ]
+}
+
 # Stop postgres cleanly when the container is told to stop, so the next start
 # does not have to replay WAL, and forward the signal to the server so its own
 # graceful shutdown (final usage flush) runs before the database goes away.
 /app/server -config /app/configs/config.workspace.yaml &
 SERVER=$!
+(
+    while sleep "${PG_WATCH_INTERVAL:-2}"; do
+        if ! postgres_alive; then
+            log "postgres is gone; stopping the server so the container restarts"
+            kill -TERM "$SERVER" 2>/dev/null || true
+            exit 0
+        fi
+    done
+) &
+WATCHER=$!
 stop() {
+    kill "$WATCHER" 2>/dev/null || true
     kill -TERM "$SERVER" 2>/dev/null || true
     wait "$SERVER" 2>/dev/null || true
     "$PGBIN/pg_ctl" -D "$PGDATA" -m fast -w stop >/dev/null 2>&1 || true
@@ -80,5 +104,10 @@ trap stop TERM INT
 # Exit when the server does, so the pod restarts instead of serving without it.
 code=0
 wait "$SERVER" || code=$?
+kill "$WATCHER" 2>/dev/null || true
+if ! postgres_alive; then
+    log "postgres is not running"
+    exit 1
+fi
 "$PGBIN/pg_ctl" -D "$PGDATA" -m fast -w stop >/dev/null 2>&1 || true
 exit "$code"
