@@ -380,3 +380,38 @@ func TestWrappedToolsStillWarnAboutRepeatedCalls(t *testing.T) {
 		t.Fatalf("got %d warnings in %v, want exactly 1", warnings, log.types())
 	}
 }
+
+// Running out of tool steps is an expected outcome, answered with a notice
+// instead of an error. It has to be recognised from the error value, not from
+// its wording, and a streamed run must report it the same way a Generate does.
+func TestRunningOutOfStepsIsRecognisedOnBothPaths(t *testing.T) {
+	always := func() []turn {
+		var turns []turn
+		for i := 0; i < 40; i++ {
+			turns = append(turns, turn{chunks: []*schema.Message{callTool("c", "lookup", `{}`)}})
+		}
+		return turns
+	}
+	run, _ := newTestRun(t, &scriptedModel{turns: always()}, 10, &lookupTool{})
+
+	_, streamErr := streamAgent(context.Background(), run, userMessage(), func(string) bool { return true })
+	if !isAgentMaxStepsError(streamErr) {
+		t.Fatalf("streamed run: isAgentMaxStepsError(%v) = false", streamErr)
+	}
+	run, _ = newTestRun(t, &scriptedModel{turns: always()}, 10, &lookupTool{})
+	_, genErr := run.agent.Generate(context.Background(), userMessage())
+	if !isAgentMaxStepsError(genErr) {
+		t.Fatalf("Generate: isAgentMaxStepsError(%v) = false", genErr)
+	}
+
+	for _, other := range []error{
+		errors.New("provider returned 429"),
+		errors.New("tool refused: max steps argument is invalid"),
+		context.DeadlineExceeded,
+		nil,
+	} {
+		if isAgentMaxStepsError(other) {
+			t.Fatalf("isAgentMaxStepsError(%v) = true, only an exhausted step budget is one", other)
+		}
+	}
+}

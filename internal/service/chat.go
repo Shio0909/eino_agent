@@ -1126,12 +1126,12 @@ func (s *ChatService) prepareChatContext(ctx context.Context, req *ChatRequest) 
 	}
 }
 
+// agentMaxStepsNotice is what the user gets, in place of an error, when the
+// agent has used its tool-step budget.
+const agentMaxStepsNotice = "⚠️ Agentic 查询超过最大工具步数，已停止继续调用工具。请缩小问题范围、指定 repo 和目标文件，或先用 code_search 获取候选证据。"
+
 func isAgentMaxStepsError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "exceeds max steps") || strings.Contains(msg, "max steps")
+	return errors.Is(err, compose.ErrExceedMaxSteps)
 }
 
 func addPipelineRetrievalTrace(trace *traceCollector, details pipeline.RetrievalTrace) {
@@ -1225,7 +1225,7 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 		if agentErr != nil {
 			if isAgentMaxStepsError(agentErr) {
 				trace.add(TraceStep{Type: "guardrail", Stage: "agent_max_steps", Error: agentErr.Error(), Metadata: map[string]any{"max_steps": s.config.Agent.MaxSteps}})
-				respMsg = &schema.Message{Content: "⚠️ Agentic 查询超过最大工具步数，已停止继续调用工具。请缩小问题范围、指定 repo 和目标文件，或先用 code_search 获取候选证据。"}
+				respMsg = &schema.Message{Content: agentMaxStepsNotice}
 			} else {
 				return nil, fmt.Errorf("agent chat: %w", agentErr)
 			}
@@ -1508,21 +1508,42 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			if errors.Is(agentErr, errStreamConsumerGone) {
 				return
 			}
-			if agentErr != nil {
+			maxSteps := isAgentMaxStepsError(agentErr)
+			if agentErr != nil && !maxSteps {
 				finishError(mode, "agent_stream", agentErr.Error())
 				return
+			}
+			// Text that bypasses emit's per-delta path still goes out sources-first.
+			writeTail := func(out string) bool {
+				if !started {
+					if !sendSources() {
+						return false
+					}
+					started = true
+				}
+				fullResponse.WriteString(out)
+				return trySend(StreamEvent{Type: "content", Content: out})
 			}
 			if rest := thinkFilter.Flush(); rest != "" {
 				if !started {
 					rest = strings.TrimLeft(rest, " \t\r\n")
 				}
-				if rest != "" {
-					started = true
-					fullResponse.WriteString(rest)
-					if !trySend(StreamEvent{Type: "content", Content: rest}) {
-						return
-					}
+				if rest != "" && !writeTail(rest) {
+					return
 				}
+			}
+			if maxSteps {
+				// Same outcome as the non-streaming path: what was written stays and
+				// the notice follows it, instead of an error that discards both.
+				trace.add(TraceStep{Type: "guardrail", Stage: "agent_max_steps", Error: agentErr.Error(), Metadata: map[string]any{"max_steps": s.config.Agent.MaxSteps}})
+				notice := agentMaxStepsNotice
+				if started {
+					notice = "\n\n" + notice
+				}
+				if !writeTail(notice) {
+					return
+				}
+				respMsg = nil
 			}
 			// Tools that ran after the answer had started add sources the early event lacked.
 			if !sendSources() {
