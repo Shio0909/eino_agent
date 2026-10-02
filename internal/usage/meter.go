@@ -37,8 +37,9 @@ type Store interface {
 // in memory only.
 type Meter struct {
 	mu      sync.Mutex
-	base    Totals // last total known to be persisted
-	pending Totals // recorded since, not yet persisted
+	base    Totals        // last total known to be persisted
+	pending Totals        // recorded since, not yet persisted
+	wake    chan struct{} // set by Attach: work ended, flush now
 
 	inflight atomic.Int64
 }
@@ -68,10 +69,26 @@ func (m *Meter) Totals() Totals {
 }
 
 // Begin marks one unit of work as in flight until the returned func is called.
+// Ending it asks an attached meter to flush, so a crash after a turn has
+// finished does not lose that turn's tokens; only work still running at the
+// time can be lost.
 func (m *Meter) Begin() (end func()) {
 	m.inflight.Add(1)
 	var once sync.Once
-	return func() { once.Do(func() { m.inflight.Add(-1) }) }
+	return func() {
+		once.Do(func() {
+			m.inflight.Add(-1)
+			m.mu.Lock()
+			wake := m.wake
+			m.mu.Unlock()
+			if wake != nil {
+				select {
+				case wake <- struct{}{}:
+				default: // a flush is already requested
+				}
+			}
+		})
+	}
 }
 
 // InFlight is the number of units of work that have begun and not ended.
@@ -106,6 +123,10 @@ func (m *Meter) Attach(ctx context.Context, s Store, interval time.Duration) (st
 	if err := m.Flush(ctx, s); err != nil {
 		log.Printf("[Usage] load persisted totals failed, counting from zero: %v", err)
 	}
+	wake := make(chan struct{}, 1)
+	m.mu.Lock()
+	m.wake = wake
+	m.mu.Unlock()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -113,6 +134,15 @@ func (m *Meter) Attach(ctx context.Context, s Store, interval time.Duration) (st
 		defer t.Stop()
 		for {
 			select {
+			case <-wake:
+				// Work that spent no tokens, which is most requests that are not
+				// a chat turn, costs no database write.
+				if m.unflushed() == 0 {
+					continue
+				}
+				if err := m.Flush(ctx, s); err != nil {
+					log.Printf("[Usage] persist totals failed, will retry: %v", err)
+				}
 			case <-t.C:
 				if err := m.Flush(ctx, s); err != nil {
 					log.Printf("[Usage] persist totals failed, will retry: %v", err)

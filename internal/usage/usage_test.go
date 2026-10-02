@@ -253,3 +253,40 @@ func TestWrapperOffersOnlyTheCapabilitiesOfTheModel(t *testing.T) {
 		t.Fatalf("a model bound with tools must still be counted, got %+v", m.Totals())
 	}
 }
+
+// A crash between two periodic flushes loses what was recorded since the last
+// one. When the work that spent the tokens has ended there is no reason to wait
+// for the next tick.
+func TestTokensAreFlushedWhenInFlightWorkEnds(t *testing.T) {
+	s := &memStore{}
+	var m Meter
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := m.Attach(ctx, s, time.Hour)
+	defer func() { cancel(); <-stopped }()
+	loaded := s.get().TotalTokens
+	adds := func() int { s.mu.Lock(); defer s.mu.Unlock(); return s.adds }
+	addsBefore := adds()
+
+	end := m.Begin()
+	m.Record(300, 40, 340)
+	if got := s.get().TotalTokens; got != loaded {
+		t.Fatalf("flushed %d tokens before the work ended", got-loaded)
+	}
+	end()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for s.get().TotalTokens != loaded+340 {
+		if time.Now().After(deadline) {
+			t.Fatalf("stored total = %d, want %d: the turn's tokens were not flushed when it ended", s.get().TotalTokens, loaded+340)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Work that spent nothing must not cost a database write.
+	addsAfterFlush := adds()
+	m.Begin()()
+	time.Sleep(100 * time.Millisecond)
+	if got := adds(); got != addsAfterFlush {
+		t.Fatalf("an idle request caused %d extra store writes (%d before the turn)", got-addsAfterFlush, addsBefore)
+	}
+}
