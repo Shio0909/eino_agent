@@ -1,0 +1,43 @@
+# All-in-one image for running eino_agent as an agent-workspace profile:
+# the server and a PostgreSQL 17 with pgvector in one container, with the data
+# directory on the workspace volume. Build from the repository root:
+#
+#   docker build -f docker/Dockerfile.workspace --build-arg AGENT_VERSION=v1 -t eino-agent-workspace:local .
+FROM golang:1.26-alpine AS build
+# The server links tree-sitter, which needs cgo. A static musl binary runs on
+# the glibc runtime image below without sharing a libc with it.
+RUN apk add --no-cache build-base
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+COPY docs ./docs
+ARG AGENT_VERSION=dev
+RUN CGO_ENABLED=1 go build -trimpath \
+    -ldflags="-s -w -linkmode external -extldflags '-static' -X eino_agent/internal/handler.Version=${AGENT_VERSION}" \
+    -o /out/server ./cmd/server
+
+# pgvector's image carries PostgreSQL 17 and the extension; its postgres user
+# is not used, because the pod drops all capabilities and a user switch needs
+# them. uid 1000 matches the controller's fsGroup.
+FROM pgvector/pgvector:pg17
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 1000 --create-home --shell /bin/sh agent \
+    && mkdir -p /app /workspace \
+    && chown agent:agent /app /workspace
+WORKDIR /app
+COPY --from=build --chown=agent:agent /out/server /app/server
+COPY --chown=agent:agent migrations /app/migrations
+COPY --chown=agent:agent skills /app/skills
+COPY --chown=agent:agent configs/config.workspace.yaml /app/configs/config.workspace.yaml
+COPY --chown=agent:agent docker/workspace-entrypoint.sh /app/entrypoint.sh
+# The server writes its audit log under ./data; keep it on the volume.
+RUN ln -s /workspace/data /app/data && chown -h agent:agent /app/data
+
+ARG AGENT_VERSION=dev
+ENV AGENT_VERSION=${AGENT_VERSION} WORKSPACE_DIR=/workspace PGBIN=/usr/lib/postgresql/17/bin
+USER 1000:1000
+EXPOSE 8080
+ENTRYPOINT ["/app/entrypoint.sh"]

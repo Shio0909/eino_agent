@@ -88,6 +88,23 @@ type MemoryConfig struct {
 	LongTermSessionLimit       int  `yaml:"long_term_session_limit"`
 	LongTermMessagesPerSession int  `yaml:"long_term_messages_per_session"`
 	MaxContextChars            int  `yaml:"max_context_chars"`
+
+	Compaction CompactionConfig `yaml:"compaction"`
+}
+
+// CompactionConfig 上下文压缩配置（设计参考 WeKnora internal/agent/compaction）。
+// max_context_tokens 为 0 时整个功能关闭，行为与未引入压缩前一致。
+type CompactionConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// MaxContextTokens 是模型上下文窗口大小（token）。
+	MaxContextTokens int `yaml:"max_context_tokens"`
+	// ReserveTokens 为下一次回复预留，历史不得占用。
+	ReserveTokens int `yaml:"reserve_tokens"`
+	// KeepRecentTokens 压缩后原样保留的最近对话预算。
+	KeepRecentTokens int `yaml:"keep_recent_tokens"`
+	// HistoryBudgetTokens 是跨轮会话历史（摘要 + 近期原文）可占用的预算，
+	// 0 表示取 max_context_tokens 的 1/3，其余留给检索证据、工具结果和系统提示。
+	HistoryBudgetTokens int `yaml:"history_budget_tokens"`
 }
 
 // AuthConfig 鉴权配置

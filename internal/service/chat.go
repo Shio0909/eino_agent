@@ -59,6 +59,7 @@ type ChatService struct {
 	// 持久化
 	sessionRepo      repository.SessionRepository
 	messageRepo      repository.MessageRepository
+	summaryRepo      repository.SessionSummaryRepository // 跨轮会话摘要（可选，nil 则回退到窗口截断）
 	sessionCache     cachepkg.SessionCache
 	auditRepo        repository.LLMAuditRepository // LLM 调用审计日志（可选）
 	requestTraceRepo repository.RequestTraceRepository
@@ -700,11 +701,26 @@ func (s *ChatService) buildMemoryInstruction(ctx context.Context, req *ChatReque
 		window = 8
 	}
 
-	shortMsgs, err := s.getShortTermMessages(ctx, sessionID, window*2)
-	if err == nil && len(shortMsgs) > 0 {
-		shortCtx := formatMemoryMessages(shortMsgs, maxChars/2)
-		if shortCtx != "" {
-			parts = append(parts, "【会话短期记忆】\n"+shortCtx)
+	compacted := false
+	if s.crossTurnCompactionEnabled() {
+		h, hErr := s.loadSessionHistory(ctx, sessionID)
+		if hErr != nil {
+			log.Printf("[ChatService] session history unavailable, using window memory (session=%s): %v", sessionID, hErr)
+		} else {
+			compacted = true
+			emitHistoryCompaction(ctx, sessionID, h.Compact)
+			if hist := formatSessionHistory(h); hist != "" {
+				parts = append(parts, hist)
+			}
+		}
+	}
+	if !compacted {
+		shortMsgs, err := s.getShortTermMessages(ctx, sessionID, window*2)
+		if err == nil && len(shortMsgs) > 0 {
+			shortCtx := formatMemoryMessages(shortMsgs, maxChars/2)
+			if shortCtx != "" {
+				parts = append(parts, "【会话短期记忆】\n"+shortCtx)
+			}
 		}
 	}
 
@@ -811,43 +827,51 @@ func (s *ChatService) buildQueryContext(ctx context.Context, req *ChatRequest, s
 	return result
 }
 
+// formatMemoryMessages renders the most recent turns oldest-first within a
+// character budget. The budget is spent from the newest message backwards, so
+// when it runs out it is the oldest turns that are dropped: the latest turn
+// is the one a follow-up question refers to.
 func formatMemoryMessages(messages []*repository.Message, maxChars int) string {
-	if len(messages) == 0 {
-		return ""
-	}
+	const (
+		maxMessages     = 12
+		perMessageChars = 400
+	)
 	if maxChars <= 0 {
 		maxChars = 1000
 	}
 
-	start := 0
-	if len(messages) > 12 {
-		start = len(messages) - 12
-	}
-
-	var sb strings.Builder
-	for i := start; i < len(messages); i++ {
+	var lines []string // newest first
+	used := 0
+	for i := len(messages) - 1; i >= 0 && len(lines) < maxMessages; i-- {
 		msg := messages[i]
 		if msg == nil {
+			continue
+		}
+		content := strings.TrimSpace(msg.Content)
+		if content == "" {
 			continue
 		}
 		role := "用户"
 		if strings.EqualFold(msg.Role, "assistant") {
 			role = "助手"
 		}
-		content := strings.TrimSpace(msg.Content)
-		if content == "" {
-			continue
-		}
-		sb.WriteString(role)
-		sb.WriteString(": ")
-		sb.WriteString(truncateText(content, 400))
-		sb.WriteString("\n")
-		if sb.Len() >= maxChars {
+		line := role + ": " + truncateText(content, perMessageChars)
+		cost := len([]rune(line)) + 1 // the newline
+		if used+cost > maxChars {
+			if len(lines) == 0 {
+				// Even the newest message alone is over budget: keep its start.
+				lines = append(lines, truncateText(line, maxChars))
+			}
 			break
 		}
+		lines = append(lines, line)
+		used += cost
 	}
 
-	return truncateText(strings.TrimSpace(sb.String()), maxChars)
+	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
+		lines[i], lines[j] = lines[j], lines[i]
+	}
+	return strings.Join(lines, "\n")
 }
 
 func truncateText(s string, maxLen int) string {

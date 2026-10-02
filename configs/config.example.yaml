@@ -101,6 +101,16 @@ memory:
     long_term_session_limit: 5
     long_term_messages_per_session: 2
     max_context_chars: 5000
+    # 上下文压缩：超过窗口阈值时把较早的对话压成结构化摘要，而不是直接截断。
+    # max_context_tokens 填所用模型的上下文窗口；为 0 则关闭。
+    # 每次模型调用实际预留 max(reserve_tokens, llm.max_tokens + 4096)（上限为窗口的一半）,
+    # 以免请求被接受但回复被截断。
+    compaction:
+      enabled: false
+      max_context_tokens: 0
+      reserve_tokens: 4096
+      keep_recent_tokens: 6000
+      history_budget_tokens: 0
 docreader:
     enabled: true
     # mode 可选: local | grpc | auto | mineru | mineru_with_fallback

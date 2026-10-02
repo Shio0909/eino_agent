@@ -11,6 +11,7 @@ import (
 	"github.com/cloudwego/eino/components/model"
 
 	"eino_agent/internal/config"
+	"eino_agent/internal/usage"
 )
 
 // NewLLMProvider 创建 LLM 提供者
@@ -42,7 +43,8 @@ func newOpenAICompatibleLLM(ctx context.Context, cfg *config.LLMConfig) (model.C
 		return nil, nil, fmt.Errorf("创建 OpenAI ChatModel 失败: %w", err)
 	}
 
-	return chatModel, nil, nil
+	// 进程内所有 LLM 调用（含运行时切换模型、轻量模型、压缩摘要）统一计量。
+	return usage.WrapChatModel(chatModel, usage.Default), nil, nil
 }
 
 // newOllamaLLM 创建 Ollama LLM

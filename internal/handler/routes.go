@@ -10,6 +10,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.GET("/health", h.HealthCheck)
 	r.GET("/health/live", h.LivenessCheck)
 	r.GET("/health/ready", h.HealthCheck)
+	// 供外部控制面（如 agent-workspace）轮询：是否忙、版本、累计 LLM 用量。
+	r.GET("/heartbeat", h.Heartbeat)
 
 	// API v1
 	v1 := r.Group("/api/v1")
@@ -27,6 +29,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 
 		// 聊天
 		chat := protected.Group("/chat")
+		chat.Use(h.TrackInFlight())
 		{
 			chat.POST("", h.Chat)
 			chat.POST("/stream", h.ChatStream)

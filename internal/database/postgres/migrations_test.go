@@ -52,6 +52,8 @@ func TestListMigrationFilesReturnsAllUpMigrations(t *testing.T) {
 		"000009_add_knowledge_content_hash_index.up.sql",
 		"000010_add_enrichment_status.up.sql",
 		"000011_add_chunk_revisions.up.sql",
+		"000012_add_session_summaries.up.sql",
+		"000013_add_llm_usage_totals.up.sql",
 	}
 	if len(files) != len(want) {
 		t.Fatalf("got %d migration files, want %d: %#v", len(files), len(want), files)

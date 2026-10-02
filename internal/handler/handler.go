@@ -220,6 +220,7 @@ func NewHandler(
 		h.messageRepo = repository.NewMessageRepository(db)
 		h.requestTraceRepo = repository.NewRequestTraceRepository(db)
 		h.chatService.SetRepositories(h.sessionRepo, h.messageRepo)
+		h.chatService.SetSessionSummaryRepository(repository.NewSessionSummaryRepository(db))
 		h.chatService.SetRequestTraceRepo(h.requestTraceRepo)
 	}
 

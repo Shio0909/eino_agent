@@ -137,6 +137,8 @@ func (s *ChatService) buildRuntimeAgentForRequest(
 		return nil, nil, fmt.Errorf("agent mode requires ToolCallingChatModel, current model type: %T", s.chatModel)
 	}
 
+	toolCallingModel = s.wrapModelForCompaction(toolCallingModel, eventSink)
+
 	tools, kt := s.buildToolsWithRetriever(runtimeRetriever)
 	tools = append(tools, s.mcpTools...)
 

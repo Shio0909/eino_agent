@@ -48,6 +48,7 @@ import (
 	"eino_agent/internal/rediscache"
 	"eino_agent/internal/service"
 	"eino_agent/internal/tool"
+	"eino_agent/internal/usage"
 	"eino_agent/internal/wiki"
 )
 
@@ -146,6 +147,13 @@ func main() {
 			}
 			log.Printf("[Database] 迁移完成: applied=%v skipped=%v", result.Applied, result.Skipped)
 			return
+		}
+
+		// 累计 LLM 用量持久化：重启后继续累加，并随优雅关闭做最后一次刷新。
+		// defer 晚于 db.Close 的 defer 注册，因此先于连接关闭执行。
+		if db != nil {
+			usageStopped := usage.Default.Attach(ctx, repository.NewUsageStore(db), 5*time.Second)
+			defer func() { cancel(); <-usageStopped }()
 		}
 	}
 

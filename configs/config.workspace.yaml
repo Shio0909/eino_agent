@@ -1,0 +1,61 @@
+# Configuration of the all-in-one image used as an agent-workspace profile
+# (docker/Dockerfile.workspace). Everything that varies per deployment is an
+# environment variable, set by the profile's "env" or injected from the
+# credential directory by docker/workspace-entrypoint.sh.
+server:
+    host: 0.0.0.0
+    port: 8080
+    mode: release
+auth:
+    # The workspace gateway authenticates callers; the process is only reachable
+    # through it.
+    enabled: false
+llm:
+    provider: ${LLM_PROVIDER:-openai}
+    base_url: ${LLM_BASE_URL:-}
+    api_key: "${LLM_API_KEY:-}"
+    model_id: ${LLM_MODEL:-default}
+    temperature: 0.2
+    max_tokens: ${LLM_MAX_TOKENS:-4096}
+embedding:
+    # "hash" needs no external service; use a real provider for semantic search.
+    provider: ${EMBEDDING_PROVIDER:-hash}
+    base_url: ${EMBEDDING_BASE_URL:-}
+    api_key: "${EMBEDDING_API_KEY:-}"
+    model_id: ${EMBEDDING_MODEL:-hash}
+    dimensions: ${EMBEDDING_DIMENSIONS:-1024}
+reranker:
+    enabled: false
+database:
+    host: 127.0.0.1
+    port: 5432
+    user: eino
+    password: "${EINO_DB_PASSWORD:-}"
+    dbname: eino
+    sslmode: disable
+rag:
+    top_k: 10
+    enable_hybrid: true
+    enable_rewrite: false
+    enable_rerank: false
+    chunk_size: 512
+    chunk_overlap: 50
+    chunk_strategy: auto
+    enable_contextual_enrichment: false
+    documents_path: ./data/documents
+agent:
+    enabled: true
+    max_steps: 10
+    enable_knowledge_tool: true
+    enable_web_search: false
+    enable_skills: true
+    skills_dir: ./skills
+memory:
+    enabled: true
+    window_size: 8
+    max_context_chars: 5000
+    compaction:
+        enabled: ${CONTEXT_COMPACTION:-true}
+        max_context_tokens: ${LLM_CONTEXT_TOKENS:-32000}
+        reserve_tokens: 4096
+        keep_recent_tokens: 6000
