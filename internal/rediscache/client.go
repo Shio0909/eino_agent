@@ -34,13 +34,8 @@ type Client struct {
 
 // NewClient 初始化 Redis 客户端；若连接探测失败则返回错误，由调用方决定是否降级。
 func NewClient(ctx context.Context, cfg config.RedisConfig) (*Client, error) {
-	status := Status{
-		Configured: cfg.Addr != "",
-		Addr:       cfg.Addr,
-		Mode:       "disabled",
-	}
-	if cfg.Addr == "" {
-		return &Client{status: status, timeout: 2 * time.Second}, nil
+	if cfg.Disabled || cfg.Addr == "" {
+		return &Client{status: Status{Mode: "disabled"}, timeout: 2 * time.Second}, nil
 	}
 
 	raw := redis.NewClient(&redis.Options{

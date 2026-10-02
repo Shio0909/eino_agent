@@ -26,6 +26,10 @@ embedding:
     dimensions: ${EMBEDDING_DIMENSIONS:-1024}
 reranker:
     enabled: false
+redis:
+    # The image has no Redis; without this the server dials localhost:6379 and
+    # waits out the timeout on every start.
+    disabled: true
 database:
     host: 127.0.0.1
     port: 5432

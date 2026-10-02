@@ -301,6 +301,10 @@ type DocReaderPlaywrightConfig struct {
 
 // RedisConfig Redis 配置
 type RedisConfig struct {
+	// Disabled turns the cache off without trying to reach a server. Without
+	// it an empty Addr falls back to localhost:6379, and a process with no
+	// Redis waits out a dial timeout on every start.
+	Disabled bool   `yaml:"disabled"`
 	Addr     string `yaml:"addr"`
 	Password string `yaml:"password"`
 	DB       int    `yaml:"db"`
@@ -685,7 +689,7 @@ func setDefaults(cfg *Config) {
 	}
 
 	// Redis 默认值
-	if cfg.Redis.Addr == "" {
+	if cfg.Redis.Addr == "" && !cfg.Redis.Disabled {
 		cfg.Redis.Addr = "localhost:6379"
 	}
 

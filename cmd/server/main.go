@@ -89,12 +89,16 @@ func main() {
 	// ========================================
 	// 初始化 Redis（可选，失败时降级）
 	// ========================================
-	log.Println("[Redis] 初始化 Redis 客户端...")
+	if cfg.Redis.Disabled {
+		log.Println("[Redis] 已在配置中关闭（redis.disabled），不使用缓存")
+	} else {
+		log.Println("[Redis] 初始化 Redis 客户端...")
+	}
 	redisClient, redisErr := rediscache.NewClient(ctx, cfg.Redis)
 	if redisErr != nil {
 		log.Printf("[Redis] 初始化失败（将降级为无缓存模式）: %v", redisErr)
 		redisClient = rediscache.NewFallbackClient(cfg.Redis, redisErr)
-	} else {
+	} else if !cfg.Redis.Disabled {
 		status := redisClient.Status(ctx)
 		log.Printf("[Redis] 状态: mode=%s addr=%s", status.Mode, status.Addr)
 	}

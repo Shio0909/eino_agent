@@ -91,3 +91,30 @@ func TestValidateRejectsOpenMCPExportInRelease(t *testing.T) {
 		t.Fatal("expected unauthenticated network MCP export to be rejected in release mode")
 	}
 }
+
+func TestLoadRedisDefaultsToLocalhostUnlessDisabled(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return p
+	}
+
+	cfg, err := Load(write("default.yaml", "llm:\n  model_id: m\n"))
+	if err != nil {
+		t.Fatalf("Load error = %v", err)
+	}
+	if cfg.Redis.Disabled || cfg.Redis.Addr != "localhost:6379" {
+		t.Fatalf("default redis = %+v, want enabled at localhost:6379", cfg.Redis)
+	}
+
+	cfg, err = Load(write("off.yaml", "redis:\n  disabled: true\n"))
+	if err != nil {
+		t.Fatalf("Load error = %v", err)
+	}
+	if !cfg.Redis.Disabled || cfg.Redis.Addr != "" {
+		t.Fatalf("disabled redis = %+v, want disabled with no address filled in", cfg.Redis)
+	}
+}

@@ -150,6 +150,7 @@ docreader:
         wait_until: networkidle
         max_html_bytes: 2097152
 redis:
+    disabled: false  # true: no cache, and no attempt to reach a server
     addr: 127.0.0.1:6379
     password: ""
     db: 0
