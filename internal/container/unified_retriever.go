@@ -50,22 +50,35 @@ func (u *UnifiedRetriever) Retrieve(ctx context.Context, query string, opts ...r
 }
 
 // WithKnowledgeBaseScope 按知识库范围创建作用域检索器
-// 自动将 KB IDs 按 mode 分组，路由到不同检索器
 func (u *UnifiedRetriever) WithKnowledgeBaseScope(ids []string) retriever.Retriever {
-	if len(ids) == 0 {
+	return u.WithRetrievalScope(ids, nil)
+}
+
+// WithRetrievalScope 按知识库和文档范围创建作用域检索器。
+// 知识库按 mode 分组，路由到不同检索器；文档 ID 下推到向量存储层执行。
+func (u *UnifiedRetriever) WithRetrievalScope(kbIDs, docIDs []string) retriever.Retriever {
+	if len(kbIDs) == 0 && len(docIDs) == 0 {
+		return u
+	}
+
+	// 只给了文档：文档的 chunk 都在向量库里。
+	if len(kbIDs) == 0 {
+		if u.vectorRetriever != nil {
+			return u.vectorRetriever.WithRetrievalScope(nil, docIDs)
+		}
 		return u
 	}
 
 	// 如果没有 kbRepo，无法查 mode，全部走 vector
 	if u.kbRepo == nil {
 		if u.vectorRetriever != nil {
-			return u.vectorRetriever.WithKnowledgeBaseScope(ids)
+			return u.vectorRetriever.WithRetrievalScope(kbIDs, docIDs)
 		}
 		return u
 	}
 
 	var vectorIDs, wikiIDs []string
-	for _, id := range ids {
+	for _, id := range kbIDs {
 		id = strings.TrimSpace(id)
 		if id == "" {
 			continue
@@ -89,6 +102,7 @@ func (u *UnifiedRetriever) WithKnowledgeBaseScope(ids []string) retriever.Retrie
 		wikiRetriever:   u.wikiRetriever,
 		vectorKBIDs:     vectorIDs,
 		wikiKBIDs:       wikiIDs,
+		docIDs:          docIDs,
 		topK:            u.topK,
 	}
 }
@@ -99,6 +113,7 @@ type scopedUnifiedRetriever struct {
 	wikiRetriever   *WikiRetriever
 	vectorKBIDs     []string
 	wikiKBIDs       []string
+	docIDs          []string
 	topK            int
 }
 
@@ -107,7 +122,7 @@ func (s *scopedUnifiedRetriever) Retrieve(ctx context.Context, query string, opt
 
 	// 1) 向量检索（vector-mode KBs）
 	if len(s.vectorKBIDs) > 0 && s.vectorRetriever != nil {
-		scoped := s.vectorRetriever.WithKnowledgeBaseScope(s.vectorKBIDs)
+		scoped := s.vectorRetriever.WithRetrievalScope(s.vectorKBIDs, s.docIDs)
 		docs, err := scoped.Retrieve(ctx, query, opts...)
 		if err != nil {
 			log.Printf("[UnifiedRetriever] vector 检索失败: %v", err)

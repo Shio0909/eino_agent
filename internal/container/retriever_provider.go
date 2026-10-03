@@ -215,7 +215,13 @@ func (r *CompositeRetriever) retrieveWithHybrid(ctx context.Context, query strin
 
 // WithKnowledgeBaseScope 返回限定到指定知识库的检索器；ids 为空时返回受限且无结果的检索器。
 func (r *CompositeRetriever) WithKnowledgeBaseScope(ids []string) einoretriever.Retriever {
-	return r.WithScope(SearchFilter{KnowledgeBaseIDs: ids, Scoped: true})
+	return r.WithRetrievalScope(ids, nil)
+}
+
+// WithRetrievalScope 返回限定到指定知识库和/或文档的检索器。范围由存储层执行，
+// 所以被选中的文档即使排不进整个库的前 topK 也能检索到；两者都给时取交集。
+func (r *CompositeRetriever) WithRetrievalScope(kbIDs, docIDs []string) einoretriever.Retriever {
+	return r.WithScope(SearchFilter{KnowledgeBaseIDs: kbIDs, KnowledgeIDs: docIDs, Scoped: true})
 }
 
 // WithScope 返回带存储层过滤条件的检索器副本。

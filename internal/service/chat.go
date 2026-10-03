@@ -633,6 +633,12 @@ func toString(v any) string {
 	}
 }
 
+// retrievalScoper is a retriever that can have the knowledge-base and document
+// scope applied where it searches, rather than to the results afterwards.
+type retrievalScoper interface {
+	WithRetrievalScope(kbIDs, docIDs []string) retriever.Retriever
+}
+
 func (s *ChatService) getRuntimeRetriever(req *ChatRequest) retriever.Retriever {
 	if s.retriever == nil {
 		return nil
@@ -641,19 +647,31 @@ func (s *ChatService) getRuntimeRetriever(req *ChatRequest) retriever.Retriever 
 	if scope.isEmpty() {
 		return s.retriever
 	}
-	if len(scope.kbSet) > 0 {
-		ids := make([]string, 0, len(scope.kbSet))
-		for id := range scope.kbSet {
-			ids = append(ids, id)
-		}
-		if scoped, ok := s.retriever.(knowledgeBaseScopedRetriever); ok {
-			return &scopedRetriever{base: scoped.WithKnowledgeBaseScope(ids), scope: scope}
-		}
-		if composite, ok := s.retriever.(*container.CompositeRetriever); ok {
-			return &scopedRetriever{base: composite.WithKnowledgeBaseScope(ids), scope: scope}
+	kbIDs, docIDs := sortedKeys(scope.kbSet), sortedKeys(scope.docSet)
+
+	// The scope is pushed to the store: filtering after a top-K search loses
+	// the selected documents whenever other documents rank ahead of them. The
+	// scopedRetriever below still checks every result, so a retriever that
+	// cannot take the scope is held to it as well.
+	base := s.retriever
+	switch r := s.retriever.(type) {
+	case retrievalScoper:
+		base = r.WithRetrievalScope(kbIDs, docIDs)
+	case knowledgeBaseScopedRetriever:
+		if len(kbIDs) > 0 {
+			base = r.WithKnowledgeBaseScope(kbIDs)
 		}
 	}
-	return &scopedRetriever{base: s.retriever, scope: scope}
+	return &scopedRetriever{base: base, scope: scope}
+}
+
+func sortedKeys(set map[string]struct{}) []string {
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func (s *ChatService) buildRuntimePipeline(runtimeRetriever retriever.Retriever) *pipeline.RAGPipeline {
