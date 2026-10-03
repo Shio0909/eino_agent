@@ -228,6 +228,7 @@ func NewHandler(
 		h.chatService.SetRepositories(h.sessionRepo, h.messageRepo)
 		h.chatService.SetSessionSummaryRepository(repository.NewSessionSummaryRepository(db))
 		h.chatService.SetRequestTraceRepo(h.requestTraceRepo)
+		h.chatService.SetDocNameResolver(h.knowledgeSourceName)
 	}
 
 	return h

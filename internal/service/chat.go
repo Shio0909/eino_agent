@@ -62,6 +62,10 @@ type ChatService struct {
 	sessionCache     cachepkg.SessionCache
 	auditRepo        repository.LLMAuditRepository // LLM 调用审计日志（可选）
 	requestTraceRepo repository.RequestTraceRepository
+
+	// docNameResolver resolves a knowledge(document) id to its display name
+	// (filename). Optional; nil skips the legacy-citation backfill.
+	docNameResolver func(ctx context.Context, knowledgeID string) string
 }
 
 // NewChatService 创建聊天服务
@@ -143,6 +147,12 @@ func (s *ChatService) SetAuditRepo(repo repository.LLMAuditRepository) {
 
 func (s *ChatService) SetRequestTraceRepo(repo repository.RequestTraceRepository) {
 	s.requestTraceRepo = repo
+}
+
+// SetDocNameResolver wires the lookup used to backfill citation filenames for
+// chunks embedded before filenames were stamped into vector metadata.
+func (s *ChatService) SetDocNameResolver(fn func(ctx context.Context, knowledgeID string) string) {
+	s.docNameResolver = fn
 }
 
 func (s *ChatService) recordRequestTrace(traceID string, req *ChatRequest, sessionID, messageID, mode, status string, latencyMs int64, steps []TraceStep, summary repository.JSON, errText string) {
@@ -421,7 +431,7 @@ func (s *ChatService) runAgenticProjectContextRecovery(ctx context.Context, req 
 		metadata["gate_status"] = gate.Status
 		trace.add(TraceStep{Type: "retrieval", Stage: "agentic_project_context_recovery", LatencyMs: time.Since(started).Milliseconds(), Metadata: metadata})
 		if gate.Status == "ok" {
-			sources := sourcesFromDocuments(docs, s.config.RAG.TopK)
+			sources := s.enrichSourceNames(ctx, sourcesFromDocuments(docs, s.config.RAG.TopK))
 			answer := summarizeRecoveredProjectContext(sources)
 			return &ChatResponse{Answer: answer, Sources: sources, SessionID: sessionID, TraceID: traceID, Trace: trace.snapshot()}, true
 		}
@@ -943,6 +953,59 @@ func sourcesFromDocuments(docs []*schema.Document, maxN int) []Source {
 	return sources
 }
 
+// sourceNameKeys are the metadata keys the API layer reads to label a citation.
+var sourceNameKeys = []string{"source", "source_filename", "file_name", "wiki_path", "title"}
+
+func sourceHasName(metadata map[string]interface{}) bool {
+	for _, key := range sourceNameKeys {
+		if metadataStringValue(metadata, key) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// enrichSourceMetadata backfills source_filename on one chunk's metadata,
+// caching lookups per document in resolved. The map is copied before mutation
+// because retrieved documents may be shared through the retrieval cache.
+func (s *ChatService) enrichSourceMetadata(ctx context.Context, metadata map[string]interface{}, resolved map[string]string) map[string]interface{} {
+	if s.docNameResolver == nil || sourceHasName(metadata) {
+		return metadata
+	}
+	knowledgeID := firstMetadataString(metadata, "knowledge_id", "document_id", "doc_id")
+	if knowledgeID == "" {
+		return metadata
+	}
+	name, ok := resolved[knowledgeID]
+	if !ok {
+		name = s.docNameResolver(ctx, knowledgeID)
+		resolved[knowledgeID] = name
+	}
+	if name == "" {
+		return metadata
+	}
+	stamped := make(map[string]interface{}, len(metadata)+1)
+	for key, value := range metadata {
+		stamped[key] = value
+	}
+	stamped["source_filename"] = name
+	return stamped
+}
+
+// enrichSourceNames backfills source_filename for chunks embedded before
+// filenames were stamped into vector metadata, so citations show the document
+// name instead of a chunk id.
+func (s *ChatService) enrichSourceNames(ctx context.Context, sources []Source) []Source {
+	if s.docNameResolver == nil || len(sources) == 0 {
+		return sources
+	}
+	resolved := make(map[string]string)
+	for i := range sources {
+		sources[i].Metadata = s.enrichSourceMetadata(ctx, sources[i].Metadata, resolved)
+	}
+	return sources
+}
+
 // Retrieve returns retrieved documents/pages only; it does not call the chat model, rewrite queries, or synthesize answers.
 func (s *ChatService) Retrieve(ctx context.Context, req *RetrieveRequest) (*RetrieveResponse, error) {
 	query := strings.TrimSpace(req.Query)
@@ -1259,6 +1322,7 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 				}
 			}
 		}
+		sources = s.enrichSourceNames(ctx, sources)
 		logger.FromContext(ctx).Info("chat_agentic",
 			"sources", len(sources),
 			"duration_ms", time.Since(modeStart).Milliseconds(),
@@ -1329,7 +1393,11 @@ func (s *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 				Score:    src.Score,
 				Metadata: src.Metadata,
 			}
-			trace.add(TraceStep{Type: "source", Stage: "source", Content: src.Content, DocID: src.DocID, Metadata: src.Metadata})
+		}
+		// Enrich before recording trace steps so streamed citations carry the name too.
+		sources = s.enrichSourceNames(ctx, sources)
+		for i := range sources {
+			trace.add(TraceStep{Type: "source", Stage: "source", Content: sources[i].Content, DocID: sources[i].DocID, Metadata: sources[i].Metadata})
 		}
 
 		resp = &ChatResponse{
@@ -1470,7 +1538,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 				if kt == nil {
 					return true
 				}
-				sources = sourcesFromDocuments(kt.LastDocs(), s.config.RAG.TopK)
+				sources = s.enrichSourceNames(ctx, sourcesFromDocuments(kt.LastDocs(), s.config.RAG.TopK))
 				if len(sources) == sourcesSent || (len(sources) == 0 && sourcesSent < 0) {
 					return true
 				}
@@ -1600,6 +1668,7 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 			}
 
 			sources := make([]Source, 0, s.config.RAG.TopK)
+			sourceNameCache := make(map[string]string)
 			pipelineDone := false
 			for chunk := range stream {
 				if chunk.Type == pipeline.ChunkTypeDone {
@@ -1628,6 +1697,9 @@ func (s *ChatService) ChatStream(ctx context.Context, req *ChatRequest) (<-chan 
 						return
 					}
 					if chunk.Type == pipeline.ChunkTypeSource {
+						// Stamp the document name before the frame goes out so live
+						// citations show it instead of a chunk id.
+						chunk.Metadata = s.enrichSourceMetadata(ctx, chunk.Metadata, sourceNameCache)
 						sources = append(sources, Source{Content: chunk.Content, DocID: chunk.DocID, Score: chunk.Score, Metadata: chunk.Metadata})
 					}
 					event := StreamEvent{

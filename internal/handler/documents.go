@@ -463,9 +463,19 @@ func (h *Handler) ReindexEditedChunk(c *gin.Context) {
 		respondError(c, http.StatusConflict, "chunk 在重建期间被修改，本次结果已丢弃，请重新触发")
 		return
 	}
-	doc := &container.Document{ID: current.ID, Content: current.Content, Vector: vectors[0], Metadata: map[string]interface{}{
-		"knowledge_base_id": kbID, "knowledge_id": docID, "chunk_index": current.ChunkIndex,
-	}}
+	metadata := map[string]interface{}{
+		"knowledge_base_id": kbID,
+		"knowledge_id":      docID,
+		"chunk_id":          current.ID,
+		"chunk_index":       current.ChunkIndex,
+		"start_pos":         current.StartPos,
+		"end_pos":           current.EndPos,
+		"source_content":    current.Content,
+	}
+	if name := h.knowledgeSourceName(ctx, docID); name != "" {
+		metadata["source_filename"] = name
+	}
+	doc := &container.Document{ID: current.ID, Content: current.Content, Vector: vectors[0], Metadata: metadata}
 	if err := h.vectorDB.Upsert(ctx, []*container.Document{doc}); err != nil {
 		respondError(c, http.StatusInternalServerError, err.Error())
 		return

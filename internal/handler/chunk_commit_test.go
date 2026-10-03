@@ -470,3 +470,23 @@ func TestChunkReindexInvalidatesCachedRetrievals(t *testing.T) {
 		t.Fatalf("cache invalidations = %v, want one for %s", counter.invalidated, syncKB)
 	}
 }
+
+func TestChunkReindexPreservesSourceMetadata(t *testing.T) {
+	env := newChunkEnv(t)
+	target := env.target(t)
+	if w := env.reindex(target.ID); w.Code != http.StatusOK {
+		t.Fatalf("reindex: %d %s", w.Code, w.Body.String())
+	}
+	env.vectors.mu.Lock()
+	meta := env.vectors.docs[target.ID].Metadata
+	env.vectors.mu.Unlock()
+	if got := meta["source_filename"]; got != syncName {
+		t.Fatalf("source_filename = %v, want %q (citation labels fall back to chunk id without it)", got, syncName)
+	}
+	if got := meta["source_content"]; got != target.Content {
+		t.Fatalf("source_content = %v, want the chunk content", got)
+	}
+	if got := meta["chunk_id"]; got != target.ID {
+		t.Fatalf("chunk_id = %v, want %q", got, target.ID)
+	}
+}
