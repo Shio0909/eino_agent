@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -38,6 +39,54 @@ func (h *Handler) getCodeReposDir() string {
 		dir = "data/test_repos"
 	}
 	return dir
+}
+
+// repoNamePattern keeps a repo name to a single plain path segment: it is joined
+// onto the repos directory and later handed to os.RemoveAll.
+var repoNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`)
+
+func validRepoName(name string) bool { return repoNamePattern.MatchString(name) }
+
+// validRepoURL rejects anything git would read as an option rather than a location.
+func validRepoURL(rawURL string) bool {
+	if rawURL == "" || strings.HasPrefix(rawURL, "-") {
+		return false
+	}
+	return !strings.ContainsFunc(rawURL, func(r rune) bool { return r < 0x20 || r == 0x7f })
+}
+
+// resolveRepoName picks the explicit name, else the last segment of the URL.
+func resolveRepoName(rawURL, name string) string {
+	if name == "" {
+		name = extractRepoNameFromURL(rawURL)
+	}
+	return name
+}
+
+// gitCloneArgs ends option parsing before the URL so it cannot be taken for a flag.
+func gitCloneArgs(repoURL, repoPath string) []string {
+	return []string{"clone", "--depth=1", "--", repoURL, repoPath}
+}
+
+func isGitCheckout(repoPath string) bool {
+	_, err := os.Stat(filepath.Join(repoPath, ".git"))
+	return err == nil
+}
+
+// existingRepoPath resolves a repo name from the URL to its checkout, writing the
+// error response itself when the name is unusable or the repo does not exist.
+func (h *Handler) existingRepoPath(c *gin.Context) (name, repoPath string, ok bool) {
+	name = c.Param("name")
+	if !validRepoName(name) {
+		respondError(c, http.StatusBadRequest, "invalid repo name")
+		return "", "", false
+	}
+	repoPath = filepath.Join(h.getCodeReposDir(), name)
+	if !isGitCheckout(repoPath) {
+		respondError(c, http.StatusNotFound, fmt.Sprintf("repo %s not found", name))
+		return "", "", false
+	}
+	return name, repoPath, true
 }
 
 // ListCodeRepos lists all code repositories with their indexing status.
@@ -126,12 +175,14 @@ func (h *Handler) CloneCodeRepo(c *gin.Context) {
 		return
 	}
 
-	repoName := req.Name
-	if repoName == "" {
-		repoName = extractRepoNameFromURL(req.URL)
+	if !validRepoURL(req.URL) {
+		respondError(c, http.StatusBadRequest, "invalid url")
+		return
 	}
-	if repoName == "" {
-		respondError(c, http.StatusBadRequest, "cannot extract repo name from url")
+
+	repoName := resolveRepoName(req.URL, req.Name)
+	if !validRepoName(repoName) {
+		respondError(c, http.StatusBadRequest, "invalid repo name; pass a name made of letters, digits, '.', '_' or '-'")
 		return
 	}
 
@@ -151,8 +202,7 @@ func (h *Handler) CloneCodeRepo(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Minute)
 	defer cancel()
 
-	args := []string{"clone", "--depth=1", req.URL, repoPath}
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := exec.CommandContext(ctx, "git", gitCloneArgs(req.URL, repoPath)...)
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -168,16 +218,8 @@ func (h *Handler) CloneCodeRepo(c *gin.Context) {
 
 // IndexCodeRepo triggers indexing for a repository.
 func (h *Handler) IndexCodeRepo(c *gin.Context) {
-	name := c.Param("name")
-	if name == "" {
-		respondError(c, http.StatusBadRequest, "repo name is required")
-		return
-	}
-
-	reposDir := h.getCodeReposDir()
-	repoPath := filepath.Join(reposDir, name)
-	if _, err := os.Stat(repoPath); os.IsNotExist(err) {
-		respondError(c, http.StatusNotFound, fmt.Sprintf("repo %s not found", name))
+	name, _, ok := h.existingRepoPath(c)
+	if !ok {
 		return
 	}
 
@@ -207,16 +249,8 @@ func (h *Handler) IndexCodeRepo(c *gin.Context) {
 
 // PullCodeRepo pulls latest changes for a repository.
 func (h *Handler) PullCodeRepo(c *gin.Context) {
-	name := c.Param("name")
-	if name == "" {
-		respondError(c, http.StatusBadRequest, "repo name is required")
-		return
-	}
-
-	reposDir := h.getCodeReposDir()
-	repoPath := filepath.Join(reposDir, name)
-	if _, err := os.Stat(repoPath); os.IsNotExist(err) {
-		respondError(c, http.StatusNotFound, fmt.Sprintf("repo %s not found", name))
+	_, repoPath, ok := h.existingRepoPath(c)
+	if !ok {
 		return
 	}
 
@@ -265,16 +299,8 @@ func (h *Handler) PullCodeRepo(c *gin.Context) {
 
 // DeleteCodeRepo deletes a repository and its graph data.
 func (h *Handler) DeleteCodeRepo(c *gin.Context) {
-	name := c.Param("name")
-	if name == "" {
-		respondError(c, http.StatusBadRequest, "repo name is required")
-		return
-	}
-
-	reposDir := h.getCodeReposDir()
-	repoPath := filepath.Join(reposDir, name)
-	if _, err := os.Stat(repoPath); os.IsNotExist(err) {
-		respondError(c, http.StatusNotFound, fmt.Sprintf("repo %s not found", name))
+	name, repoPath, ok := h.existingRepoPath(c)
+	if !ok {
 		return
 	}
 
@@ -306,11 +332,13 @@ func gitCommand(ctx context.Context, dir string, args ...string) (string, error)
 	return strings.TrimSpace(string(out)), nil
 }
 
-// extractRepoNameFromURL extracts repository name from a git URL.
+// extractRepoNameFromURL extracts repository name from a git URL, including the
+// scp-like form git@host:owner/repo.git.
 func extractRepoNameFromURL(rawURL string) string {
+	rawURL = strings.TrimSuffix(rawURL, "/")
 	rawURL = strings.TrimSuffix(rawURL, ".git")
 	rawURL = strings.TrimSuffix(rawURL, "/")
-	parts := strings.Split(rawURL, "/")
+	parts := strings.FieldsFunc(rawURL, func(r rune) bool { return r == '/' || r == ':' })
 	if len(parts) > 0 {
 		return parts[len(parts)-1]
 	}

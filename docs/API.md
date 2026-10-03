@@ -992,6 +992,10 @@ Local git clones under the configured repos dir (`agent.code_search_repos_dir`, 
 `data/test_repos`), used by the code-graph search tool. Listing requires auth (any role);
 all mutations require role admin.
 
+Repo names are single path segments matching `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`. A
+name outside that pattern is `400` on every route below; `index`, `pull` and `delete`
+only act on directories that contain a `.git` entry and answer `404` for anything else.
+
 ### `GET /api/v1/code-repos`
 
 `200`:
@@ -1012,8 +1016,10 @@ all mutations require role admin.
 
 ### `POST /api/v1/code-repos/clone`
 
-Role: admin. Body: `{"url": "https://...", "name": "..."}`. `url` required; `name`
-defaults to the last path segment of the URL. Shallow clone (`--depth=1`, 5-minute
+Role: admin. Body: `{"url": "https://...", "name": "..."}`. `url` required (`400` when it
+is empty, starts with `-` or contains control characters); `name` defaults to the last
+path segment of the URL (`git@host:owner/repo.git` gives `repo`) and is `400` when that
+is not a valid repo name. Shallow clone (`--depth=1`, 5-minute
 timeout). `200`: `{"message": "Cloning completed", "name": "..."}`. `409` when the target
 directory already exists.
 

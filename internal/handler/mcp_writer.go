@@ -168,13 +168,13 @@ func (h *Handler) MCPCloneCodeRepo(ctx context.Context, repoURL, name string) (s
 	if strings.TrimSpace(repoURL) == "" {
 		return "", fmt.Errorf("url 不能为空")
 	}
-
-	repoName := name
-	if repoName == "" {
-		repoName = extractRepoNameFromURL(repoURL)
+	if !validRepoURL(repoURL) {
+		return "", fmt.Errorf("url 不合法")
 	}
-	if repoName == "" {
-		return "", fmt.Errorf("无法从 URL 提取仓库名称")
+
+	repoName := resolveRepoName(repoURL, name)
+	if !validRepoName(repoName) {
+		return "", fmt.Errorf("仓库名称不合法，请使用字母、数字、'.'、'_'、'-' 组成的名称")
 	}
 
 	reposDir := h.getCodeReposDir()
@@ -191,8 +191,7 @@ func (h *Handler) MCPCloneCodeRepo(ctx context.Context, repoURL, name string) (s
 	cloneCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
-	args := []string{"clone", "--depth=1", repoURL, repoPath}
-	cmd := exec.CommandContext(cloneCtx, "git", args...)
+	cmd := exec.CommandContext(cloneCtx, "git", gitCloneArgs(repoURL, repoPath)...)
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -203,13 +202,14 @@ func (h *Handler) MCPCloneCodeRepo(ctx context.Context, repoURL, name string) (s
 
 // MCPIndexCodeRepo indexes a cloned repository for code graph queries.
 func (h *Handler) MCPIndexCodeRepo(ctx context.Context, name string) (map[string]any, error) {
+	if !validRepoName(name) {
+		return nil, fmt.Errorf("仓库名称不合法")
+	}
 	if h.codeIndexer == nil {
 		return nil, fmt.Errorf("代码知识图谱索引器未初始化")
 	}
 
-	reposDir := h.getCodeReposDir()
-	repoPath := filepath.Join(reposDir, name)
-	if _, err := os.Stat(repoPath); os.IsNotExist(err) {
+	if !isGitCheckout(filepath.Join(h.getCodeReposDir(), name)) {
 		return nil, fmt.Errorf("仓库 %s 不存在", name)
 	}
 
