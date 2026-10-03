@@ -13,7 +13,6 @@ import (
 	"github.com/cloudwego/eino/adk/middlewares/skill"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/retriever"
-	einotool "github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/flow/agent/react"
 	"github.com/cloudwego/eino/schema"
@@ -168,13 +167,11 @@ func (s *ChatService) buildRuntimeAgentForRequest(
 	if runtimeSkill != nil {
 		tools = append(tools, runtimeSkill.AdditionalTools...)
 	}
-	if eventSink != nil {
-		tools = s.wrapAgentToolsForRequest(tools, req, eventSink)
-	}
 
+	toolsConfig := compose.ToolsNodeConfig{Tools: tools, ToolCallMiddlewares: s.toolCallMiddlewares(req, eventSink)}
 	systemInstruction := s.buildAgentInstructionForRequest(req, runtimeSkill)
 	agent, err := react.NewAgent(ctx, &react.AgentConfig{
-		ToolsConfig:           compose.ToolsNodeConfig{Tools: tools},
+		ToolsConfig:           toolsConfig,
 		MaxStep:               s.config.Agent.MaxSteps,
 		ToolCallingModel:      toolCallingModel,
 		StreamToolCallChecker: newStreamToolCallChecker(streamPeekRunes(s.config.Agent.StreamPeekChars)),
@@ -192,15 +189,17 @@ func (s *ChatService) buildRuntimeAgentForRequest(
 		return nil, nil, err
 	}
 
-	return &agentRun{agent: agent, tools: tools}, kt, nil
+	return &agentRun{agent: agent, toolsConfig: toolsConfig}, kt, nil
 }
 
-// agentRun is a built ReAct agent together with the tools it runs, which a
-// streamed run needs again when a model calls a tool after it already started
-// writing its answer (see streamAgent).
+// agentRun is a built ReAct agent together with the configuration of its tools
+// node, which a streamed run needs again when a model calls a tool after it
+// already started writing its answer (see streamAgent). The configuration
+// carries the tool middlewares, so a tool run that way is reported, approved
+// and checked like any other.
 type agentRun struct {
-	agent *react.Agent
-	tools []einotool.BaseTool
+	agent       *react.Agent
+	toolsConfig compose.ToolsNodeConfig
 }
 
 // streamPeekRunes maps AgentConfig.StreamPeekChars to the checker's window:
@@ -214,58 +213,6 @@ func streamPeekRunes(configured int) int {
 	default:
 		return configured
 	}
-}
-
-type eventTool struct {
-	name            string
-	base            einotool.BaseTool
-	sink            func(StreamEvent)
-	approvalManager *approval.Manager
-	approvalRequest approval.Request
-	tracker         *toolCallTracker
-}
-
-// eventToolFor wraps base so that its calls emit action/observation events and
-// go through approval and repeat-call tracking. The wrapper declares only the
-// ways of running that base has. Eino calls the streaming entry point of a tool
-// that declares one, and turns an invokable-only tool into a streaming one by
-// itself, so a wrapper that declared both would make every streamed run fail on
-// a tool that cannot stream. A base that is neither is returned as it is.
-func eventToolFor(base einotool.BaseTool, e *eventTool) einotool.BaseTool {
-	_, invokable := base.(einotool.InvokableTool)
-	_, streamable := base.(einotool.StreamableTool)
-	name := "tool"
-	if info, err := base.Info(context.Background()); err == nil && info != nil && strings.TrimSpace(info.Name) != "" {
-		name = strings.TrimSpace(info.Name)
-	}
-	e.name, e.base = name, base
-	switch {
-	case invokable && streamable:
-		return invokableStreamableEventTool{e}
-	case invokable:
-		return invokableEventTool{e}
-	case streamable:
-		return streamableEventTool{e}
-	default:
-		return base
-	}
-}
-
-func (s *ChatService) wrapAgentToolsForRequest(tools []einotool.BaseTool, req *ChatRequest, sink func(StreamEvent)) []einotool.BaseTool {
-	if sink == nil || len(tools) == 0 {
-		return tools
-	}
-
-	tracker := newToolCallTracker()
-	wrapped := make([]einotool.BaseTool, 0, len(tools))
-	for _, base := range tools {
-		e := &eventTool{sink: sink, approvalManager: s.approvalManager, tracker: tracker}
-		wrapped = append(wrapped, eventToolFor(base, e))
-		if e.name != "" {
-			e.approvalRequest = s.approvalRequestForTool(req, e.name)
-		}
-	}
-	return wrapped
 }
 
 func (s *ChatService) approvalRequestForTool(req *ChatRequest, toolName string) approval.Request {
@@ -315,185 +262,11 @@ func chatApprovalReason(action string) string {
 	}
 }
 
-func wrapAgentTools(tools []einotool.BaseTool, sink func(StreamEvent)) []einotool.BaseTool {
-	if sink == nil || len(tools) == 0 {
-		return tools
-	}
-
-	wrapped := make([]einotool.BaseTool, 0, len(tools))
-	for _, base := range tools {
-		wrapped = append(wrapped, eventToolFor(base, &eventTool{sink: sink}))
-	}
-	return wrapped
-}
-
-func (t *eventTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
-	return t.base.Info(ctx)
-}
-
-func (t *eventTool) invoke(ctx context.Context, argumentsInJSON string, opts ...einotool.Option) (string, error) {
-	it, ok := t.base.(einotool.InvokableTool)
-	if !ok {
-		return "", fmt.Errorf("tool %s is not invokable", t.name)
-	}
-
-	t.track(argumentsInJSON)
-	started := time.Now()
-	t.emit("action", argumentsInJSON, "", 0, nil, map[string]any{"args_chars": len(argumentsInJSON)})
-	if proceed, observation, waitErr := t.waitForApproval(ctx, argumentsInJSON, started); !proceed {
-		metadata := map[string]any{"args_chars": len(argumentsInJSON), "output_chars": len(observation), "approval_blocked": true}
-		if waitErr != nil {
-			t.emit("observation", argumentsInJSON, summarizeToolOutput("error: "+waitErr.Error()), time.Since(started).Milliseconds(), waitErr, metadata)
-			return "", waitErr
-		}
-		t.emit("observation", argumentsInJSON, summarizeToolOutput(observation), time.Since(started).Milliseconds(), nil, metadata)
-		return observation, nil
-	}
-	result, err := it.InvokableRun(ctx, argumentsInJSON, opts...)
-	metadata := map[string]any{"args_chars": len(argumentsInJSON), "output_chars": len(result)}
-	if err != nil {
-		t.emit("observation", argumentsInJSON, summarizeToolOutput("error: "+err.Error()), time.Since(started).Milliseconds(), err, metadata)
-		return "", err
-	}
-	t.emit("observation", argumentsInJSON, summarizeToolOutput(result), time.Since(started).Milliseconds(), nil, metadata)
-	return result, nil
-}
-
-func (t *eventTool) stream(ctx context.Context, argumentsInJSON string, opts ...einotool.Option) (*schema.StreamReader[string], error) {
-	st, ok := t.base.(einotool.StreamableTool)
-	if !ok {
-		return nil, fmt.Errorf("tool %s is not streamable", t.name)
-	}
-
-	t.track(argumentsInJSON)
-	started := time.Now()
-	t.emit("action", argumentsInJSON, "", 0, nil, map[string]any{"args_chars": len(argumentsInJSON), "streamable": true})
-	if proceed, observation, waitErr := t.waitForApproval(ctx, argumentsInJSON, started); !proceed {
-		metadata := map[string]any{"args_chars": len(argumentsInJSON), "streamable": true, "approval_blocked": true}
-		if waitErr != nil {
-			t.emit("observation", argumentsInJSON, summarizeToolOutput("error: "+waitErr.Error()), time.Since(started).Milliseconds(), waitErr, metadata)
-			return nil, waitErr
-		}
-		t.emit("observation", argumentsInJSON, summarizeToolOutput(observation), time.Since(started).Milliseconds(), nil, metadata)
-		return schema.StreamReaderFromArray([]string{observation}), nil
-	}
-	reader, err := st.StreamableRun(ctx, argumentsInJSON, opts...)
-	metadata := map[string]any{"args_chars": len(argumentsInJSON), "streamable": true}
-	if err != nil {
-		t.emit("observation", argumentsInJSON, summarizeToolOutput("error: "+err.Error()), time.Since(started).Milliseconds(), err, metadata)
-		return nil, err
-	}
-	t.emit("observation", argumentsInJSON, "stream started", time.Since(started).Milliseconds(), nil, metadata)
-	return reader, nil
-}
-
-func (t *eventTool) waitForApproval(ctx context.Context, argumentsInJSON string, started time.Time) (bool, string, error) {
-	if t.approvalManager == nil || t.approvalRequest.Action == "" {
-		return true, "", nil
-	}
-	req := t.approvalRequest
-	req.ToolInput = argumentsInJSON
-	item, err := t.approvalManager.Create(ctx, req)
-	if err != nil {
-		return false, "", fmt.Errorf("create approval request: %w", err)
-	}
-	metadata := map[string]any{
-		"args_chars":  len(argumentsInJSON),
-		"action_hash": item.ActionHash,
-		"source":      item.Source,
-	}
-	t.emitApproval("approval_required", argumentsInJSON, item, metadata, time.Since(started).Milliseconds(), "")
-	decision, err := t.approvalManager.Wait(ctx, item.ID)
-	if err != nil {
-		return false, "", err
-	}
-	current, _ := t.approvalManager.Get(ctx, item.ID)
-	if current.ID == "" {
-		current = item
-	}
-	switch decision.Decision {
-	case approval.DecisionApprove:
-		t.emitApproval("approval_resolved", argumentsInJSON, current, metadata, time.Since(started).Milliseconds(), decision.Reason)
-		return true, "", nil
-	case approval.DecisionReject:
-		t.emitApproval("approval_rejected", argumentsInJSON, current, metadata, time.Since(started).Milliseconds(), decision.Reason)
-		return false, humanDecisionObservation("rejected", t.name, decision.Reason), nil
-	case approval.DecisionExpire:
-		t.emitApproval("approval_expired", argumentsInJSON, current, metadata, time.Since(started).Milliseconds(), decision.Reason)
-		return false, humanDecisionObservation("expired", t.name, decision.Reason), nil
-	default:
-		return false, humanDecisionObservation("rejected", t.name, decision.Reason), nil
-	}
-}
-
-func (t *eventTool) emitApproval(eventType, input string, item approval.Approval, metadata map[string]any, latencyMs int64, decisionReason string) {
-	if t.sink == nil {
-		return
-	}
-	content := item.Reason
-	if decisionReason != "" {
-		content = decisionReason
-	}
-	step := &TraceStep{
-		Type:      eventType,
-		Stage:     eventType,
-		Content:   content,
-		ToolName:  t.name,
-		ToolInput: input,
-		LatencyMs: latencyMs,
-		Metadata:  metadata,
-	}
-	t.sink(StreamEvent{
-		Type:           eventType,
-		Content:        content,
-		ToolName:       t.name,
-		ToolInput:      input,
-		ApprovalID:     item.ID,
-		ApprovalStatus: string(item.Status),
-		Action:         item.Action,
-		RiskLevel:      item.RiskLevel,
-		Reason:         item.Reason,
-		ExpiresAt:      &item.ExpiresAt,
-		Metadata:       metadata,
-		LatencyMs:      latencyMs,
-		TraceStep:      step,
-	})
-}
-
 func humanDecisionObservation(status, toolName, reason string) string {
 	if strings.TrimSpace(reason) == "" {
 		return fmt.Sprintf("human approval %s for tool %s; do not execute this tool call, explain the result and ask for an alternative if needed", status, toolName)
 	}
 	return fmt.Sprintf("human approval %s for tool %s: %s; do not execute this tool call, explain the result and ask for an alternative if needed", status, toolName, reason)
-}
-
-func (t *eventTool) emit(eventType, input, content string, latencyMs int64, err error, metadata map[string]any) {
-	if t.sink == nil {
-		return
-	}
-	step := &TraceStep{
-		Type:      eventType,
-		Stage:     eventType,
-		Content:   content,
-		ToolName:  t.name,
-		ToolInput: input,
-		LatencyMs: latencyMs,
-		Metadata:  metadata,
-	}
-	if err != nil {
-		step.Level = "error"
-		step.Error = err.Error()
-	}
-	t.sink(StreamEvent{
-		Type:      eventType,
-		Content:   content,
-		ToolName:  t.name,
-		ToolInput: input,
-		Metadata:  metadata,
-		LatencyMs: latencyMs,
-		Error:     step.Error,
-		TraceStep: step,
-	})
 }
 
 func summarizeToolOutput(output string) string {
@@ -507,48 +280,6 @@ func summarizeToolOutput(output string) string {
 	}
 	return trimmed
 }
-
-// track records a call and passes on the repeat-call warning, if any, to the
-// event sink.
-func (t *eventTool) track(argumentsInJSON string) {
-	if t.tracker == nil {
-		return
-	}
-	if warning := t.tracker.record(t.name, argumentsInJSON); warning != "" && t.sink != nil {
-		t.sink(StreamEvent{Type: "warning", Content: warning})
-	}
-}
-
-// The three wrappers differ only in which entry points they expose. eventTool
-// itself has none, so embedding it adds no method by accident.
-type invokableEventTool struct{ *eventTool }
-
-func (t invokableEventTool) InvokableRun(ctx context.Context, args string, opts ...einotool.Option) (string, error) {
-	return t.invoke(ctx, args, opts...)
-}
-
-type streamableEventTool struct{ *eventTool }
-
-func (t streamableEventTool) StreamableRun(ctx context.Context, args string, opts ...einotool.Option) (*schema.StreamReader[string], error) {
-	return t.stream(ctx, args, opts...)
-}
-
-type invokableStreamableEventTool struct{ *eventTool }
-
-func (t invokableStreamableEventTool) InvokableRun(ctx context.Context, args string, opts ...einotool.Option) (string, error) {
-	return t.invoke(ctx, args, opts...)
-}
-
-func (t invokableStreamableEventTool) StreamableRun(ctx context.Context, args string, opts ...einotool.Option) (*schema.StreamReader[string], error) {
-	return t.stream(ctx, args, opts...)
-}
-
-var (
-	_ einotool.InvokableTool  = invokableEventTool{}
-	_ einotool.StreamableTool = streamableEventTool{}
-	_ einotool.InvokableTool  = invokableStreamableEventTool{}
-	_ einotool.StreamableTool = invokableStreamableEventTool{}
-)
 
 // toolCallRecord 记录单次工具调用
 type toolCallRecord struct {

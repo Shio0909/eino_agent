@@ -46,7 +46,7 @@ func streamAgent(ctx context.Context, run *agentRun, messages []*schema.Message,
 		if round >= maxLateToolRounds {
 			return msg, fmt.Errorf("the model kept calling tools after writing text, giving up after %d continuations", maxLateToolRounds)
 		}
-		toolNode, err := compose.NewToolNode(ctx, &compose.ToolsNodeConfig{Tools: run.tools})
+		toolNode, err := compose.NewToolNode(ctx, &run.toolsConfig)
 		if err != nil {
 			return msg, fmt.Errorf("continue after a late tool call: %w", err)
 		}

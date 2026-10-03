@@ -57,17 +57,20 @@ func liveStreamRun(t *testing.T, peek int) (*agentRun, *liveTool, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tools := wrapAgentTools([]einotool.BaseTool{lookup}, func(StreamEvent) {})
+	toolsConfig := compose.ToolsNodeConfig{
+		Tools:               []einotool.BaseTool{lookup},
+		ToolCallMiddlewares: toolCallMiddlewares(newToolEvents(func(StreamEvent) {})),
+	}
 	agent, err := react.NewAgent(context.Background(), &react.AgentConfig{
 		ToolCallingModel:      llm,
-		ToolsConfig:           compose.ToolsNodeConfig{Tools: tools},
+		ToolsConfig:           toolsConfig,
 		MaxStep:               12,
 		StreamToolCallChecker: newStreamToolCallChecker(peek),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &agentRun{agent: agent, tools: tools}, runs, code
+	return &agentRun{agent: agent, toolsConfig: toolsConfig}, runs, code
 }
 
 // liveTool counts the calls of the lookup tool and remembers when the last one began.

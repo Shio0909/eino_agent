@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -76,6 +77,37 @@ func TestValidatedTool_MissingRequired(t *testing.T) {
 		t.Fatal("inner tool should not be called on validation failure")
 	}
 	assertContains(t, err.Error(), "query")
+}
+
+// Callers tell the model's bad arguments from a tool that failed by this type.
+func TestValidatedTool_RejectedArgumentsAreAnInvalidArgumentsError(t *testing.T) {
+	for _, input := range []string{`{"mode":"auto"}`, `not json`, `{"query":"x","mode":"nope"}`, `{"query":"x","count":1.5}`} {
+		_, err := WrapWithValidation(&mockTool{}).InvokableRun(context.Background(), input)
+		var bad *InvalidArgumentsError
+		if !errors.As(err, &bad) {
+			t.Errorf("input %s: err = %v, want *InvalidArgumentsError", input, err)
+		}
+		if err != nil && !strings.HasPrefix(err.Error(), "参数校验失败: ") {
+			t.Errorf("input %s: message %q lost its prefix", input, err.Error())
+		}
+	}
+
+	failing := &failingTool{err: errors.New("backend down")}
+	_, err := WrapWithValidation(failing).InvokableRun(context.Background(), `{"query":"x"}`)
+	var bad *InvalidArgumentsError
+	if err == nil || errors.As(err, &bad) {
+		t.Errorf("a failure of the tool itself must not look like bad arguments: %v", err)
+	}
+}
+
+type failingTool struct{ err error }
+
+func (f *failingTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
+	return (&mockTool{}).Info(ctx)
+}
+
+func (f *failingTool) InvokableRun(context.Context, string, ...tool.Option) (string, error) {
+	return "", f.err
 }
 
 func TestValidatedTool_EmptyRequiredString(t *testing.T) {

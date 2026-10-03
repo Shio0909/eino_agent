@@ -41,11 +41,23 @@ func (v *ValidatedTool) InvokableRun(ctx context.Context, input string, opts ...
 	}
 
 	if err := validateInput(info, input); err != nil {
-		return "", fmt.Errorf("参数校验失败: %w", err)
+		return "", &InvalidArgumentsError{Reason: err}
 	}
 
 	return v.inner.InvokableRun(ctx, input, opts...)
 }
+
+// InvalidArgumentsError is returned when a call's arguments do not match the
+// tool's schema. It is the model's mistake rather than a failure of the tool, so
+// a caller that drives a model should hand the message back to it instead of
+// ending the run.
+type InvalidArgumentsError struct {
+	Reason error
+}
+
+func (e *InvalidArgumentsError) Error() string { return "参数校验失败: " + e.Reason.Error() }
+
+func (e *InvalidArgumentsError) Unwrap() error { return e.Reason }
 
 func validateInput(info *schema.ToolInfo, input string) error {
 	if info == nil || info.ParamsOneOf == nil {

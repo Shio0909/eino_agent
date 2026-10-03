@@ -154,36 +154,63 @@ func (l *eventLog) types() []string {
 func newTestRun(t *testing.T, m model.ToolCallingChatModel, peek int, tools ...einotool.BaseTool) (*agentRun, *eventLog) {
 	t.Helper()
 	log := &eventLog{}
-	wrapped := wrapAgentTools(tools, log.add)
+	return newTestRunWith(t, m, peek, toolCallMiddlewares(newToolEvents(log.add)), tools...), log
+}
+
+func newTestRunWith(t *testing.T, m model.ToolCallingChatModel, peek int, middlewares []compose.ToolMiddleware, tools ...einotool.BaseTool) *agentRun {
+	t.Helper()
+	toolsConfig := compose.ToolsNodeConfig{Tools: tools, ToolCallMiddlewares: middlewares}
 	agent, err := react.NewAgent(context.Background(), &react.AgentConfig{
 		ToolCallingModel:      m,
-		ToolsConfig:           compose.ToolsNodeConfig{Tools: wrapped},
+		ToolsConfig:           toolsConfig,
 		MaxStep:               12,
 		StreamToolCallChecker: newStreamToolCallChecker(peek),
 	})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}
-	return &agentRun{agent: agent, tools: wrapped}, log
+	return &agentRun{agent: agent, toolsConfig: toolsConfig}
 }
 
 func userMessage() []*schema.Message {
 	return []*schema.Message{{Role: schema.User, Content: "question"}}
 }
 
-// A wrapper must not claim a way of running that its base lacks. Eino picks the
-// streaming entry point of a tool that has one, and adapts a tool that has only
-// an invokable one; a wrapper that declares both turns that adaptation off.
-func TestEventToolDeclaresOnlyWhatTheBaseCanDo(t *testing.T) {
-	wrapped := wrapAgentTools([]einotool.BaseTool{&lookupTool{}, streamOnlyTool{}, &bothTool{}}, func(StreamEvent) {})
-	type caps struct{ invokable, streamable bool }
-	want := []caps{{true, false}, {false, true}, {true, true}}
-	for i, w := range wrapped {
-		_, inv := w.(einotool.InvokableTool)
-		_, str := w.(einotool.StreamableTool)
-		if got := (caps{inv, str}); got != want[i] {
-			info, _ := w.Info(context.Background())
-			t.Errorf("tool %s: invokable=%v streamable=%v, want %+v", info.Name, inv, str, want[i])
+// A tool may be invokable only, streamable only, or both, and the agent may be
+// run either way. Every combination has to work, and each call has to be
+// reported once: as one action and one observation, not twice because an
+// adapted tool was seen by the event middleware on both of its entry points.
+func TestEveryKindOfToolRunsAndIsReportedOnceOnBothPaths(t *testing.T) {
+	kinds := []struct {
+		name string
+		tool einotool.BaseTool
+		call string
+	}{
+		{"invokable only", &lookupTool{}, "lookup"},
+		{"streamable only", streamOnlyTool{}, "tail"},
+		{"both", &bothTool{}, "lookup"},
+	}
+	for _, k := range kinds {
+		for _, streamed := range []bool{false, true} {
+			m := &scriptedModel{turns: []turn{
+				{chunks: []*schema.Message{callTool("c1", k.call, `{}`)}},
+				{chunks: []*schema.Message{text("ok")}},
+			}}
+			run, log := newTestRun(t, m, 64, k.tool)
+
+			var err error
+			if streamed {
+				_, err = streamAgent(context.Background(), run, userMessage(), func(string) bool { return true })
+			} else {
+				_, err = run.agent.Generate(context.Background(), userMessage())
+			}
+			if err != nil {
+				t.Errorf("%s, streamed=%v: %v", k.name, streamed, err)
+				continue
+			}
+			if types := log.types(); len(types) != 2 || types[0] != "action" || types[1] != "observation" {
+				t.Errorf("%s, streamed=%v: events %v, want [action observation]", k.name, streamed, types)
+			}
 		}
 	}
 }
@@ -358,15 +385,21 @@ func TestStreamToolCallCheckerPeekWindow(t *testing.T) {
 	}
 }
 
-// Repeat-call tracking used to live in a second wrapper around eventTool; it
-// must keep working now that the wrappers are chosen by capability.
-func TestWrappedToolsStillWarnAboutRepeatedCalls(t *testing.T) {
+// A model that calls the same tool with the same arguments over and over is
+// told once to stop. This goes through the middlewares the service builds for a
+// request, not the ones the tests assemble.
+func TestRepeatedToolCallsAreWarnedAboutOnce(t *testing.T) {
 	log := &eventLog{}
 	svc := &ChatService{config: &config.Config{}}
-	wrapped := svc.wrapAgentToolsForRequest([]einotool.BaseTool{&lookupTool{}}, &ChatRequest{}, log.add)
-	inv := wrapped[0].(einotool.InvokableTool)
+	node, err := compose.NewToolNode(context.Background(), &compose.ToolsNodeConfig{
+		Tools:               []einotool.BaseTool{&lookupTool{}},
+		ToolCallMiddlewares: svc.toolCallMiddlewares(&ChatRequest{}, log.add),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < 3; i++ {
-		if _, err := inv.InvokableRun(context.Background(), `{"q":"same"}`); err != nil {
+		if _, err := node.Invoke(context.Background(), callTool("c", "lookup", `{"q":"same"}`)); err != nil {
 			t.Fatal(err)
 		}
 	}
