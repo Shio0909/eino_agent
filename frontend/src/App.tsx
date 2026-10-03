@@ -10,6 +10,8 @@ const ChatPage = lazy(() => import('@/pages/chat/ChatPage'))
 const KnowledgeListPage = lazy(() => import('@/pages/knowledge/KnowledgeListPage'))
 const KbLayout = lazy(() => import('@/pages/knowledge/KbLayout'))
 const DocumentsTab = lazy(() => import('@/pages/knowledge/DocumentsTab'))
+const WikiTab = lazy(() => import('@/pages/knowledge/WikiTab'))
+const GraphTab = lazy(() => import('@/pages/knowledge/GraphTab'))
 const ChunksPage = lazy(() => import('@/pages/knowledge/ChunksPage'))
 const ComingSoon = lazy(() => import('@/pages/ComingSoon'))
 
@@ -26,6 +28,8 @@ export default function App() {
               <Route path="/knowledge" element={<KnowledgeListPage />} />
               <Route path="/knowledge/:kbId" element={<KbLayout />}>
                 <Route index element={<DocumentsTab />} />
+                <Route path="wiki" element={<WikiTab />} />
+                <Route path="graph" element={<GraphTab />} />
               </Route>
               <Route path="/knowledge/:kbId/documents/:docId" element={<ChunksPage />} />
               <Route path="/code" element={<ComingSoon title="代码仓库" />} />

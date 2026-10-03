@@ -53,7 +53,12 @@ export default function KbLayout() {
   }
 
   const data = kb.data
-  const tabs = [{ to: `/knowledge/${data.id}`, label: '文档', end: true }]
+  const base = `/knowledge/${data.id}`
+  // Wiki pages exist only in wiki-mode bases; the graph is built from chunks, which wiki-mode bases do not have.
+  const tabs = [
+    { to: base, label: '文档', end: true },
+    ...(data.mode === 'wiki' ? [{ to: `${base}/wiki`, label: 'Wiki', end: false }] : [{ to: `${base}/graph`, label: '图谱', end: false }]),
+  ]
 
   return (
     <>

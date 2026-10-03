@@ -117,3 +117,70 @@ export interface IngestResponse {
   mode?: string
   error?: string
 }
+
+export type WikiPageType = 'index' | 'topic' | 'entity'
+
+export interface WikiPage {
+  id: string
+  knowledge_base_id: string
+  source_knowledge_id?: string | null
+  path: string
+  title: string
+  content: string
+  page_type: WikiPageType | string
+  metadata?: Record<string, unknown>
+  created_at: string
+  updated_at: string
+}
+
+export interface WikiPagesResponse {
+  pages: WikiPage[]
+}
+
+export interface WikiPageResponse {
+  page: WikiPage
+  linked_pages?: WikiPage[]
+}
+
+export interface WikiSearchResponse {
+  pages: WikiPage[]
+  query: string
+}
+
+export interface GraphNode {
+  id: string
+  label: string
+  degree: number
+  chunk_count: number
+}
+
+export interface GraphEdge {
+  source: string
+  target: string
+  label: string
+}
+
+/** Empty graphs come back as null lists. */
+export interface GraphResponse {
+  nodes: GraphNode[] | null
+  edges: GraphEdge[] | null
+}
+
+export interface GraphBuildResponse {
+  chunk_count: number
+  result?: {
+    total_chunks: number
+    processed_nodes: number
+    processed_relations: number
+    failed_chunks: number
+    /** A Go time.Duration, so nanoseconds. */
+    duration: number
+  }
+}
+
+export interface GraphRagStatus {
+  enabled: boolean
+  message?: string
+  neo4j_uri?: string
+  connected?: boolean
+}

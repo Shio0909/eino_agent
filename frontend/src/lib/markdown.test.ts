@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { renderMarkdown } from '@/lib/markdown'
+import { renderMarkdown, renderWikiMarkdown } from '@/lib/markdown'
 
 describe('renderMarkdown', () => {
   it('renders ordinary Markdown', () => {
@@ -90,5 +90,57 @@ describe('renderMarkdown', () => {
 
   it('returns an empty string for empty input', () => {
     expect(renderMarkdown('')).toBe('')
+  })
+})
+
+describe('renderWikiMarkdown', () => {
+  it('turns [[path]] into an in-app link carrying the page path', () => {
+    const html = renderWikiMarkdown('见 [[kubernetes/pod-lifecycle.md]]')
+    expect(html).toContain('data-wiki-path="kubernetes/pod-lifecycle.md"')
+    expect(html).toContain('href="?path=kubernetes%2Fpod-lifecycle.md"')
+    expect(html).toContain('>kubernetes/pod lifecycle</a>')
+    expect(html).not.toContain('target=')
+  })
+
+  it('adds the .md suffix like the server and uses the given link text', () => {
+    const html = renderWikiMarkdown('[[pods|Pod 说明]]')
+    expect(html).toContain('data-wiki-path="pods.md"')
+    expect(html).toContain('>Pod 说明</a>')
+  })
+
+  it('escapes the path and the text', () => {
+    const html = renderWikiMarkdown('[[x" onmouseover="alert(1)|<b>t</b>]]')
+    expect(html).not.toContain('onmouseover="alert')
+    expect(html).not.toContain('<b>')
+    expect(html).toContain('&lt;b&gt;t&lt;/b&gt;')
+  })
+
+  it('does not make a link out of a blank [[ ]]', () => {
+    expect(renderWikiMarkdown('[[ ]]')).not.toContain('data-wiki-path')
+  })
+
+  it('leaves [[...]] alone inside code', () => {
+    const html = renderWikiMarkdown('`[[a]]`\n\n```\n[[b]]\n```')
+    expect(html).not.toContain('data-wiki-path')
+    expect(html).toContain('[[a]]')
+    expect(html).toContain('[[b]]')
+  })
+
+  it('still opens ordinary links in a new tab and keeps the other protections', () => {
+    const html = renderWikiMarkdown('[文档](https://example.com) <script>x</script> [bad](javascript:alert(1))')
+    expect(html).toContain('href="https://example.com"')
+    expect(html).toContain('target="_blank"')
+    expect(html).not.toContain('<script')
+    expect(html).not.toContain('javascript:')
+  })
+
+  it('does not turn [[path]] into a link in ordinary rendering', () => {
+    const html = renderMarkdown('[[a]]')
+    expect(html).not.toContain('data-wiki-path')
+    expect(html).toContain('[[a]]')
+  })
+
+  it('renders an empty string for no content', () => {
+    expect(renderWikiMarkdown('')).toBe('')
   })
 })
