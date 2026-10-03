@@ -65,11 +65,26 @@ func ValidateChunks(chunks []Chunk, totalChars, chunkSize int) ValidationResult 
 	}
 
 	// Sanity check on absolute upper bound. Anything past 2x chunkSize is a
-	// red flag — the splitter ignored its size budget.
-	if maxLen > 2*chunkSize && chunkSize > 0 {
-		return ValidationResult{Reason: "chunk exceeds 2x target size"}
+	// red flag — the splitter ignored its size budget. A code block or table is
+	// kept whole on purpose, so only the text around the largest one counts.
+	if chunkSize > 0 && maxLen > 2*chunkSize {
+		for _, c := range chunks {
+			if l := runeLen(c.Content); l > 2*chunkSize && l-largestProtectedRunes(c.Content) > 2*chunkSize {
+				return ValidationResult{Reason: "chunk exceeds 2x target size"}
+			}
+		}
 	}
 
 	_ = avg
 	return ValidationResult{OK: true}
+}
+
+// largestProtectedRunes is the rune length of the biggest span in text that the
+// splitter treats as indivisible.
+func largestProtectedRunes(text string) int {
+	largest := 0
+	for _, sp := range protectedSpans(text) {
+		largest = max(largest, runeLen(text[sp.start:sp.end]))
+	}
+	return largest
 }
