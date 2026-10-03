@@ -1,7 +1,35 @@
+import { lazy, Suspense } from 'react'
+import { Navigate, Route, Routes } from 'react-router-dom'
+import { AppLayout } from '@/components/layout/AppLayout'
+import { RequireAuth } from '@/components/RequireAuth'
+import { PageSpinner } from '@/components/ui/Spinner'
+import { Toaster } from '@/components/ui/Toaster'
+
+const LoginPage = lazy(() => import('@/pages/LoginPage'))
+const ComingSoon = lazy(() => import('@/pages/ComingSoon'))
+
 export default function App() {
   return (
-    <main className="grid min-h-screen place-items-center">
-      <p>Eino RAG 知识库 · 控制台重建中</p>
-    </main>
+    <>
+      <Suspense fallback={<PageSpinner />}>
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
+          <Route element={<RequireAuth />}>
+            <Route element={<AppLayout />}>
+              <Route index element={<Navigate to="/chat" replace />} />
+              <Route path="/chat/*" element={<ComingSoon title="对话" />} />
+              <Route path="/knowledge/*" element={<ComingSoon title="知识库" />} />
+              <Route path="/code" element={<ComingSoon title="代码仓库" />} />
+              <Route path="/eval" element={<ComingSoon title="评测报告" />} />
+              <Route path="/approvals" element={<ComingSoon title="审批" />} />
+              <Route path="/settings" element={<ComingSoon title="设置" />} />
+              <Route path="/system" element={<ComingSoon title="系统" />} />
+              <Route path="*" element={<Navigate to="/chat" replace />} />
+            </Route>
+          </Route>
+        </Routes>
+      </Suspense>
+      <Toaster />
+    </>
   )
 }
