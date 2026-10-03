@@ -19,13 +19,14 @@ import (
 
 	"eino_agent/internal/config"
 	"eino_agent/internal/container"
+	internalTool "eino_agent/internal/tool"
 )
 
 // Streamed ReAct runs against a real model. Skipped unless
 // COMPACTION_LIVE_CONFIG points at a config file with a working llm section:
 //
 //	COMPACTION_LIVE_CONFIG=$PWD/configs/config.yaml go test ./internal/service -run LiveStreamAgent -v -count=1
-func liveStreamRun(t *testing.T, peek int) (*agentRun, *liveTool, string) {
+func liveModel(t *testing.T) model.ToolCallingChatModel {
 	t.Helper()
 	path := os.Getenv("COMPACTION_LIVE_CONFIG")
 	if path == "" {
@@ -43,6 +44,12 @@ func liveStreamRun(t *testing.T, peek int) (*agentRun, *liveTool, string) {
 	if !ok {
 		t.Fatalf("model %T does not support tool calling", m)
 	}
+	return llm
+}
+
+func liveStreamRun(t *testing.T, peek int) (*agentRun, *liveTool, string) {
+	t.Helper()
+	llm := liveModel(t)
 
 	code := fmt.Sprintf("zx-%d", time.Now().UnixNano()%1_000_000)
 	runs := &liveTool{}
@@ -175,4 +182,78 @@ func TestLiveStreamAgentSurvivesToolCallAfterThePeekWindow(t *testing.T) {
 		}
 	}
 	t.Logf("%d of %d trials wrote text before the tool call ran, which is the case this test is about", late, trials)
+}
+
+// A real model that calls a tool with no arguments is told what was missing and
+// calls it again correctly, on both ways of running the agent.
+func TestLiveModelCorrectsItselfAfterInvalidArguments(t *testing.T) {
+	llm := liveModel(t)
+	for _, streamed := range []bool{false, true} {
+		code := fmt.Sprintf("zx-%d", time.Now().UnixNano()%1_000_000)
+		runs := &liveTool{}
+		type in struct {
+			Topic string `json:"topic" jsonschema:"description=the topic to look up,required"`
+		}
+		lookup, err := utils.InferTool("lookup", "Look up the access code of a topic.",
+			func(_ context.Context, a in) (string, error) {
+				runs.ran()
+				return "The access code of " + a.Topic + " is " + code + ".", nil
+			})
+		if err != nil {
+			t.Fatal(err)
+		}
+		log := &eventLog{}
+		toolsConfig := compose.ToolsNodeConfig{
+			Tools:               []einotool.BaseTool{internalTool.WrapWithValidation(lookup.(einotool.InvokableTool))},
+			ToolCallMiddlewares: toolCallMiddlewares(newToolEvents(log.add)),
+		}
+		agent, err := react.NewAgent(context.Background(), &react.AgentConfig{
+			ToolCallingModel:      llm,
+			ToolsConfig:           toolsConfig,
+			MaxStep:               12,
+			StreamToolCallChecker: newStreamToolCallChecker(256),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		run := &agentRun{agent: agent, toolsConfig: toolsConfig}
+		msgs := []*schema.Message{
+			{Role: schema.System, Content: "You are testing error recovery. Your FIRST call of the lookup tool must pass an empty JSON object {} as arguments. If the tool reports an error, read it, then call lookup again with correct arguments for topic alpha. Finally state the access code."},
+			{Role: schema.User, Content: "Get me the access code for topic alpha."},
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		var answer string
+		if streamed {
+			msg, e := streamAgent(ctx, run, msgs, func(string) bool { return true })
+			err = e
+			if msg != nil {
+				answer = msg.Content
+			}
+		} else {
+			msg, e := run.agent.Generate(ctx, msgs)
+			err = e
+			if msg != nil {
+				answer = msg.Content
+			}
+		}
+		cancel()
+		if err != nil {
+			t.Fatalf("streamed=%v: %v", streamed, err)
+		}
+		rejected := 0
+		log.mu.Lock()
+		for _, e := range log.events {
+			if e.Type == "observation" && e.Error != "" {
+				rejected++
+			}
+		}
+		log.mu.Unlock()
+		t.Logf("streamed=%v: rejected calls=%d, tool runs=%d", streamed, rejected, runs.count())
+		if rejected < 1 {
+			t.Errorf("streamed=%v: the model never made the bad call this test depends on", streamed)
+		}
+		if runs.count() != 1 || !strings.Contains(answer, code) {
+			t.Errorf("streamed=%v: tool runs=%d, answer %q does not contain %s", streamed, runs.count(), answer, code)
+		}
+	}
 }
