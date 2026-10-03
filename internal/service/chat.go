@@ -16,7 +16,6 @@ import (
 	"github.com/cloudwego/eino/components/retriever"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
-	"github.com/cloudwego/eino/flow/agent/react"
 	"github.com/cloudwego/eino/schema"
 
 	"eino_agent/internal/approval"
@@ -47,8 +46,6 @@ type ChatService struct {
 	retriever       retriever.Retriever
 	reranker        pipeline.Reranker // 重排序器（注入到 Pipeline）
 	pipeline        *pipeline.RAGPipeline
-	agent           *react.Agent
-	knowledgeTool   *internalTool.KnowledgeTool   // Agent 模式的知识库工具引用
 	graphRAGService *graphrag.Service             // GraphRAG 服务（可选，用于按需创建图谱检索器）
 	codeGraphRepo   codegraph.CodeGraphRepository // 代码知识图谱存储（可选）
 	codeIndexer     *codegraph.Indexer            // 代码索引器（可选）
@@ -246,51 +243,12 @@ func (s *ChatService) InitWithComponents(
 		pipeOpts...,
 	)
 
-	// 初始化 Agent（如果启用）
+	// 每个请求都会按自己的检索范围、技能和事件通道构建 agent（buildRuntimeAgentForRequest），
+	// 这里只在启动时确认模型能做工具调用，让配置错误尽早暴露。
 	if s.config.Agent.Enabled {
-		tools, kt := s.buildToolsWithRetriever(retriever)
-		s.knowledgeTool = kt
-		// 追加 MCP 远程工具
-		tools = append(tools, s.mcpTools...)
-
-		// 追加 Eino skill 中间件提供的工具（渐进式披露）
-		if s.skillMiddleware != nil {
-			tools = append(tools, s.skillMiddleware.AdditionalTools...)
-		}
-
-		toolCallingModel, ok := any(chatModel).(model.ToolCallingChatModel)
-		if !ok {
+		if _, ok := any(chatModel).(model.ToolCallingChatModel); !ok {
 			return fmt.Errorf("agent mode requires ToolCallingChatModel, current model type: %T", chatModel)
 		}
-
-		// 构建系统指令（含 skill 附加指令）
-		systemInstruction := s.renderSystemPrompt("agentic")
-		if s.skillMiddleware != nil && s.skillMiddleware.AdditionalInstruction != "" {
-			systemInstruction = systemInstruction + "\n\n" + s.skillMiddleware.AdditionalInstruction
-		}
-
-		reactCfg := &react.AgentConfig{
-			ToolsConfig: compose.ToolsNodeConfig{
-				Tools: tools,
-			},
-			MaxStep:          s.config.Agent.MaxSteps,
-			ToolCallingModel: toolCallingModel,
-			MessageModifier: func(ctx context.Context, input []*schema.Message) []*schema.Message {
-				if len(input) == 0 {
-					return []*schema.Message{{Role: schema.System, Content: systemInstruction}}
-				}
-				out := make([]*schema.Message, 0, len(input)+1)
-				out = append(out, &schema.Message{Role: schema.System, Content: systemInstruction})
-				out = append(out, input...)
-				return out
-			},
-		}
-
-		agent, err := react.NewAgent(ctx, reactCfg)
-		if err != nil {
-			return fmt.Errorf("create agent: %w", err)
-		}
-		s.agent = agent
 	}
 
 	return nil
