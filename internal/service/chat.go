@@ -535,32 +535,39 @@ func (r *scopedRetriever) Retrieve(ctx context.Context, query string, opts ...re
 }
 
 func (r *scopedRetriever) matchDoc(doc *schema.Document) bool {
-	if r.scope.restricted && len(r.scope.kbSet) == 0 && len(r.scope.docSet) == 0 {
+	return r.scope.allows(doc.ID, doc.MetaData)
+}
+
+// allows reports whether a chunk, identified by its id and metadata, falls
+// inside the scope. Retrieval results and remembered evidence from earlier
+// turns are held to the same rule.
+func (s retrievalScope) allows(id string, meta map[string]any) bool {
+	if s.restricted && len(s.kbSet) == 0 && len(s.docSet) == 0 {
 		return false
 	}
-	if len(r.scope.kbSet) > 0 {
-		kbID := strings.TrimSpace(toString(metaValue(doc.MetaData, "knowledge_base_id")))
+	if len(s.kbSet) > 0 {
+		kbID := strings.TrimSpace(toString(metaValue(meta, "knowledge_base_id")))
 		if kbID == "" {
 			return false
 		}
-		if _, ok := r.scope.kbSet[kbID]; !ok {
+		if _, ok := s.kbSet[kbID]; !ok {
 			return false
 		}
 	}
 
-	if len(r.scope.docSet) > 0 {
+	if len(s.docSet) > 0 {
 		ids := []string{
-			strings.TrimSpace(doc.ID),
-			strings.TrimSpace(toString(metaValue(doc.MetaData, "knowledge_id"))),
-			strings.TrimSpace(toString(metaValue(doc.MetaData, "document_id"))),
-			strings.TrimSpace(toString(metaValue(doc.MetaData, "doc_id"))),
-			strings.TrimSpace(toString(metaValue(doc.MetaData, "chunk_id"))),
+			strings.TrimSpace(id),
+			strings.TrimSpace(toString(metaValue(meta, "knowledge_id"))),
+			strings.TrimSpace(toString(metaValue(meta, "document_id"))),
+			strings.TrimSpace(toString(metaValue(meta, "doc_id"))),
+			strings.TrimSpace(toString(metaValue(meta, "chunk_id"))),
 		}
-		for _, id := range ids {
-			if id == "" {
+		for _, candidate := range ids {
+			if candidate == "" {
 				continue
 			}
-			if _, ok := r.scope.docSet[id]; ok {
+			if _, ok := s.docSet[candidate]; ok {
 				return true
 			}
 		}
@@ -568,6 +575,20 @@ func (r *scopedRetriever) matchDoc(doc *schema.Document) bool {
 	}
 
 	return true
+}
+
+// filterSources keeps the sources that are inside the scope, in order.
+func (s retrievalScope) filterSources(sources []Source) []Source {
+	if s.isEmpty() {
+		return sources
+	}
+	kept := make([]Source, 0, len(sources))
+	for _, source := range sources {
+		if s.allows(source.DocID, source.Metadata) {
+			kept = append(kept, source)
+		}
+	}
+	return kept
 }
 
 func metaValue(meta map[string]any, key string) any {

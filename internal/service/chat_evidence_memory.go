@@ -18,7 +18,11 @@ func (s *ChatService) buildFollowUpEvidenceInstruction(ctx context.Context, req 
 	if req == nil || sessionID == "" || s.messageRepo == nil || !isFollowUpEvidenceQuestion(req.Message) {
 		return "", nil
 	}
-	sources := s.lastAssistantSources(ctx, sessionID)
+	// The earlier turn may have searched a different knowledge base or
+	// document than the one selected now, or one the user can no longer reach.
+	// Only evidence the current request could itself retrieve is reused, and
+	// this runs before the source limit so out-of-scope entries do not use it up.
+	sources := s.buildRetrievalScope(req).filterSources(s.lastAssistantSources(ctx, sessionID))
 	if len(sources) == 0 {
 		return "", nil
 	}

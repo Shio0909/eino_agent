@@ -102,7 +102,9 @@ flowchart LR
 
 系统会把 assistant 回答中的 sources 持久化到会话消息里。后续问题命中“这个、继续、上面、刚才”等追问信号时，会把上一轮 sources 作为 evidence instruction 注入当前轮生成上下文，同时保留本轮检索流程，避免仅凭短句追问查偏。
 
-该复用行为会写入 `followup_evidence` trace step，便于观察一次回答是否使用了上一轮证据。
+注入前，上一轮 sources 会先与本轮的知识库/文档范围求交：只复用本轮检索器自己也能取到的证据。切换了知识库或文档、失去某个知识库的访问权限、或所选范围为空时，旧 sources 不会进入生成上下文；缺少 `knowledge_base_id` 的 source 在限定知识库时按不在范围内处理。过滤发生在“最多 3 条”的截断之前。
+
+该复用行为会写入 `followup_evidence` trace step，`source_count` 为过滤后实际复用的条数，便于观察一次回答是否使用了上一轮证据。
 
 ## 项目结构
 
