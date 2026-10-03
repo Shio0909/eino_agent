@@ -247,18 +247,11 @@ func (h *Handler) DeleteKnowledgeBase(c *gin.Context) {
 	if _, ok := h.ensureKnowledgeBaseAdminAccess(c, id); !ok {
 		return
 	}
-	h.clearKnowledgeBaseImportStates(c.Request.Context(), id)
-	if err := h.kbRepo.Delete(c.Request.Context(), id); err != nil {
+	if err := h.purgeKnowledgeBase(c.Request.Context(), id); err != nil {
+		log.Printf("[Delete] 删除知识库失败，知识库保留以便重试: kb=%s err=%v", id, err)
 		h.audit(c, "kb.delete", id, false, map[string]interface{}{"error": err.Error()})
-		respondError(c, http.StatusInternalServerError, err.Error())
+		respondError(c, http.StatusInternalServerError, "删除失败，知识库已保留，请重试: "+err.Error())
 		return
-	}
-
-	// 清理向量数据库中该知识库的所有 chunk
-	if h.vectorDB != nil {
-		if err := h.vectorDB.DeleteByKnowledgeBaseID(c.Request.Context(), id); err != nil {
-			log.Printf("[VectorDB] 删除知识库向量失败（数据可能残留）: kb=%s err=%v", id, err)
-		}
 	}
 
 	if h.retrievalCache != nil {

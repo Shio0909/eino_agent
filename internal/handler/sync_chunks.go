@@ -76,6 +76,9 @@ var (
 	// errSuperseded means a newer upload replaced the source while this update
 	// waited. It is not a failure: the newer upload's own update owns the document.
 	errSuperseded = errors.New("文档已被更新的上传取代，本次更新已放弃")
+	// errDocumentGone means the document was deleted while this update waited.
+	// Like errSuperseded it is not a failure: there is nothing left to index.
+	errDocumentGone = errors.New("文档已被删除，本次更新已放弃")
 )
 
 // stableChunkID names a chunk by what it says and which copy of that text it

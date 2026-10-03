@@ -2,8 +2,8 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"log"
 	"net/url"
 	"os"
 	"os/exec"
@@ -99,14 +99,8 @@ func (h *Handler) MCPDeleteKB(ctx context.Context, kbID string) error {
 	if err != nil || kb == nil {
 		return fmt.Errorf("知识库 %s 不存在", kbID)
 	}
-	h.clearKnowledgeBaseImportStates(ctx, kbID)
-	if err := h.kbRepo.Delete(ctx, kbID); err != nil {
-		return fmt.Errorf("删除知识库失败: %w", err)
-	}
-	if h.vectorDB != nil {
-		if err := h.vectorDB.DeleteByKnowledgeBaseID(ctx, kbID); err != nil {
-			log.Printf("[VectorDB] MCP删除知识库向量失败（数据可能残留）: kb=%s err=%v", kbID, err)
-		}
+	if err := h.purgeKnowledgeBase(ctx, kbID); err != nil {
+		return err
 	}
 	if h.retrievalCache != nil {
 		_ = h.retrievalCache.InvalidateKnowledgeBase(ctx, kbID)
@@ -156,18 +150,10 @@ func (h *Handler) MCPDeleteDocument(ctx context.Context, kbID, docID string) err
 	if k == nil || k.KnowledgeBaseID != kbID {
 		return fmt.Errorf("文档 %s 不存在于知识库 %s 中", docID, kbID)
 	}
-	if err := h.knowledgeRepo.Delete(ctx, docID); err != nil {
-		return fmt.Errorf("删除文档失败: %w", err)
-	}
-	if h.wikiRepo != nil {
-		if err := h.wikiRepo.DeletePagesBySourceKnowledge(ctx, docID); err != nil {
-			log.Printf("[Wiki] MCP删除文档 wiki 页面失败（数据可能残留）: doc=%s err=%v", docID, err)
-		}
-	}
-	if h.vectorDB != nil {
-		if err := h.vectorDB.DeleteByKnowledgeID(ctx, docID); err != nil {
-			log.Printf("[VectorDB] MCP删除文档向量失败（数据可能残留）: doc=%s err=%v", docID, err)
-		}
+	if err := h.purgeDocument(ctx, docID); errors.Is(err, errDocumentGone) {
+		return fmt.Errorf("文档 %s 不存在于知识库 %s 中", docID, kbID)
+	} else if err != nil {
+		return fmt.Errorf("删除文档失败，文档已保留，可重试: %w", err)
 	}
 	_ = h.kbRepo.IncrementCounts(ctx, kbID, -1, 0)
 	h.deleteImportTaskState(ctx, docID)

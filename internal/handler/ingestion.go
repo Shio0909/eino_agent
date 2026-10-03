@@ -131,7 +131,7 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 	}
 
 	chunkCount, err := h.indexChunks(c.Request.Context(), kbID, knowledge.ID, header.Filename, chunks, docHash, syncOptions{ExpectStoredHash: docHash})
-	if errors.Is(err, errSuperseded) {
+	if errors.Is(err, errSuperseded) || errors.Is(err, errDocumentGone) {
 		h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error(), "filename": header.Filename, "knowledge_id": knowledge.ID})
 		respondError(c, http.StatusConflict, err.Error())
 		return
@@ -709,10 +709,11 @@ func (h *Handler) ProcessImportTask(ctx context.Context, task importqueue.Task) 
 	}
 
 	elapsed := time.Since(start)
-	if errors.Is(err, errSuperseded) {
-		// A newer upload owns the document now and has its own task, so this
-		// one ends quietly: no failed status, no retry, and its file is dropped.
-		log.Printf("[ImportWorker] 已被新的上传取代，放弃: %s (id=%s)", task.FileName, task.KnowledgeID)
+	if errors.Is(err, errSuperseded) || errors.Is(err, errDocumentGone) {
+		// A newer upload owns the document now and has its own task (or the
+		// document was deleted), so this one ends quietly: no failed status, no
+		// retry, and its file is dropped.
+		log.Printf("[ImportWorker] 已被取代或文档已删除，放弃: %s (id=%s): %v", task.FileName, task.KnowledgeID, err)
 		if task.SourceType == "file" && task.FilePath != "" {
 			_ = os.Remove(task.FilePath)
 		}

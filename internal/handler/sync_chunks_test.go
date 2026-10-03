@@ -99,6 +99,9 @@ func (r *statefulChunkRepo) DeleteByIDs(_ context.Context, ids []string) error {
 func (r *statefulChunkRepo) DeleteByKnowledgeID(_ context.Context, knowledgeID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.take("DeleteByKnowledgeID"); err != nil {
+		return err
+	}
 	for id, c := range r.rows {
 		if c.KnowledgeID == knowledgeID {
 			delete(r.rows, id)
@@ -176,6 +179,9 @@ func (v *statefulVectorDB) Delete(_ context.Context, ids []string) error {
 func (v *statefulVectorDB) DeleteByKnowledgeID(_ context.Context, knowledgeID string) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	if err := v.take("DeleteByKnowledgeID"); err != nil {
+		return err
+	}
 	for id, d := range v.docs {
 		if d.Metadata["knowledge_id"] == knowledgeID {
 			delete(v.docs, id)
@@ -193,9 +199,21 @@ func (v *statefulVectorDB) UpdateChunkIndexes(_ context.Context, indexes map[str
 	}
 	return nil
 }
-func (v *statefulVectorDB) DeleteByKnowledgeBaseID(context.Context, string) error { return nil }
-func (v *statefulVectorDB) Ping(context.Context) error                            { return nil }
-func (v *statefulVectorDB) Close() error                                          { return nil }
+func (v *statefulVectorDB) DeleteByKnowledgeBaseID(_ context.Context, kbID string) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if err := v.take("DeleteByKnowledgeBaseID"); err != nil {
+		return err
+	}
+	for id, d := range v.docs {
+		if d.Metadata["knowledge_base_id"] == kbID {
+			delete(v.docs, id)
+		}
+	}
+	return nil
+}
+func (v *statefulVectorDB) Ping(context.Context) error { return nil }
+func (v *statefulVectorDB) Close() error               { return nil }
 func (v *statefulVectorDB) Search(context.Context, []float32, int, container.SearchFilter) ([]*container.Document, error) {
 	return nil, nil
 }

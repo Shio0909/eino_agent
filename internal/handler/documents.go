@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -212,23 +213,14 @@ func (h *Handler) DeleteDocument(c *gin.Context) {
 		return
 	}
 
-	if err := h.knowledgeRepo.Delete(c.Request.Context(), docID); err != nil {
-		h.audit(c, "doc.delete", docID, false, map[string]interface{}{"error": err.Error()})
-		respondError(c, http.StatusInternalServerError, err.Error())
+	if err := h.purgeDocument(c.Request.Context(), docID); errors.Is(err, errDocumentGone) {
+		respondError(c, http.StatusNotFound, "文档不存在")
 		return
-	}
-
-	if h.wikiRepo != nil {
-		if err := h.wikiRepo.DeletePagesBySourceKnowledge(c.Request.Context(), docID); err != nil {
-			log.Printf("[Wiki] 删除文档 wiki 页面失败（数据可能残留）: doc=%s err=%v", docID, err)
-		}
-	}
-
-	// 清理向量数据库中该文档的所有 chunk
-	if h.vectorDB != nil {
-		if err := h.vectorDB.DeleteByKnowledgeID(c.Request.Context(), docID); err != nil {
-			log.Printf("[VectorDB] 删除文档向量失败（数据可能残留）: doc=%s err=%v", docID, err)
-		}
+	} else if err != nil {
+		log.Printf("[Delete] 删除文档失败，文档保留以便重试: doc=%s err=%v", docID, err)
+		h.audit(c, "doc.delete", docID, false, map[string]interface{}{"error": err.Error()})
+		respondError(c, http.StatusInternalServerError, "删除失败，文档已保留，请重试: "+err.Error())
+		return
 	}
 
 	// 更新知识库计数
@@ -673,15 +665,18 @@ func (h *Handler) applySync(ctx context.Context, kbID, knowledgeID, filename str
 	}
 	defer unlock()
 
-	if opts.ExpectStoredHash != "" && h.knowledgeRepo != nil {
+	// The document may have been deleted while this update waited for the lock.
+	// Writing then would bring chunks and vectors back for a document nobody can
+	// see or delete any more.
+	if h.knowledgeRepo != nil {
 		current, err := h.knowledgeRepo.GetByID(ctx, knowledgeID)
 		if err != nil {
 			return nil, fmt.Errorf("读取文档记录失败: %w", err)
 		}
 		if current == nil {
-			return nil, fmt.Errorf("文档 %s 已不存在", knowledgeID)
+			return nil, errDocumentGone
 		}
-		if current.ContentHash != "" && current.ContentHash != opts.ExpectStoredHash {
+		if opts.ExpectStoredHash != "" && current.ContentHash != "" && current.ContentHash != opts.ExpectStoredHash {
 			return nil, errSuperseded
 		}
 	}

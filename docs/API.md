@@ -494,8 +494,9 @@ fields are reset to zero values. `200`: `{"message": "更新成功"}`.
 
 ### `DELETE /api/v1/knowledge-bases/{id}`
 
-KB role: admin. Deletes the KB, its documents, vectors and import states.
-`200`: `{"message": "删除成功"}`.
+KB role: admin. Deletes the KB, its vectors and its import states. The vectors are removed
+first and the KB record last, so if the vector store fails the call returns `500` and the KB
+is still there to delete again. `200`: `{"message": "删除成功"}`.
 
 ---
 
@@ -749,8 +750,12 @@ content cannot be fetched.
 
 ### `DELETE /api/v1/knowledge-bases/{id}/documents/{docId}`
 
-KB role: editor. Deletes the document record, its wiki pages (wiki KBs), and its vectors.
-`200`: `{"message": "删除成功"}`.
+KB role: editor. Deletes the document's wiki pages (wiki KBs), vectors and chunk rows, and
+then the document record, all under the document's update lock. `200`: `{"message": "删除成功"}`.
+If any cleanup step fails the call returns `500` and the document is kept, so the delete can be
+retried; success is never reported while indexed data is left behind. `404` when the document
+does not exist (including when a concurrent delete finished first). An import or sync that was
+waiting on the same document ends without writing anything.
 
 ---
 
