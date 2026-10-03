@@ -81,7 +81,8 @@ function onUnauthorized(path: string) {
   if (path !== '/auth/login') useAuth.getState().logout()
 }
 
-export async function api<T = void>(path: string, opts: RequestOptions = {}): Promise<T> {
+/** Like `api`, but also returns the HTTP status for endpoints whose meaning depends on it (200 vs 202). */
+export async function apiRaw<T = void>(path: string, opts: RequestOptions = {}): Promise<{ status: number; data: T }> {
   const headers: Record<string, string> = { Accept: 'application/json', ...authHeaders(), ...opts.headers }
   let body: BodyInit | undefined
   if (opts.form) {
@@ -104,9 +105,12 @@ export async function api<T = void>(path: string, opts: RequestOptions = {}): Pr
     if (res.status === 401) onUnauthorized(path)
     throw error
   }
-  if (res.status === 204) return undefined as T
   const text = await res.text()
-  return (text ? JSON.parse(text) : undefined) as T
+  return { status: res.status, data: (text ? JSON.parse(text) : undefined) as T }
+}
+
+export async function api<T = void>(path: string, opts: RequestOptions = {}): Promise<T> {
+  return (await apiRaw<T>(path, opts)).data
 }
 
 export const apiGet = <T>(path: string, query?: Query, signal?: AbortSignal) => api<T>(path, { query, signal })
