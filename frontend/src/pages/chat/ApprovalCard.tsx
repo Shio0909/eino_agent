@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
 import { useNow } from '@/hooks/useNow'
 import { apiPost, errorMessage } from '@/lib/api'
+import { cn } from '@/lib/cn'
 import type { TurnApproval } from '@/lib/chatTurn'
 import { prettyJson } from '@/lib/format'
 import { toast } from '@/store/toast'
@@ -54,9 +55,9 @@ export function ApprovalCard({ approval, onSettled }: ApprovalCardProps) {
   }
 
   return (
-    <div className="rounded-xl border border-warning/40 bg-warning-soft/40 p-4">
+    <div className={cn('rounded-xl border p-4', pending ? 'border-warning/40 bg-warning-soft/40' : 'border-border bg-surface')}>
       <div className="flex flex-wrap items-center gap-2">
-        <ShieldAlert className="size-4 text-warning" />
+        <ShieldAlert className={cn('size-4', pending ? 'text-warning' : 'text-muted')} />
         <span className="font-medium">{approval.action || approval.toolName || '需要确认的操作'}</span>
         <Badge variant={status.variant}>{status.label}</Badge>
         {approval.riskLevel ? <Badge variant={RISK[approval.riskLevel.toLowerCase()] ?? 'neutral'}>风险：{approval.riskLevel}</Badge> : null}

@@ -3,6 +3,8 @@ import type { ApiErrorBody } from '@/types/api'
 
 export const API_BASE = '/api/v1'
 
+export const NETWORK_ERROR_MESSAGE = '无法连接到服务器，请检查网络或后端是否已启动'
+
 /** An error response from the server, or a failure to reach it (status 0). */
 export class ApiError extends Error {
   readonly status: number
@@ -97,7 +99,7 @@ export async function apiRaw<T = void>(path: string, opts: RequestOptions = {}):
     res = await fetch(buildUrl(path, opts.query), { method: opts.method ?? 'GET', headers, body, signal: opts.signal })
   } catch (err) {
     if (err instanceof DOMException && err.name === 'AbortError') throw err
-    throw new ApiError(0, 'network_error', '无法连接到服务器，请检查网络或后端是否已启动')
+    throw new ApiError(0, 'network_error', NETWORK_ERROR_MESSAGE)
   }
 
   if (!res.ok) {

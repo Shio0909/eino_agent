@@ -169,12 +169,13 @@ func TestValidRepoName(t *testing.T) {
 
 func TestExtractRepoNameFromURL(t *testing.T) {
 	for url, want := range map[string]string{
-		"https://github.com/owner/repo.git": "repo",
-		"https://github.com/owner/repo/":    "repo",
-		"https://github.com/owner/repo":     "repo",
-		"git@github.com:owner/repo.git":     "repo",
-		"git@host:repo.git":                 "repo",
-		"ssh://git@host:2222/owner/repo":    "repo",
+		"https://github.com/owner/repo.git":  "repo",
+		"https://github.com/owner/repo/":     "repo",
+		"https://github.com/owner/repo.git/": "repo",
+		"https://github.com/owner/repo":      "repo",
+		"git@github.com:owner/repo.git":      "repo",
+		"git@host:repo.git":                  "repo",
+		"ssh://git@host:2222/owner/repo":     "repo",
 	} {
 		if got := extractRepoNameFromURL(url); got != want {
 			t.Errorf("extractRepoNameFromURL(%q) = %q, want %q", url, got, want)

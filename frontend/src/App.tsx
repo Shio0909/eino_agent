@@ -13,7 +13,11 @@ const DocumentsTab = lazy(() => import('@/pages/knowledge/DocumentsTab'))
 const WikiTab = lazy(() => import('@/pages/knowledge/WikiTab'))
 const GraphTab = lazy(() => import('@/pages/knowledge/GraphTab'))
 const ChunksPage = lazy(() => import('@/pages/knowledge/ChunksPage'))
-const ComingSoon = lazy(() => import('@/pages/ComingSoon'))
+const CodeReposPage = lazy(() => import('@/pages/code/CodeReposPage'))
+const EvalPage = lazy(() => import('@/pages/eval/EvalPage'))
+const ApprovalsPage = lazy(() => import('@/pages/approvals/ApprovalsPage'))
+const SettingsPage = lazy(() => import('@/pages/settings/SettingsPage'))
+const SystemPage = lazy(() => import('@/pages/system/SystemPage'))
 
 export default function App() {
   return (
@@ -32,11 +36,11 @@ export default function App() {
                 <Route path="graph" element={<GraphTab />} />
               </Route>
               <Route path="/knowledge/:kbId/documents/:docId" element={<ChunksPage />} />
-              <Route path="/code" element={<ComingSoon title="代码仓库" />} />
-              <Route path="/eval" element={<ComingSoon title="评测报告" />} />
-              <Route path="/approvals" element={<ComingSoon title="审批" />} />
-              <Route path="/settings" element={<ComingSoon title="设置" />} />
-              <Route path="/system" element={<ComingSoon title="系统" />} />
+              <Route path="/code" element={<CodeReposPage />} />
+              <Route path="/eval" element={<EvalPage />} />
+              <Route path="/approvals" element={<ApprovalsPage />} />
+              <Route path="/settings" element={<SettingsPage />} />
+              <Route path="/system" element={<SystemPage />} />
               <Route path="*" element={<Navigate to="/chat" replace />} />
             </Route>
           </Route>
