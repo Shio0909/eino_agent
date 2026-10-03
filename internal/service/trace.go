@@ -9,6 +9,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 
 	"eino_agent/internal/database/repository"
+	"eino_agent/internal/retrieval"
 	"eino_agent/internal/tracing"
 )
 
@@ -165,6 +166,9 @@ func (r *tracedRetriever) Retrieve(ctx context.Context, query string, opts ...re
 	started := time.Now()
 	docs, err := r.base.Retrieve(ctx, query, opts...)
 	metadata := map[string]any{"query": query, "doc_count": len(docs)}
+	if mode := retrieval.ModeFromOptions(opts...); mode != "" {
+		metadata["mode"] = mode
+	}
 	if err != nil {
 		metadata["error"] = err.Error()
 	}
@@ -179,23 +183,6 @@ func (r *tracedRetriever) Retrieve(ctx context.Context, query string, opts ...re
 			}
 		}
 		metadata["doc_ids"] = ids
-	}
-	r.trace.addStage("retrieve", started, metadata)
-	return docs, err
-}
-
-func (r *tracedRetriever) RetrieveWithMode(ctx context.Context, query string, mode string) ([]*schema.Document, error) {
-	mr, ok := r.base.(interface {
-		RetrieveWithMode(context.Context, string, string) ([]*schema.Document, error)
-	})
-	if !ok {
-		return r.Retrieve(ctx, query)
-	}
-	started := time.Now()
-	docs, err := mr.RetrieveWithMode(ctx, query, mode)
-	metadata := map[string]any{"query": query, "mode": mode, "doc_count": len(docs)}
-	if err != nil {
-		metadata["error"] = err.Error()
 	}
 	r.trace.addStage("retrieve", started, metadata)
 	return docs, err

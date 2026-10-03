@@ -16,12 +16,9 @@ import (
 	"github.com/cloudwego/eino/components/retriever"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
-)
 
-// ModeRetriever 支持按模式检索的接口（由 CompositeRetriever 实现）
-type ModeRetriever interface {
-	RetrieveWithMode(ctx context.Context, query string, mode string) ([]*schema.Document, error)
-}
+	"eino_agent/internal/retrieval"
+)
 
 // KnowledgeTool 知识库检索工具
 type KnowledgeTool struct {
@@ -109,26 +106,19 @@ func (t *KnowledgeTool) InvokableRun(ctx context.Context, input string, opts ...
 	}
 
 	mode := strings.ToLower(strings.TrimSpace(params.Mode))
-	if mode == "" {
-		mode = "auto"
+	switch mode {
+	case retrieval.ModeSemantic, retrieval.ModeExact, retrieval.ModeGraph:
+	default:
+		mode = retrieval.ModeAuto
 	}
 
 	retrieveStart := time.Now()
-	var docs []*schema.Document
-	var err error
-
-	// 如果 retriever 支持按模式检索且 mode 非 auto，使用模式检索
-	if mode != "auto" {
-		if mr, ok := t.retriever.(ModeRetriever); ok {
-			docs, err = mr.RetrieveWithMode(ctx, params.Query, mode)
-		} else {
-			log.Printf("[KnowledgeTool] retriever 不支持 mode=%s，降级为 auto", mode)
-			mode = "auto"
-			docs, err = t.retriever.Retrieve(ctx, params.Query)
-		}
-	} else {
-		docs, err = t.retriever.Retrieve(ctx, params.Query)
+	// 模式以 retriever.Option 传递：包在外层的作用域/追踪检索器会原样转发 opts。
+	var retrieveOpts []retriever.Option
+	if mode != retrieval.ModeAuto {
+		retrieveOpts = append(retrieveOpts, retrieval.WithMode(mode))
 	}
+	docs, err := t.retriever.Retrieve(ctx, params.Query, retrieveOpts...)
 
 	log.Printf("[Timing][KnowledgeTool] stage=retrieve mode=%s duration_ms=%d docs=%d query=%q",
 		mode, time.Since(retrieveStart).Milliseconds(), len(docs), params.Query)

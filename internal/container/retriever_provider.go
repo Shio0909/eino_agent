@@ -19,6 +19,7 @@ import (
 
 	cachepkg "eino_agent/internal/cache"
 	"eino_agent/internal/config"
+	"eino_agent/internal/retrieval"
 	"eino_agent/internal/tracing"
 )
 
@@ -69,8 +70,19 @@ func (r *CompositeRetriever) SetGraphRetrieverFactory(f GraphRetrieverFactory) {
 	r.graphRetrieverFactory = f
 }
 
-// Retrieve 执行检索
+// Retrieve 执行检索。retrieval.WithMode 可指定 semantic / exact / graph，
+// 其余（含未设置、auto 和未知取值）走默认策略。
 func (r *CompositeRetriever) Retrieve(ctx context.Context, query string, opts ...einoretriever.Option) ([]*schema.Document, error) {
+	switch mode := retrieval.ModeFromOptions(opts...); mode {
+	case retrieval.ModeSemantic, retrieval.ModeExact, retrieval.ModeGraph:
+		return r.retrieveByMode(ctx, query, mode)
+	default:
+		return r.retrieveAuto(ctx, query, opts...)
+	}
+}
+
+// retrieveAuto 是默认策略：开启 hybrid 时走 RRF 融合，否则纯向量。
+func (r *CompositeRetriever) retrieveAuto(ctx context.Context, query string, opts ...einoretriever.Option) ([]*schema.Document, error) {
 	if r.cfg.EnableHybrid {
 		return r.retrieveWithHybrid(ctx, query, opts...)
 	}
@@ -563,9 +575,8 @@ func (r *CompositeRetriever) RetrieveWithHybrid(ctx context.Context, query strin
 	return r.retrieveWithHybrid(ctx, query, opts...)
 }
 
-// RetrieveWithMode 按指定模式检索。mode: "auto"|"semantic"|"exact"|"graph"。
-// auto = 默认行为（hybrid 开启时走 RRF，否则纯向量）。
-func (r *CompositeRetriever) RetrieveWithMode(ctx context.Context, query string, mode string) ([]*schema.Document, error) {
+// retrieveByMode 执行 semantic / exact / graph 三种显式模式。
+func (r *CompositeRetriever) retrieveByMode(ctx context.Context, query string, mode string) ([]*schema.Document, error) {
 	topK := r.cfg.TopK
 	if topK <= 0 {
 		topK = 10
@@ -606,14 +617,14 @@ func (r *CompositeRetriever) RetrieveWithMode(ctx context.Context, query string,
 		if r.graphRetriever == nil {
 			log.Printf("[Retriever] graph 模式不可用（无图谱检索器），降级为 auto")
 			tracing.Emit(ctx, tracing.Event{Type: "retrieval", Stage: "graph_recall", Summary: "graph retriever unavailable", Metadata: map[string]any{"source": "graph", "available": false, "fallback": "auto"}})
-			return r.Retrieve(ctx, query)
+			return r.retrieveAuto(ctx, query)
 		}
 		started := time.Now()
 		docs, err := r.graphRetriever.Retrieve(ctx, query)
 		tracing.Emit(ctx, graphRetrievalEvent(query, docs, started, err))
 		return docs, err
 
-	default: // "auto" 或其他
-		return r.Retrieve(ctx, query)
+	default:
+		return r.retrieveAuto(ctx, query)
 	}
 }

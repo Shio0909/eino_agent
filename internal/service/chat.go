@@ -31,6 +31,7 @@ import (
 	"eino_agent/internal/metrics"
 	"eino_agent/internal/pipeline"
 	promptmgr "eino_agent/internal/prompt"
+	"eino_agent/internal/retrieval"
 	internalTool "eino_agent/internal/tool"
 )
 
@@ -486,14 +487,10 @@ func agenticProjectContextRecoveryQueries(original string) []projectContextRecov
 }
 
 func retrieveForRecoveryMode(ctx context.Context, runtimeRetriever retriever.Retriever, query, mode string) ([]*schema.Document, error) {
-	if mode != "" && mode != "auto" {
-		if mr, ok := runtimeRetriever.(interface {
-			RetrieveWithMode(context.Context, string, string) ([]*schema.Document, error)
-		}); ok {
-			return mr.RetrieveWithMode(ctx, query, mode)
-		}
+	if mode == "" || mode == retrieval.ModeAuto {
+		return runtimeRetriever.Retrieve(ctx, query)
 	}
-	return runtimeRetriever.Retrieve(ctx, query)
+	return runtimeRetriever.Retrieve(ctx, query, retrieval.WithMode(mode))
 }
 
 func summarizeRecoveredProjectContext(sources []Source) string {

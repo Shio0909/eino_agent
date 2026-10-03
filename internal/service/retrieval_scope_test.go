@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"eino_agent/internal/config"
+	"eino_agent/internal/retrieval"
 
 	"github.com/cloudwego/eino/components/retriever"
 	"github.com/cloudwego/eino/schema"
@@ -94,13 +95,11 @@ type modeFakeRetriever struct {
 	modes      []string
 }
 
-func (r *modeFakeRetriever) Retrieve(_ context.Context, query string, _ ...retriever.Option) ([]*schema.Document, error) {
-	r.queries = append(r.queries, query)
-	r.modes = append(r.modes, "auto")
-	return r.docsByMode["auto"], nil
-}
-
-func (r *modeFakeRetriever) RetrieveWithMode(_ context.Context, query string, mode string) ([]*schema.Document, error) {
+func (r *modeFakeRetriever) Retrieve(_ context.Context, query string, opts ...retriever.Option) ([]*schema.Document, error) {
+	mode := retrieval.ModeFromOptions(opts...)
+	if mode == "" {
+		mode = retrieval.ModeAuto
+	}
 	r.queries = append(r.queries, query)
 	r.modes = append(r.modes, mode)
 	return r.docsByMode[mode], nil
