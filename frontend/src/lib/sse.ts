@@ -20,7 +20,12 @@ export async function* parseSse(body: ReadableStream<Uint8Array>): AsyncGenerato
     for (;;) {
       const { value, done } = await reader.read()
       buffer += decoder.decode(value, { stream: !done })
+      // A CR at the very end may be the first half of a CRLF pair, so it is
+      // normalized only once the next chunk shows what follows it.
+      const held = !done && buffer.endsWith('\r')
+      if (held) buffer = buffer.slice(0, -1)
       buffer = buffer.replace(/\r\n?/g, '\n')
+      if (held) buffer += '\r'
 
       let end: number
       while ((end = buffer.indexOf('\n\n')) >= 0) {

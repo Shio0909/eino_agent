@@ -6,6 +6,7 @@ import { PageSpinner } from '@/components/ui/Spinner'
 import { Toaster } from '@/components/ui/Toaster'
 
 const LoginPage = lazy(() => import('@/pages/LoginPage'))
+const ChatPage = lazy(() => import('@/pages/chat/ChatPage'))
 const ComingSoon = lazy(() => import('@/pages/ComingSoon'))
 
 export default function App() {
@@ -17,7 +18,7 @@ export default function App() {
           <Route element={<RequireAuth />}>
             <Route element={<AppLayout />}>
               <Route index element={<Navigate to="/chat" replace />} />
-              <Route path="/chat/*" element={<ComingSoon title="对话" />} />
+              <Route path="/chat/:sessionId?" element={<ChatPage />} />
               <Route path="/knowledge/*" element={<ComingSoon title="知识库" />} />
               <Route path="/code" element={<ComingSoon title="代码仓库" />} />
               <Route path="/eval" element={<ComingSoon title="评测报告" />} />
