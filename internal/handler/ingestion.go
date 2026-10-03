@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -129,7 +130,12 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 		return
 	}
 
-	chunkCount, err := h.indexChunks(c.Request.Context(), kbID, knowledge.ID, header.Filename, chunks, docHash)
+	chunkCount, err := h.indexChunks(c.Request.Context(), kbID, knowledge.ID, header.Filename, chunks, docHash, syncOptions{ExpectStoredHash: docHash})
+	if errors.Is(err, errSuperseded) {
+		h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error(), "filename": header.Filename, "knowledge_id": knowledge.ID})
+		respondError(c, http.StatusConflict, err.Error())
+		return
+	}
 	if err != nil {
 		log.Printf("[Upload] 向量化失败（文档已解析 %d 块）: %v", chunkCount, err)
 		h.markKnowledgeImportFailed(c.Request.Context(), knowledge.ID, err)
@@ -241,7 +247,7 @@ func (h *Handler) UploadDocumentURL(c *gin.Context) {
 		return
 	}
 
-	chunkCount, err := h.indexChunks(c.Request.Context(), kbID, knowledge.ID, title, chunks, pageHash)
+	chunkCount, err := h.indexChunks(c.Request.Context(), kbID, knowledge.ID, title, chunks, pageHash, syncOptions{})
 	if err != nil {
 		log.Printf("[UploadURL] 向量化失败（URL 已解析 %d 块）: %v", chunkCount, err)
 		h.markKnowledgeImportFailed(c.Request.Context(), knowledge.ID, err)
@@ -501,6 +507,7 @@ func (h *Handler) enqueueFileImport(ctx context.Context, kbID, filename string, 
 		FileName:        filename,
 		FileType:        inferFileType(filename),
 		ReplaceExisting: replaced,
+		SourceHash:      contentHash,
 	}
 	if err := h.importQueue.Enqueue(ctx, task); err != nil {
 		_ = os.Remove(tempPath)
@@ -658,11 +665,11 @@ func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeI
 	if err != nil {
 		return 0, fmt.Errorf("文档分块失败: %w", err)
 	}
-	return h.indexChunks(ctx, kbID, knowledgeID, filename, chunks, contentHash(string(content)))
+	return h.indexChunks(ctx, kbID, knowledgeID, filename, chunks, contentHash(string(content)), syncOptions{})
 }
 
 func (h *Handler) storeParsedChunks(ctx context.Context, kbID, knowledgeID, sourceFilename string, chunks []docreader.ParsedChunk) (int, error) {
-	return h.indexChunks(ctx, kbID, knowledgeID, sourceFilename, parsedToIndexChunks(chunks), "")
+	return h.indexChunks(ctx, kbID, knowledgeID, sourceFilename, parsedToIndexChunks(chunks), "", syncOptions{})
 }
 
 // ProcessImportTask 处理异步导入任务。
@@ -674,7 +681,7 @@ func (h *Handler) ProcessImportTask(ctx context.Context, task importqueue.Task) 
 	start := time.Now()
 	log.Printf("[ImportWorker] 开始处理: %s (type=%s, id=%s)", task.FileName, task.SourceType, task.KnowledgeID)
 
-	if err := h.knowledgeRepo.UpdateParseStatus(ctx, task.KnowledgeID, "processing", "", 0); err != nil {
+	if err := h.knowledgeRepo.UpdateParseStatus(ctx, task.KnowledgeID, "processing", "", h.storedChunkCount(ctx, task.KnowledgeID)); err != nil {
 		return err
 	}
 	h.writeImportTaskState(ctx, task.KnowledgeID, func(state *cachepkg.ImportTaskState) {
@@ -702,6 +709,15 @@ func (h *Handler) ProcessImportTask(ctx context.Context, task importqueue.Task) 
 	}
 
 	elapsed := time.Since(start)
+	if errors.Is(err, errSuperseded) {
+		// A newer upload owns the document now and has its own task, so this
+		// one ends quietly: no failed status, no retry, and its file is dropped.
+		log.Printf("[ImportWorker] 已被新的上传取代，放弃: %s (id=%s)", task.FileName, task.KnowledgeID)
+		if task.SourceType == "file" && task.FilePath != "" {
+			_ = os.Remove(task.FilePath)
+		}
+		return nil
+	}
 	finalAttempt := err == nil || importqueue.IsPermanent(err) || task.Attempt >= importqueue.MaxAttempts
 	// 可重试的失败保留临时文件，供下一次投递使用。
 	if finalAttempt && task.SourceType == "file" && task.FilePath != "" {
@@ -734,7 +750,7 @@ func (h *Handler) processQueuedFileImport(ctx context.Context, task importqueue.
 	if err != nil {
 		return 0, err
 	}
-	return h.indexChunks(ctx, task.KnowledgeBaseID, task.KnowledgeID, task.FileName, chunks, contentHashBytes(content))
+	return h.indexChunks(ctx, task.KnowledgeBaseID, task.KnowledgeID, task.FileName, chunks, contentHashBytes(content), syncOptions{ExpectStoredHash: task.SourceHash})
 }
 
 func (h *Handler) processQueuedURLImport(ctx context.Context, task importqueue.Task) (int, error) {
@@ -742,7 +758,7 @@ func (h *Handler) processQueuedURLImport(ctx context.Context, task importqueue.T
 	if err != nil {
 		return 0, err
 	}
-	return h.indexChunks(ctx, task.KnowledgeBaseID, task.KnowledgeID, task.Title, chunks, pageHash)
+	return h.indexChunks(ctx, task.KnowledgeBaseID, task.KnowledgeID, task.Title, chunks, pageHash, syncOptions{})
 }
 
 func enrichmentStatusForConfig(cfg *config.Config) string {
@@ -771,10 +787,18 @@ func (h *Handler) scheduleContextualEnrichment(knowledgeID, kbID string) {
 	if h.cfg == nil || !h.cfg.RAG.EnableContextualEnrichment || h.chunkRepo == nil || h.vectorDB == nil || h.currentEmbedder() == nil {
 		return
 	}
-	go h.processContextualEnrichment(context.Background(), knowledgeID, kbID)
+	added, known := h.takeAddedChunks(knowledgeID)
+	if known && len(added) == 0 {
+		return
+	}
+	go h.processContextualEnrichment(context.Background(), knowledgeID, kbID, added)
 }
 
-func (h *Handler) processContextualEnrichment(ctx context.Context, knowledgeID, kbID string) {
+// processContextualEnrichment adds a context sentence to chunks and embeds
+// them again. addedIDs limits it to the chunks an update wrote from new text:
+// the others already carry the vectors they were given. A nil addedIDs means
+// every chunk of the document.
+func (h *Handler) processContextualEnrichment(ctx context.Context, knowledgeID, kbID string, addedIDs []string) {
 	h.writeImportTaskState(ctx, knowledgeID, func(state *cachepkg.ImportTaskState) {
 		state.EnrichmentStatus = "processing"
 		state.EnrichmentError = ""
@@ -796,10 +820,24 @@ func (h *Handler) processContextualEnrichment(ctx context.Context, knowledgeID, 
 		return
 	}
 
-	docs := make([]*container.Document, len(chunks))
+	var wanted map[string]struct{}
+	if addedIDs != nil {
+		wanted = make(map[string]struct{}, len(addedIDs))
+		for _, id := range addedIDs {
+			wanted[id] = struct{}{}
+		}
+	}
+	sourceName := h.knowledgeSourceName(ctx, knowledgeID)
+
+	docs := make([]*container.Document, 0, len(chunks))
 	contents := make([]string, 0, len(chunks))
-	for i, chunk := range chunks {
+	for _, chunk := range chunks {
 		contents = append(contents, strings.TrimSpace(chunk.Content))
+		if wanted != nil {
+			if _, ok := wanted[chunk.ID]; !ok {
+				continue
+			}
+		}
 		metadata := map[string]interface{}{}
 		for key, value := range chunk.Metadata {
 			metadata[key] = value
@@ -808,8 +846,17 @@ func (h *Handler) processContextualEnrichment(ctx context.Context, knowledgeID, 
 		metadata["knowledge_id"] = knowledgeID
 		metadata["chunk_id"] = chunk.ID
 		metadata["chunk_index"] = chunk.ChunkIndex
+		metadata["start_pos"] = chunk.StartPos
+		metadata["end_pos"] = chunk.EndPos
 		metadata["source_content"] = chunk.Content
-		docs[i] = &container.Document{ID: chunk.ID, Content: chunk.Content, Metadata: metadata}
+		if sourceName != "" {
+			metadata["source_filename"] = sourceName
+		}
+		docs = append(docs, &container.Document{ID: chunk.ID, Content: chunk.Content, Metadata: metadata})
+	}
+	if len(docs) == 0 {
+		h.markContextualEnrichmentCompleted(ctx, knowledgeID, 0)
+		return
 	}
 	docContent := strings.Join(contents, "\n\n")
 	enrichedDocs := h.enrichChunks(ctx, docContent, docs)
@@ -826,7 +873,9 @@ func (h *Handler) processContextualEnrichment(ctx context.Context, knowledgeID, 
 	for i, doc := range enrichedDocs {
 		doc.Vector = vectors[i]
 	}
-	if err := h.vectorDB.Upsert(ctx, enrichedDocs); err != nil {
+
+	written, err := h.writeEnrichedVectors(ctx, knowledgeID, enrichedDocs)
+	if err != nil {
 		h.markContextualEnrichmentFailed(ctx, knowledgeID, fmt.Errorf("增强向量写入失败: %w", err))
 		return
 	}
@@ -835,7 +884,58 @@ func (h *Handler) processContextualEnrichment(ctx context.Context, knowledgeID, 
 			log.Printf("[Cache] 文档富化后失效检索缓存失败: kb=%s knowledge=%s err=%v", kbID, knowledgeID, err)
 		}
 	}
-	h.markContextualEnrichmentCompleted(ctx, knowledgeID, len(enrichedDocs))
+	h.markContextualEnrichmentCompleted(ctx, knowledgeID, written)
+}
+
+// writeEnrichedVectors stores enriched vectors for the chunks that are still in
+// the document. Enrichment works from a snapshot and takes a while, so an update
+// may have removed a chunk or moved it since; the check and the write happen
+// under the document lock so no update can slip in between them.
+func (h *Handler) writeEnrichedVectors(ctx context.Context, knowledgeID string, docs []*container.Document) (int, error) {
+	unlock, err := h.lockDocument(ctx, knowledgeID)
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
+
+	current, err := h.chunkRepo.GetByKnowledgeID(ctx, knowledgeID)
+	if err != nil {
+		return 0, err
+	}
+	rows := make(map[string]*repository.Chunk, len(current))
+	for _, row := range current {
+		rows[row.ID] = row
+	}
+	live := make([]*container.Document, 0, len(docs))
+	for _, doc := range docs {
+		row, ok := rows[doc.ID]
+		if !ok {
+			continue
+		}
+		doc.Metadata["chunk_index"] = row.ChunkIndex
+		live = append(live, doc)
+	}
+	if len(live) == 0 {
+		return 0, nil
+	}
+	if err := h.vectorDB.Upsert(ctx, live); err != nil {
+		return 0, err
+	}
+	return len(live), nil
+}
+
+func (h *Handler) knowledgeSourceName(ctx context.Context, knowledgeID string) string {
+	if h.knowledgeRepo == nil {
+		return ""
+	}
+	k, err := h.knowledgeRepo.GetByID(ctx, knowledgeID)
+	if err != nil || k == nil {
+		return ""
+	}
+	if k.FileName != "" {
+		return k.FileName
+	}
+	return k.Name
 }
 
 func (h *Handler) markContextualEnrichmentCompleted(ctx context.Context, knowledgeID string, chunkCount int) {
@@ -877,7 +977,7 @@ func (h *Handler) processAndStoreChunks(ctx context.Context, kbID, knowledgeID, 
 // indexChunks puts parsed chunks into the index and returns how many the
 // document has afterwards. It is the single entry point for first imports and
 // for updates alike.
-func (h *Handler) indexChunks(ctx context.Context, kbID, knowledgeID, filename string, chunks []indexChunk, docHash string) (int, error) {
+func (h *Handler) indexChunks(ctx context.Context, kbID, knowledgeID, filename string, chunks []indexChunk, docHash string, opts syncOptions) (int, error) {
 	h.writeImportTaskState(ctx, knowledgeID, func(state *cachepkg.ImportTaskState) {
 		state.Status = "processing"
 		state.Stage = "vectorizing"
@@ -885,7 +985,7 @@ func (h *Handler) indexChunks(ctx context.Context, kbID, knowledgeID, filename s
 		state.Error = ""
 	})
 
-	result, err := h.applySync(ctx, kbID, knowledgeID, filename, chunks, docHash, syncOptions{})
+	result, err := h.applySync(ctx, kbID, knowledgeID, filename, chunks, docHash, opts)
 	if err != nil {
 		return len(chunks), err
 	}

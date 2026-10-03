@@ -50,6 +50,10 @@ type syncOptions struct {
 	// Force re-embeds every chunk even when its text is unchanged, for when the
 	// stored vectors themselves are what needs replacing (a new embedding model).
 	Force bool
+	// ExpectStoredHash, when set, is the content hash this update was started
+	// for. If the document's stored hash is different by the time the update gets
+	// its turn, a newer upload has replaced the source and this update stands down.
+	ExpectStoredHash string
 }
 
 type indexedChunk struct {
@@ -67,7 +71,12 @@ type syncResult struct {
 	Chunks []indexedChunk
 }
 
-var errNothingToIndex = errors.New("解析后没有可索引的内容")
+var (
+	errNothingToIndex = errors.New("解析后没有可索引的内容")
+	// errSuperseded means a newer upload replaced the source while this update
+	// waited. It is not a failure: the newer upload's own update owns the document.
+	errSuperseded = errors.New("文档已被更新的上传取代，本次更新已放弃")
+)
 
 // stableChunkID names a chunk by what it says and which copy of that text it
 // is, not by where it sits. A sync that is retried after a failure therefore

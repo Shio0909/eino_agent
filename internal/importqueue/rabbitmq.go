@@ -26,6 +26,10 @@ type Task struct {
 	SourceURL        string `json:"source_url,omitempty"`
 	EnableMultimodal bool   `json:"enable_multimodal,omitempty"`
 	ReplaceExisting  bool   `json:"replace_existing,omitempty"`
+	// SourceHash is the hash of the uploaded file this task was created for. If
+	// the document's stored hash has moved on when the task runs, a newer upload
+	// has replaced it and this task stands down.
+	SourceHash string `json:"source_hash,omitempty"`
 	// Attempt 从 1 开始，重试时递增。
 	Attempt int `json:"attempt,omitempty"`
 }

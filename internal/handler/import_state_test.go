@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 )
 
 type memoryImportStateStore struct {
+	mu     sync.Mutex
 	states map[string]*cachepkg.ImportTaskState
 }
 
@@ -30,6 +32,8 @@ func newMemoryImportStateStore() *memoryImportStateStore {
 }
 
 func (s *memoryImportStateStore) GetTaskState(_ context.Context, taskID string) (*cachepkg.ImportTaskState, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	state, ok := s.states[taskID]
 	if !ok {
 		return nil, false, nil
@@ -39,12 +43,16 @@ func (s *memoryImportStateStore) GetTaskState(_ context.Context, taskID string) 
 }
 
 func (s *memoryImportStateStore) SetTaskState(_ context.Context, taskID string, state *cachepkg.ImportTaskState, _ time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	clone := *state
 	s.states[taskID] = &clone
 	return nil
 }
 
 func (s *memoryImportStateStore) DeleteTaskState(_ context.Context, taskID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	delete(s.states, taskID)
 	return nil
 }
@@ -81,6 +89,7 @@ func (r *fakeKnowledgeBaseRepo) UpdateEmbedFingerprint(context.Context, string, 
 }
 
 type fakeKnowledgeRepo struct {
+	mu            sync.Mutex
 	items         map[string]*repository.Knowledge
 	updatedStatus map[string]string
 	updatedChunks map[string]int
@@ -98,6 +107,8 @@ func newFakeKnowledgeRepo(items map[string]*repository.Knowledge) *fakeKnowledge
 }
 
 func (r *fakeKnowledgeRepo) Create(_ context.Context, k *repository.Knowledge) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.items == nil {
 		r.items = make(map[string]*repository.Knowledge)
 	}
@@ -111,10 +122,22 @@ func (r *fakeKnowledgeRepo) Create(_ context.Context, k *repository.Knowledge) e
 	r.items[k.ID] = k
 	return nil
 }
+
+// GetByID returns a copy, like a database read would, so a caller holding the
+// result is not affected by updates that happen afterwards.
 func (r *fakeKnowledgeRepo) GetByID(_ context.Context, id string) (*repository.Knowledge, error) {
-	return r.items[id], nil
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	item := r.items[id]
+	if item == nil {
+		return nil, nil
+	}
+	cp := *item
+	return &cp, nil
 }
 func (r *fakeKnowledgeRepo) ListByKnowledgeBase(_ context.Context, kbID string, _, _ int) ([]*repository.Knowledge, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	result := make([]*repository.Knowledge, 0)
 	for _, item := range r.items {
 		if item != nil && item.KnowledgeBaseID == kbID {
@@ -124,6 +147,8 @@ func (r *fakeKnowledgeRepo) ListByKnowledgeBase(_ context.Context, kbID string, 
 	return result, nil
 }
 func (r *fakeKnowledgeRepo) UpdateParseStatus(_ context.Context, id, status, errorMsg string, chunkCount int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.updatedStatus[id] = status
 	r.updatedChunks[id] = chunkCount
 	r.updatedErrors[id] = errorMsg
@@ -140,8 +165,17 @@ func (r *fakeKnowledgeRepo) UpdateParseStatus(_ context.Context, id, status, err
 }
 func (r *fakeKnowledgeRepo) Delete(context.Context, string) error                      { return nil }
 func (r *fakeKnowledgeRepo) CountByKnowledgeBase(context.Context, string) (int, error) { return 0, nil }
-func (r *fakeKnowledgeRepo) UpdateContentHash(context.Context, string, string) error   { return nil }
+func (r *fakeKnowledgeRepo) UpdateContentHash(_ context.Context, id, hash string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if item := r.items[id]; item != nil {
+		item.ContentHash = hash
+	}
+	return nil
+}
 func (r *fakeKnowledgeRepo) UpdateEnrichmentStatus(_ context.Context, id, status, errorMsg string, enrichedChunkCount int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if item := r.items[id]; item != nil {
 		item.EnrichmentStatus = status
 		item.EnrichedChunkCount = enrichedChunkCount
@@ -153,21 +187,38 @@ func (r *fakeKnowledgeRepo) UpdateEnrichmentStatus(_ context.Context, id, status
 	}
 	return nil
 }
-func (r *fakeKnowledgeRepo) FindByFileName(context.Context, string, string) (*repository.Knowledge, error) {
+func (r *fakeKnowledgeRepo) FindByFileName(_ context.Context, kbID, fileName string) (*repository.Knowledge, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, item := range r.items {
+		if item != nil && item.KnowledgeBaseID == kbID && item.SourceType == "file" && item.FileName == fileName {
+			cp := *item
+			return &cp, nil
+		}
+	}
 	return nil, nil
 }
 func (r *fakeKnowledgeRepo) FindBySourceURL(context.Context, string, string) (*repository.Knowledge, error) {
 	return nil, nil
 }
 func (r *fakeKnowledgeRepo) FindByContentHash(_ context.Context, kbID, sourceType, hash string) (*repository.Knowledge, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for _, item := range r.items {
 		if item != nil && item.KnowledgeBaseID == kbID && item.SourceType == sourceType && item.ContentHash == hash {
-			return item, nil
+			cp := *item
+			return &cp, nil
 		}
 	}
 	return nil, nil
 }
-func (r *fakeKnowledgeRepo) PrepareForReplacement(context.Context, string, *repository.Knowledge) error {
+func (r *fakeKnowledgeRepo) PrepareForReplacement(_ context.Context, id string, k *repository.Knowledge) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if item := r.items[id]; item != nil {
+		item.Name, item.FileName, item.FileType, item.FileSize = k.Name, k.FileName, k.FileType, k.FileSize
+		item.ParseStatus, item.ParseError, item.ContentHash = k.ParseStatus, nil, k.ContentHash
+	}
 	return nil
 }
 

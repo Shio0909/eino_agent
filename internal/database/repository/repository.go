@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -269,6 +270,14 @@ type KnowledgeRepository interface {
 	Delete(ctx context.Context, id string) error
 }
 
+// DocumentLocker is implemented by repositories that can serialize work on one
+// document across processes (an API server and its import workers).
+type DocumentLocker interface {
+	// LockDocument blocks until it holds the document's lock and returns the
+	// function that releases it.
+	LockDocument(ctx context.Context, id string) (unlock func(), err error)
+}
+
 // ChunkRepository 文本块仓储接口
 type ChunkRepository interface {
 	BatchCreate(ctx context.Context, chunks []*Chunk) error
@@ -498,6 +507,9 @@ func (r *pgKnowledgeBaseRepo) UpdateEmbedFingerprint(ctx context.Context, id, fi
 // pgKnowledgeRepo PostgreSQL 知识文档仓储实现
 type pgKnowledgeRepo struct {
 	db *postgres.DB
+
+	lockSlotsOnce sync.Once
+	lockSlots     chan struct{}
 }
 
 // NewKnowledgeRepository 创建知识文档仓储
@@ -648,6 +660,54 @@ func (r *pgKnowledgeRepo) UpdateContentHash(ctx context.Context, id, hash string
 		UPDATE knowledges SET content_hash = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1
 	`, id, hash)
 	return err
+}
+
+// documentLockSlots caps how many document locks this process holds at once.
+// A held lock keeps a pooled connection for the whole update, so without a cap
+// enough simultaneous updates would take every connection and leave none for
+// the queries those updates need to finish.
+func (r *pgKnowledgeRepo) documentLockSlots() chan struct{} {
+	r.lockSlotsOnce.Do(func() {
+		n := int(r.db.Pool().Config().MaxConns) / 2
+		if n < 1 {
+			n = 1
+		}
+		r.lockSlots = make(chan struct{}, n)
+	})
+	return r.lockSlots
+}
+
+// LockDocument takes a session-level advisory lock on a connection of its own,
+// so the lock outlives any single query and is dropped if the process dies.
+func (r *pgKnowledgeRepo) LockDocument(ctx context.Context, id string) (func(), error) {
+	slots := r.documentLockSlots()
+	select {
+	case slots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	conn, err := r.db.Pool().Acquire(ctx)
+	if err != nil {
+		<-slots
+		return nil, err
+	}
+	key := "knowledge:" + id
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtextextended($1, 0))`, key); err != nil {
+		conn.Release()
+		<-slots
+		return nil, err
+	}
+	return func() {
+		defer func() { <-slots }()
+		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := conn.Exec(unlockCtx, `SELECT pg_advisory_unlock(hashtextextended($1, 0))`, key); err != nil {
+			// A connection that could not release its lock must not go back to
+			// the pool still holding it; closing the session drops the lock.
+			_ = conn.Conn().Close(unlockCtx)
+		}
+		conn.Release()
+	}, nil
 }
 
 func (r *pgKnowledgeRepo) PrepareForReplacement(ctx context.Context, id string, k *Knowledge) error {

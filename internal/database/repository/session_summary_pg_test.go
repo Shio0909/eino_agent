@@ -17,6 +17,12 @@ import (
 // keeping: a throwaway database on a development server is what this is for.
 func pgTestDB(t *testing.T) *postgres.DB {
 	t.Helper()
+	return pgTestDBWithPool(t, 0)
+}
+
+// pgTestDBWithPool is pgTestDB with a chosen pool size (0 keeps the default).
+func pgTestDBWithPool(t *testing.T, maxConns int32) *postgres.DB {
+	t.Helper()
 	raw := os.Getenv("EINO_TEST_PG_DSN")
 	if raw == "" {
 		t.Skip("EINO_TEST_PG_DSN not set")
@@ -38,7 +44,7 @@ func pgTestDB(t *testing.T) *postgres.DB {
 	}
 	db, err := postgres.New(context.Background(), &postgres.Config{
 		Host: u.Hostname(), Port: port, User: u.User.Username(), Password: pw,
-		Database: u.Path[1:], SSLMode: sslmode,
+		Database: u.Path[1:], SSLMode: sslmode, MaxConns: maxConns,
 	})
 	if err != nil {
 		t.Fatalf("connect: %v", err)

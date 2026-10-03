@@ -69,6 +69,12 @@ type Handler struct {
 	sessionRepo      repository.SessionRepository
 	messageRepo      repository.MessageRepository
 	requestTraceRepo repository.RequestTraceRepository
+
+	// docLocks serializes index changes per document; addedChunks remembers
+	// what the last update wrote, for enrichment.
+	docLocks    keyedMutex
+	addedMu     sync.Mutex
+	addedChunks map[string][]string
 }
 
 func (h *Handler) currentEmbedder() einoembedding.Embedder {

@@ -609,19 +609,43 @@ func (h *Handler) SyncDocument(c *gin.Context) {
 }
 
 // applySync is the one way a document's chunks reach the index, for a first
-// import as much as for an update.
+// import as much as for an update. Updates of one document run one at a time.
 func (h *Handler) applySync(ctx context.Context, kbID, knowledgeID, filename string, chunks []indexChunk, docHash string, opts syncOptions) (*syncResult, error) {
+	unlock, err := h.lockDocument(ctx, knowledgeID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
+	if opts.ExpectStoredHash != "" && h.knowledgeRepo != nil {
+		current, err := h.knowledgeRepo.GetByID(ctx, knowledgeID)
+		if err != nil {
+			return nil, fmt.Errorf("读取文档记录失败: %w", err)
+		}
+		if current == nil {
+			return nil, fmt.Errorf("文档 %s 已不存在", knowledgeID)
+		}
+		if current.ContentHash != "" && current.ContentHash != opts.ExpectStoredHash {
+			return nil, errSuperseded
+		}
+	}
+
 	h.markKnowledgeProcessing(ctx, knowledgeID)
 	result, err := h.syncChunks(ctx, kbID, knowledgeID, filename, chunks, opts)
 	if err != nil {
 		return nil, err
 	}
-	if h.knowledgeRepo != nil && docHash != "" {
+	// For an upload the stored hash is what identifies the source and was set
+	// when the upload was accepted; writing it again here could undo a newer upload.
+	if h.knowledgeRepo != nil && docHash != "" && opts.ExpectStoredHash == "" {
 		if err := h.knowledgeRepo.UpdateContentHash(ctx, knowledgeID, docHash); err != nil {
 			log.Printf("[Sync] 更新文档 content_hash 失败: knowledge=%s err=%v", knowledgeID, err)
 		}
 	}
-	h.markContextualEnrichmentPending(ctx, knowledgeID)
+	if len(result.AddedIDs) > 0 {
+		h.markContextualEnrichmentPending(ctx, knowledgeID)
+	}
+	h.rememberAddedChunks(knowledgeID, result.AddedIDs)
 	return result, nil
 }
 

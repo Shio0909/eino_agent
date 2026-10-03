@@ -127,6 +127,8 @@ type statefulVectorDB struct {
 	mu     sync.Mutex
 	docs   map[string]*container.Document
 	failFn map[string]error
+	// onUpsert, when set, runs before each Upsert is applied, outside the lock.
+	onUpsert func(docs []*container.Document)
 }
 
 func newStatefulVectorDB() *statefulVectorDB {
@@ -142,6 +144,9 @@ func (v *statefulVectorDB) take(name string) error {
 }
 
 func (v *statefulVectorDB) Upsert(_ context.Context, docs []*container.Document) error {
+	if v.onUpsert != nil {
+		v.onUpsert(docs)
+	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if err := v.take("Upsert"); err != nil {
@@ -211,12 +216,16 @@ func (v *statefulVectorDB) forKnowledge(knowledgeID string) map[string]*containe
 }
 
 type countingEmbedder struct {
-	mu    sync.Mutex
-	texts int
-	fail  error
+	mu      sync.Mutex
+	texts   int
+	fail    error
+	onEmbed func() // called before each request, outside the lock
 }
 
 func (e *countingEmbedder) EmbedStrings(_ context.Context, texts []string, _ ...einoembedding.Option) ([][]float64, error) {
+	if e.onEmbed != nil {
+		e.onEmbed()
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.fail != nil {
@@ -230,6 +239,12 @@ func (e *countingEmbedder) EmbedStrings(_ context.Context, texts []string, _ ...
 		out[i] = []float64{float64(hs.Sum32()%97) + 1, 1, 0}
 	}
 	return out, nil
+}
+
+func (e *countingEmbedder) count() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.texts
 }
 
 func (e *countingEmbedder) reset() {
