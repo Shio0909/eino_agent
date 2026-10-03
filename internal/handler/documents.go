@@ -269,6 +269,8 @@ func (h *Handler) GetDocumentChunks(c *gin.Context) {
 			"char_count":  ch.ContentLength,
 			"token_count": 0, // 暂未存储 token 数
 			"content":     ch.Content,
+			// 编辑器把它作为 expected_content_hash 回传，用于发现并发修改。
+			"content_hash": ch.ContentHash,
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"chunks": result, "total": len(result)})

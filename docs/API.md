@@ -669,13 +669,14 @@ KB role: viewer. `200`:
 ```json
 {
   "chunks": [
-    {"id": "...", "index": 0, "char_count": 512, "token_count": 0, "content": "..."}
+    {"id": "...", "index": 0, "char_count": 512, "token_count": 0, "content": "...", "content_hash": "..."}
   ],
   "total": 12
 }
 ```
 
-`token_count` is currently always `0`.
+`token_count` is currently always `0`. `content_hash` is the stored hash of `content`; send it back
+as `expected_content_hash` when editing the chunk (see `PATCH` below).
 
 ### `PATCH /api/v1/knowledge-bases/{id}/documents/{docId}/chunks/{chunkId}`
 
