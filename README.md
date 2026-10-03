@@ -146,7 +146,7 @@ eino_agent/
 ├── skills/                  # Eino Skill 定义文件
 ├── scripts/                 # 评估与运维脚本
 ├── migrations/              # 数据库迁移（包含 request_traces 链路观测表）
-├── frontend-react/          # React 前端
+├── frontend/                # React 前端（Vite + Tailwind）
 └── docker/                  # Docker 构建文件
 ```
 

@@ -32,7 +32,7 @@ services:
   # ===========================================
   frontend:
     build:
-      context: ./frontend-react
+      context: ./frontend
     container_name: eino-rag-frontend
     ports:
       - "${FRONTEND_PORT:-80}:80"

@@ -132,7 +132,7 @@
 ## 验证结果
 - `go test ./internal/handler`
 - `go test ./...`
-- `npm --prefix frontend-react run build`
+- `npm --prefix frontend run build`
 - `go run ./cmd/server -migrate`
 - 新代码临时服务端口 `19095` 真实上传 `.tmp/mysql-performance.pdf`
 

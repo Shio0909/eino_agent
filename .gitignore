@@ -20,7 +20,7 @@ node_modules/
 *.exe
 *.exe~
 dist/
-frontend-react/dist/
+frontend/dist/
 eino-rag
 
 # 数据目录

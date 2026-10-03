@@ -155,12 +155,12 @@ test-core:
 	go test ./internal/config ./internal/filter ./internal/security ./internal/wiki ./internal/handler ./internal/service ./internal/pipeline ./internal/mcp
 
 frontend-build:
-	npm --prefix frontend-react run build
+	npm --prefix frontend run build
 
 check-demo:
 	go test ./internal/config ./internal/wiki ./internal/handler ./internal/service ./internal/pipeline ./internal/mcp
 	go build ./cmd/server
-	npm --prefix frontend-react run build
+	npm --prefix frontend run build
 
 # 代码检查
 lint:
