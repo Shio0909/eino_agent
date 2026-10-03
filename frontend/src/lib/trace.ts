@@ -85,7 +85,7 @@ function text(v: unknown): string {
 /** Display name of a retrieved passage: file name, then source, then title, then id. */
 export function sourceName(metadata: Record<string, unknown> | undefined, docId: string): string {
   const m = metadata ?? {}
-  return text(m.filename) || text(m.source) || text(m.title) || docId || '未命名来源'
+  return text(m.filename) || text(m.source_filename) || text(m.source) || text(m.title) || docId || '未命名来源'
 }
 
 export function sourceKey(docId: string, content: string): string {

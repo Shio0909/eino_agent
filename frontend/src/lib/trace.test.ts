@@ -51,6 +51,8 @@ describe('retrievalView', () => {
 describe('sourceName', () => {
   it('prefers a file name, then the source, then the title, then the id', () => {
     expect(sourceName({ filename: 'a.pdf', source: 's' }, 'id')).toBe('a.pdf')
+    expect(sourceName({ source_filename: 'b.md', source: 's' }, 'id')).toBe('b.md')
+    expect(sourceName({ filename: 'a.pdf', source_filename: 'b.md' }, 'id')).toBe('a.pdf')
     expect(sourceName({ source: 'notes.md' }, 'id')).toBe('notes.md')
     expect(sourceName({ title: 'T' }, 'id')).toBe('T')
     expect(sourceName({}, 'id')).toBe('id')
