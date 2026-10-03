@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -122,99 +121,35 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 		return
 	}
 
-	// 检查 docreader 是否可用
-	if h.docReaderCli != nil {
-		// 从文件名推导文件类型
-		fileType := ""
-		if dotIdx := strings.LastIndex(header.Filename, "."); dotIdx >= 0 {
-			fileType = strings.ToLower(header.Filename[dotIdx+1:])
-		}
-		// 使用 docreader 解析文件
-		result, err := h.docReaderCli.ParseReader(
-			c.Request.Context(),
-			bytes.NewReader(content),
-			header.Filename,
-			fileType,
-			docreader.DefaultParseOptions(),
-		)
-		if err != nil {
-			h.markKnowledgeImportFailed(c.Request.Context(), knowledge.ID, err)
-			h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error(), "filename": header.Filename})
-			respondError(c, http.StatusInternalServerError, "文档解析失败: "+err.Error())
-			return
-		}
-
-		// 向量化并存储
-		var chunkCount int
-		if replaced {
-			content := []byte(strings.Join(parsedChunkContents(result.Chunks), "\n\n"))
-			syncResult, syncErr := h.incrementalSync(c.Request.Context(), kbID, knowledge.ID, header.Filename, content, contentHash(string(content)))
-			if syncErr != nil {
-				chunkCount = 0
-				err = syncErr
-			} else {
-				chunkCount = syncResult.Added + syncResult.Retained
-			}
-		} else {
-			chunkCount, err = h.storeParsedChunks(c.Request.Context(), kbID, knowledge.ID, header.Filename, result.Chunks)
-		}
-		if err != nil {
-			log.Printf("[Upload] 向量化失败（文档已解析 %d 块）: %v", chunkCount, err)
-			h.markKnowledgeImportFailed(c.Request.Context(), knowledge.ID, err)
-			h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error(), "filename": header.Filename})
-			c.JSON(http.StatusOK, gin.H{
-				"message":      "文档已解析，但向量化失败（请在设置中配置有效的 API Key）",
-				"chunk_count":  chunkCount,
-				"status":       "failed",
-				"knowledge_id": knowledge.ID,
-				"error":        err.Error(),
-			})
-			return
-		}
-
-		h.markKnowledgeCompleted(c.Request.Context(), knowledge, chunkCount)
-		h.audit(c, "doc.upload", kbID, true, map[string]interface{}{"filename": header.Filename, "chunk_count": chunkCount})
-
-		c.JSON(http.StatusOK, gin.H{
-			"message":      uploadSuccessMessage(replaced, "文档"),
-			"chunk_count":  chunkCount,
-			"knowledge_id": knowledge.ID,
-			"replaced":     replaced,
-		})
-		return
-	}
-
-	// 回退到本地处理
-	if replaced {
-		syncResult, syncErr := h.incrementalSync(c.Request.Context(), kbID, knowledge.ID, header.Filename, content, docHash)
-		if syncErr != nil {
-			h.markKnowledgeImportFailed(c.Request.Context(), knowledge.ID, syncErr)
-			h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": syncErr.Error()})
-			respondError(c, http.StatusInternalServerError, "文档更新失败: "+syncErr.Error())
-			return
-		}
-		chunkCount := syncResult.Added + syncResult.Retained
-		h.markKnowledgeCompleted(c.Request.Context(), knowledge, chunkCount)
-		h.audit(c, "doc.upload", kbID, true, map[string]interface{}{"filename": header.Filename, "chunk_count": chunkCount, "replaced": true})
-		c.JSON(http.StatusOK, gin.H{
-			"message":      uploadSuccessMessage(true, "文档"),
-			"chunk_count":  chunkCount,
-			"knowledge_id": knowledge.ID,
-			"replaced":     true,
-		})
-		return
-	}
-
-	chunkCount, err := h.processPlainTextDocument(c.Request.Context(), kbID, knowledge.ID, header.Filename, content)
+	chunks, err := h.parseFileChunks(c.Request.Context(), content, header.Filename, inferFileType(header.Filename))
 	if err != nil {
 		h.markKnowledgeImportFailed(c.Request.Context(), knowledge.ID, err)
-		h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error()})
-		respondError(c, http.StatusInternalServerError, "文档处理失败: "+err.Error())
+		h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error(), "filename": header.Filename})
+		respondError(c, http.StatusInternalServerError, "文档解析失败: "+err.Error())
+		return
+	}
+
+	chunkCount, err := h.indexChunks(c.Request.Context(), kbID, knowledge.ID, header.Filename, chunks, docHash)
+	if err != nil {
+		log.Printf("[Upload] 向量化失败（文档已解析 %d 块）: %v", chunkCount, err)
+		h.markKnowledgeImportFailed(c.Request.Context(), knowledge.ID, err)
+		h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error(), "filename": header.Filename})
+		if h.docReaderCli == nil {
+			respondError(c, http.StatusInternalServerError, "文档处理失败: "+err.Error())
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"message":      "文档已解析，但向量化失败（请在设置中配置有效的 API Key）",
+			"chunk_count":  chunkCount,
+			"status":       "failed",
+			"knowledge_id": knowledge.ID,
+			"error":        err.Error(),
+		})
 		return
 	}
 
 	h.markKnowledgeCompleted(c.Request.Context(), knowledge, chunkCount)
-	h.audit(c, "doc.upload", kbID, true, map[string]interface{}{"filename": header.Filename, "chunk_count": chunkCount})
+	h.audit(c, "doc.upload", kbID, true, map[string]interface{}{"filename": header.Filename, "chunk_count": chunkCount, "replaced": replaced})
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":      uploadSuccessMessage(replaced, "文档"),
@@ -291,9 +226,6 @@ func (h *Handler) UploadDocumentURL(c *gin.Context) {
 		return
 	}
 
-	parseOpts := docreader.DefaultParseOptions()
-	parseOpts.EnableMultimodal = req.EnableMultimodal
-
 	knowledge, replaced, err := h.prepareKnowledgeForImport(c.Request.Context(), h.newURLKnowledge(kbID, title, parsedURL.String(), "processing"))
 	if err != nil {
 		h.audit(c, "doc.upload_url", kbID, false, map[string]interface{}{"error": err.Error(), "url": parsedURL.String()})
@@ -301,7 +233,7 @@ func (h *Handler) UploadDocumentURL(c *gin.Context) {
 		return
 	}
 
-	result, err := h.docReaderCli.ParseURL(c.Request.Context(), parsedURL.String(), title, parseOpts)
+	chunks, pageHash, err := h.parseURLChunks(c.Request.Context(), parsedURL.String(), title, req.EnableMultimodal)
 	if err != nil {
 		h.markKnowledgeImportFailed(c.Request.Context(), knowledge.ID, err)
 		h.audit(c, "doc.upload_url", kbID, false, map[string]interface{}{"error": err.Error(), "url": parsedURL.String()})
@@ -309,19 +241,7 @@ func (h *Handler) UploadDocumentURL(c *gin.Context) {
 		return
 	}
 
-	var chunkCount int
-	if replaced {
-		content := []byte(strings.Join(parsedChunkContents(result.Chunks), "\n\n"))
-		syncResult, syncErr := h.incrementalSync(c.Request.Context(), kbID, knowledge.ID, title, content, contentHash(string(content)))
-		if syncErr != nil {
-			chunkCount = 0
-			err = syncErr
-		} else {
-			chunkCount = syncResult.Added + syncResult.Retained
-		}
-	} else {
-		chunkCount, err = h.storeParsedChunks(c.Request.Context(), kbID, knowledge.ID, title, result.Chunks)
-	}
+	chunkCount, err := h.indexChunks(c.Request.Context(), kbID, knowledge.ID, title, chunks, pageHash)
 	if err != nil {
 		log.Printf("[UploadURL] 向量化失败（URL 已解析 %d 块）: %v", chunkCount, err)
 		h.markKnowledgeImportFailed(c.Request.Context(), knowledge.ID, err)
@@ -738,19 +658,11 @@ func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeI
 	if err != nil {
 		return 0, fmt.Errorf("文档分块失败: %w", err)
 	}
-	// 上下文富化由后台任务异步覆盖向量库内容，不阻塞基础索引。
-	result, err := h.applySync(ctx, kbID, knowledgeID, filename, chunks, contentHash(string(content)), syncOptions{})
-	if err != nil {
-		return len(chunks), err
-	}
-	return result.Added + result.Retained, nil
+	return h.indexChunks(ctx, kbID, knowledgeID, filename, chunks, contentHash(string(content)))
 }
 
 func (h *Handler) storeParsedChunks(ctx context.Context, kbID, knowledgeID, sourceFilename string, chunks []docreader.ParsedChunk) (int, error) {
-	if err := h.processAndStoreChunks(ctx, kbID, knowledgeID, sourceFilename, chunks); err != nil {
-		return len(chunks), err
-	}
-	return len(chunks), nil
+	return h.indexChunks(ctx, kbID, knowledgeID, sourceFilename, parsedToIndexChunks(chunks), "")
 }
 
 // ProcessImportTask 处理异步导入任务。
@@ -814,94 +726,23 @@ func (h *Handler) ProcessImportTask(ctx context.Context, task importqueue.Task) 
 }
 
 func (h *Handler) processQueuedFileImport(ctx context.Context, task importqueue.Task) (int, error) {
-	if task.ReplaceExisting {
-		content, err := os.ReadFile(task.FilePath)
-		if err != nil {
-			return 0, fmt.Errorf("read temp file: %w", err)
-		}
-		result, err := h.incrementalSync(ctx, task.KnowledgeBaseID, task.KnowledgeID, task.FileName, content, contentHash(string(content)))
-		if err != nil {
-			return 0, err
-		}
-		return result.Added + result.Retained, nil
-	}
-	if h.docReaderCli != nil {
-		file, err := os.Open(task.FilePath)
-		if err != nil {
-			return 0, fmt.Errorf("open temp file: %w", err)
-		}
-		defer file.Close()
-
-		result, err := h.docReaderCli.ParseReader(ctx, file, task.FileName, task.FileType, docreader.DefaultParseOptions())
-		if err != nil {
-			return 0, fmt.Errorf("文档解析失败: %w", err)
-		}
-		return h.storeParsedChunks(ctx, task.KnowledgeBaseID, task.KnowledgeID, task.FileName, result.Chunks)
-	}
-
 	content, err := os.ReadFile(task.FilePath)
 	if err != nil {
 		return 0, fmt.Errorf("read temp file: %w", err)
 	}
-	return h.processPlainTextDocument(ctx, task.KnowledgeBaseID, task.KnowledgeID, task.FileName, content)
+	chunks, err := h.parseFileChunks(ctx, content, task.FileName, task.FileType)
+	if err != nil {
+		return 0, err
+	}
+	return h.indexChunks(ctx, task.KnowledgeBaseID, task.KnowledgeID, task.FileName, chunks, contentHashBytes(content))
 }
 
 func (h *Handler) processQueuedURLImport(ctx context.Context, task importqueue.Task) (int, error) {
-	if task.ReplaceExisting {
-		content, err := h.fetchDocumentContent(ctx, &repository.Knowledge{
-			ID:              task.KnowledgeID,
-			KnowledgeBaseID: task.KnowledgeBaseID,
-			SourceType:      "url",
-			FileName:        task.Title,
-			FilePath:        &task.SourceURL,
-			Metadata: repository.JSON{
-				"source_url": task.SourceURL,
-			},
-		})
-		if err != nil {
-			return 0, err
-		}
-		result, err := h.incrementalSync(ctx, task.KnowledgeBaseID, task.KnowledgeID, task.Title, content, contentHash(string(content)))
-		if err != nil {
-			return 0, err
-		}
-		return result.Added + result.Retained, nil
-	}
-	if h.docReaderCli != nil {
-		parseOpts := docreader.DefaultParseOptions()
-		parseOpts.EnableMultimodal = task.EnableMultimodal
-
-		result, err := h.docReaderCli.ParseURL(ctx, task.SourceURL, task.Title, parseOpts)
-		if err != nil {
-			return 0, fmt.Errorf("网页解析失败: %w", err)
-		}
-		return h.storeParsedChunks(ctx, task.KnowledgeBaseID, task.KnowledgeID, task.Title, result.Chunks)
-	}
-
-	// docreader 不可用时，直接 HTTP 抓取并按纯文本处理
-	log.Printf("[ImportWorker] docreader 不可用，使用 HTTP 直接抓取: %s", task.SourceURL)
-	if _, err := security.ValidateExternalURL(task.SourceURL, h.cfg.Security.URLPolicy); err != nil {
-		return 0, importqueue.Permanent(fmt.Errorf("URL 安全检查失败: %w", err))
-	}
-	client := h.fetchHTTPClient()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, task.SourceURL, nil)
+	chunks, pageHash, err := h.parseURLChunks(ctx, task.SourceURL, task.Title, task.EnableMultimodal)
 	if err != nil {
-		return 0, fmt.Errorf("构建请求失败: %w", err)
+		return 0, err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; EinoAgent/1.0)")
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("HTTP 抓取失败: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("HTTP 抓取返回 %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
-	if err != nil {
-		return 0, fmt.Errorf("读取响应失败: %w", err)
-	}
-	return h.processPlainTextDocument(ctx, task.KnowledgeBaseID, task.KnowledgeID, task.FileName, body)
+	return h.indexChunks(ctx, task.KnowledgeBaseID, task.KnowledgeID, task.Title, chunks, pageHash)
 }
 
 func enrichmentStatusForConfig(cfg *config.Config) string {
@@ -1029,9 +870,14 @@ func (h *Handler) markContextualEnrichmentFailed(ctx context.Context, knowledgeI
 
 // processAndStoreChunks 处理并存储文档块
 func (h *Handler) processAndStoreChunks(ctx context.Context, kbID, knowledgeID, sourceFilename string, chunks []docreader.ParsedChunk) error {
-	if len(chunks) == 0 {
-		return nil
-	}
+	_, err := h.storeParsedChunks(ctx, kbID, knowledgeID, sourceFilename, chunks)
+	return err
+}
+
+// indexChunks puts parsed chunks into the index and returns how many the
+// document has afterwards. It is the single entry point for first imports and
+// for updates alike.
+func (h *Handler) indexChunks(ctx context.Context, kbID, knowledgeID, filename string, chunks []indexChunk, docHash string) (int, error) {
 	h.writeImportTaskState(ctx, knowledgeID, func(state *cachepkg.ImportTaskState) {
 		state.Status = "processing"
 		state.Stage = "vectorizing"
@@ -1039,9 +885,9 @@ func (h *Handler) processAndStoreChunks(ctx context.Context, kbID, knowledgeID, 
 		state.Error = ""
 	})
 
-	result, err := h.syncChunks(ctx, kbID, knowledgeID, sourceFilename, parsedToIndexChunks(chunks), syncOptions{})
+	result, err := h.applySync(ctx, kbID, knowledgeID, filename, chunks, docHash, syncOptions{})
 	if err != nil {
-		return err
+		return len(chunks), err
 	}
 
 	// 异步构建 GraphRAG 图谱
@@ -1060,9 +906,7 @@ func (h *Handler) processAndStoreChunks(ctx context.Context, kbID, knowledgeID, 
 			}
 		}()
 	}
-
-	h.markContextualEnrichmentPending(ctx, knowledgeID)
-	return nil
+	return len(result.Chunks), nil
 }
 
 func parsedToIndexChunks(chunks []docreader.ParsedChunk) []indexChunk {
@@ -1071,14 +915,4 @@ func parsedToIndexChunks(chunks []docreader.ParsedChunk) []indexChunk {
 		out[i] = indexChunk{Content: c.Content, Start: c.Start, End: c.End}
 	}
 	return out
-}
-
-func parsedChunkContents(chunks []docreader.ParsedChunk) []string {
-	contents := make([]string, 0, len(chunks))
-	for _, chunk := range chunks {
-		if strings.TrimSpace(chunk.Content) != "" {
-			contents = append(contents, chunk.Content)
-		}
-	}
-	return contents
 }

@@ -306,7 +306,11 @@ func (e *syncEnv) firstImport(t *testing.T, content string) {
 }
 
 func (e *syncEnv) sync(content string) (*syncResult, error) {
-	return e.h.incrementalSync(context.Background(), syncKB, syncDoc, syncName, []byte(content), contentHash(content))
+	chunks, err := e.h.chunkPlainText(context.Background(), syncDoc, syncName, []byte(content))
+	if err != nil {
+		return nil, err
+	}
+	return e.h.applySync(context.Background(), syncKB, syncDoc, syncName, chunks, contentHash(content), syncOptions{})
 }
 
 // assertIndex checks that what the document preview shows (Postgres chunks in

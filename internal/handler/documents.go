@@ -591,7 +591,7 @@ func (h *Handler) SyncDocument(c *gin.Context) {
 	// 后台执行增量同步
 	go func() {
 		bgCtx := context.Background()
-		result, syncErr := h.incrementalSync(bgCtx, kbID, docID, k.FileName, newContent, newDocHash)
+		result, syncErr := h.syncKnowledgeSource(bgCtx, k, newContent, newDocHash)
 		if syncErr != nil {
 			log.Printf("[Sync] 增量同步失败: doc=%s err=%v", docID, syncErr)
 			h.markKnowledgeImportFailed(bgCtx, docID, syncErr)
@@ -606,16 +606,6 @@ func (h *Handler) SyncDocument(c *gin.Context) {
 		"message": "增量同步已开始（后台处理）",
 		"doc_id":  docID,
 	})
-}
-
-// incrementalSync re-chunks plain text with the chunker the first import uses
-// and brings the document's index in line with it.
-func (h *Handler) incrementalSync(ctx context.Context, kbID, knowledgeID, filename string, content []byte, docHash string) (*syncResult, error) {
-	chunks, err := h.chunkPlainText(ctx, knowledgeID, filename, content)
-	if err != nil {
-		return nil, fmt.Errorf("分块失败: %w", err)
-	}
-	return h.applySync(ctx, kbID, knowledgeID, filename, chunks, docHash, syncOptions{})
 }
 
 // applySync is the one way a document's chunks reach the index, for a first
