@@ -22,10 +22,29 @@ import (
 // replacement a different way than the original is what makes an "unchanged"
 // document look completely rewritten, or turns a DOCX into archive noise.
 
+// parseOptions carries the configured chunking settings into the docreader, so
+// rag.chunk_size, rag.chunk_overlap and rag.chunk_strategy shape what gets
+// indexed no matter which engine reads the document.
+func (h *Handler) parseOptions() *docreader.ParseOptions {
+	opts := docreader.DefaultParseOptions()
+	if h == nil || h.cfg == nil {
+		return opts
+	}
+	rag := h.cfg.RAG
+	if rag.ChunkSize > 0 {
+		opts.ChunkSize = rag.ChunkSize
+		opts.ChunkOverlap = rag.ChunkOverlap
+	}
+	if rag.ChunkStrategy != "" {
+		opts.Strategy = rag.ChunkStrategy
+	}
+	return opts
+}
+
 // parseFileChunks turns an uploaded file into chunks.
 func (h *Handler) parseFileChunks(ctx context.Context, content []byte, fileName, fileType string) ([]indexChunk, error) {
 	if h.docReaderCli != nil {
-		result, err := h.docReaderCli.ParseBytes(ctx, content, fileName, fileType, docreader.DefaultParseOptions())
+		result, err := h.docReaderCli.ParseBytes(ctx, content, fileName, fileType, h.parseOptions())
 		if err != nil {
 			return nil, fmt.Errorf("文档解析失败: %w", err)
 		}
@@ -45,7 +64,7 @@ func (h *Handler) parseFileChunks(ctx context.Context, content []byte, fileName,
 // what was fetched, for telling an unchanged page from a changed one.
 func (h *Handler) parseURLChunks(ctx context.Context, sourceURL, title string, enableMultimodal bool) ([]indexChunk, string, error) {
 	if h.docReaderCli != nil {
-		opts := docreader.DefaultParseOptions()
+		opts := h.parseOptions()
 		opts.EnableMultimodal = enableMultimodal
 		result, err := h.docReaderCli.ParseURL(ctx, sourceURL, title, opts)
 		if err != nil {

@@ -208,7 +208,7 @@ type RAGConfig struct {
 	// 分块配置
 	ChunkSize                  int     `yaml:"chunk_size"`
 	ChunkOverlap               int     `yaml:"chunk_overlap"`
-	ChunkStrategy              string  `yaml:"chunk_strategy"`               // recursive, markdown, auto, semantic
+	ChunkStrategy              string  `yaml:"chunk_strategy"`               // auto(=adaptive), adaptive, recursive, markdown, semantic
 	SemanticSimilarityPct      float64 `yaml:"semantic_similarity_pct"`      // 语义分块百分位阈值 (0-1), 默认 0.25
 	EnableContextualEnrichment bool    `yaml:"enable_contextual_enrichment"` // 启用上下文富化（LLM生成chunk前缀）
 
@@ -518,6 +518,11 @@ func (cfg *Config) Validate() (warnings []string, err error) {
 		warnings = append(warnings, "release 模式未启用认证（auth.enabled=false），所有接口可匿名访问")
 	}
 
+	switch cfg.RAG.ChunkStrategy {
+	case "", "auto", "adaptive", "recursive", "markdown", "semantic":
+	default:
+		errs = append(errs, fmt.Sprintf("rag.chunk_strategy(%q) 无效，可选 auto/adaptive/recursive/markdown/semantic", cfg.RAG.ChunkStrategy))
+	}
 	if cfg.RAG.ChunkOverlap >= cfg.RAG.ChunkSize {
 		errs = append(errs, fmt.Sprintf("rag.chunk_overlap(%d) 必须小于 rag.chunk_size(%d)", cfg.RAG.ChunkOverlap, cfg.RAG.ChunkSize))
 	}

@@ -12,12 +12,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 
 	"github.com/ledongthuc/pdf"
-	"golang.org/x/net/html"
 
+	"eino_agent/internal/chunking"
 	"eino_agent/internal/config"
 	"eino_agent/internal/security"
 )
@@ -269,8 +270,13 @@ func (l *localEngine) parseDOCX(content []byte) (string, error) {
 		return "", fmt.Errorf("DOCX 缺少 word/document.xml")
 	}
 	tokens := xml.NewDecoder(bytes.NewReader(documentXML))
-	var lines []string
+	type docxLine struct {
+		text    string
+		heading bool
+	}
+	var lines []docxLine
 	var current strings.Builder
+	level := 0
 	for {
 		token, err := tokens.Token()
 		if err == io.EOF {
@@ -281,17 +287,32 @@ func (l *localEngine) parseDOCX(content []byte) (string, error) {
 		}
 		switch t := token.(type) {
 		case xml.StartElement:
-			if t.Name.Local == "tab" {
+			switch t.Name.Local {
+			case "tab":
 				current.WriteRune('\t')
+			case "pStyle":
+				if l := docxStyleLevel(docxAttr(t, "val")); l > 0 {
+					level = l
+				}
+			case "outlineLvl":
+				if v, convErr := strconv.Atoi(docxAttr(t, "val")); convErr == nil && v >= 0 && v <= 8 && level == 0 {
+					level = v + 1
+				}
 			}
 		case xml.EndElement:
 			switch t.Name.Local {
 			case "p", "tr":
 				line := normalizeWhitespace(current.String())
 				if line != "" {
-					lines = append(lines, line)
+					if level > 0 && t.Name.Local == "p" {
+						line = strings.Repeat("#", level) + " " + line
+					}
+					lines = append(lines, docxLine{text: line, heading: level > 0 && t.Name.Local == "p"})
 				}
 				current.Reset()
+				if t.Name.Local == "p" {
+					level = 0
+				}
 			case "tc":
 				if current.Len() > 0 && !strings.HasSuffix(current.String(), "\t") {
 					current.WriteRune('\t')
@@ -301,97 +322,93 @@ func (l *localEngine) parseDOCX(content []byte) (string, error) {
 			current.WriteString(string(t))
 		}
 	}
-	text := strings.Join(lines, "\n")
+	var joined strings.Builder
+	for i, l := range lines {
+		if i > 0 {
+			if l.heading || lines[i-1].heading {
+				joined.WriteString("\n\n")
+			} else {
+				joined.WriteString("\n")
+			}
+		}
+		joined.WriteString(l.text)
+	}
+	text := joined.String()
 	if strings.TrimSpace(text) == "" {
 		return "", fmt.Errorf("DOCX 未提取到可用文本")
 	}
 	return text, nil
 }
 
+func docxAttr(el xml.StartElement, name string) string {
+	for _, a := range el.Attr {
+		if a.Name.Local == name {
+			return a.Value
+		}
+	}
+	return ""
+}
+
+var docxHeadingStyle = regexp.MustCompile(`(?i)^(?:heading|标题)\s*([1-9])$`)
+
+// docxStyleLevel maps a paragraph style id to a Markdown heading level, or 0
+// for body text.
+func docxStyleLevel(style string) int {
+	style = strings.TrimSpace(style)
+	if strings.EqualFold(style, "title") {
+		return 1
+	}
+	if m := docxHeadingStyle.FindStringSubmatch(style); m != nil {
+		return int(m[1][0] - '0')
+	}
+	return 0
+}
+
 func chunkText(text string, opts *ParseOptions) *ParseResult {
-	text = strings.TrimSpace(text)
+	text = chunking.NormalizeLineEndings(strings.TrimSpace(text))
 	if text == "" {
 		return &ParseResult{}
 	}
-	chunkSize := opts.ChunkSize
-	if chunkSize <= 0 {
-		chunkSize = 500
+	if opts == nil {
+		opts = DefaultParseOptions()
 	}
-	overlap := opts.ChunkOverlap
-	if overlap < 0 {
-		overlap = 0
+	cfg := chunking.SplitterConfig{
+		ChunkSize:    opts.ChunkSize,
+		ChunkOverlap: opts.ChunkOverlap,
+		Separators:   chunking.TextSeparators,
+		Strategy:     splitterStrategy(opts.Strategy),
 	}
-	if overlap >= chunkSize {
-		overlap = chunkSize / 5
+	if cfg.ChunkSize <= 0 {
+		cfg.ChunkSize = DefaultParseOptions().ChunkSize
 	}
-	runes := []rune(text)
-	step := chunkSize - overlap
-	if step <= 0 {
-		step = chunkSize
+	if cfg.ChunkOverlap < 0 {
+		cfg.ChunkOverlap = 0
 	}
-	result := &ParseResult{Chunks: make([]ParsedChunk, 0, (len(runes)/step)+1)}
-	for start := 0; start < len(runes); start += step {
-		end := start + chunkSize
-		if end > len(runes) {
-			end = len(runes)
+
+	pieces := chunking.Split(text, cfg)
+	result := &ParseResult{Chunks: make([]ParsedChunk, 0, len(pieces))}
+	for _, piece := range pieces {
+		content := piece.EmbeddingContent()
+		if content == "" {
+			continue
 		}
-		chunk := strings.TrimSpace(string(runes[start:end]))
-		if chunk != "" {
-			result.Chunks = append(result.Chunks, ParsedChunk{
-				Content: chunk,
-				Seq:     len(result.Chunks),
-				Start:   start,
-				End:     end,
-			})
-		}
-		if end == len(runes) {
-			break
-		}
+		result.Chunks = append(result.Chunks, ParsedChunk{
+			Content: content,
+			Seq:     len(result.Chunks),
+			Start:   piece.Start,
+			End:     piece.End,
+		})
 	}
 	return result
 }
 
-func extractHTMLText(input string) (string, error) {
-	doc, err := html.Parse(strings.NewReader(input))
-	if err != nil {
-		return "", fmt.Errorf("HTML 解析失败: %w", err)
+func splitterStrategy(strategy string) string {
+	switch strings.ToLower(strings.TrimSpace(strategy)) {
+	case "recursive", "legacy":
+		return chunking.StrategyLegacy
+	default:
+		return chunking.StrategyAuto
 	}
-	var title string
-	var body strings.Builder
-	var walk func(*html.Node, bool)
-	walk = func(node *html.Node, skip bool) {
-		if node.Type == html.ElementNode {
-			switch strings.ToLower(node.Data) {
-			case "script", "style", "noscript", "svg":
-				skip = true
-			case "title":
-				if node.FirstChild != nil {
-					title = normalizeWhitespace(node.FirstChild.Data)
-				}
-			}
-		}
-		if !skip && node.Type == html.TextNode {
-			text := normalizeWhitespace(node.Data)
-			if text != "" {
-				if body.Len() > 0 {
-					body.WriteString("\n")
-				}
-				body.WriteString(text)
-			}
-		}
-		for child := node.FirstChild; child != nil; child = child.NextSibling {
-			walk(child, skip)
-		}
-	}
-	walk(doc, false)
-	content := normalizeWhitespace(body.String())
-	if title != "" {
-		content = strings.TrimSpace(title + "\n\n" + content)
-	}
-	if content == "" {
-		return "", fmt.Errorf("HTML 未提取到可用正文")
-	}
-	return content, nil
 }
 
 func normalizeWhitespace(input string) string {

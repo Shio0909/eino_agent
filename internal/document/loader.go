@@ -186,33 +186,28 @@ func WithSimilarityPct(pct float64) ChunkerOption {
 }
 
 // NewChunker 根据策略创建分块器
-// strategy: "recursive"=递归字符, "markdown"=Markdown 结构, "semantic"=语义分块, "auto"=根据文件扩展名自动选择
+// strategy: "auto"/"adaptive"(默认)=按文档结构自适应, "recursive"=递归字符, "markdown"=按标题切分, "semantic"=语义分块
 func NewChunker(strategy string, chunkSize, chunkOverlap int, filename string, opts ...ChunkerOption) Chunker {
 	o := &chunkerOpts{similarityThreshold: 0.25}
 	for _, opt := range opts {
 		opt(o)
 	}
 
-	ext := strings.ToLower(filepath.Ext(filename))
 	switch strategy {
 	case "markdown":
 		return NewMarkdownChunker(chunkSize, chunkOverlap)
+	case "recursive":
+		return NewRecursiveCharacterChunker(chunkSize, chunkOverlap)
 	case "semantic":
 		if o.embedder != nil {
 			sc := NewSemanticChunker(o.embedder, chunkSize)
 			sc.PercentileThreshold = o.similarityThreshold
 			return sc
 		}
-		log.Printf("[Chunker] semantic 策略需要 Embedder，退回 auto")
-		return NewChunker("auto", chunkSize, chunkOverlap, filename)
-	case "auto":
-		if ext == ".md" || ext == ".markdown" {
-			log.Printf("[Chunker] 文件 %s 使用 MarkdownChunker", filename)
-			return NewMarkdownChunker(chunkSize, chunkOverlap)
-		}
-		return NewRecursiveCharacterChunker(chunkSize, chunkOverlap)
-	default: // "recursive"
-		return NewRecursiveCharacterChunker(chunkSize, chunkOverlap)
+		log.Printf("[Chunker] semantic 策略需要 Embedder，退回 adaptive")
+		return NewAdaptiveChunker(chunkSize, chunkOverlap)
+	default: // "auto", "adaptive"
+		return NewAdaptiveChunker(chunkSize, chunkOverlap)
 	}
 }
 

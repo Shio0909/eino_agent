@@ -52,7 +52,7 @@ rag:
     retrieval_cache_ttl_minutes: 10
     chunk_size: 512
     chunk_overlap: 50
-    chunk_strategy: auto  # recursive, markdown, auto(根据文件类型自动选择), semantic
+    chunk_strategy: auto  # auto/adaptive(按文档结构自适应:标题/章节/代码块/表格), recursive(仅按分隔符), markdown(旧版按标题), semantic(需 embedding)
     enable_contextual_enrichment: true
     documents_path: ./data/documents
     # 知识库模式说明:

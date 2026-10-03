@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"eino_agent/internal/database/repository"
-	"eino_agent/internal/docreader"
 )
 
 // MCPCreateKB creates a knowledge base via MCP write tool.
@@ -74,7 +73,7 @@ func (h *Handler) MCPImportURL(ctx context.Context, kbID, rawURL, title string) 
 		return "", 0, fmt.Errorf("创建文档记录失败: %w", err)
 	}
 
-	parseOpts := docreader.DefaultParseOptions()
+	parseOpts := h.parseOptions()
 	result, err := h.docReaderCli.ParseURL(ctx, parsedURL.String(), title, parseOpts)
 	if err != nil {
 		h.markKnowledgeFailed(ctx, knowledge.ID, 0, err)

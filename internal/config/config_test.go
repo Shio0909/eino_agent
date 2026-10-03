@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -80,6 +81,25 @@ func TestValidateRejectsInvalidChunking(t *testing.T) {
 	cfg.RAG.ChunkOverlap = 100
 	if _, err := cfg.Validate(); err == nil {
 		t.Fatal("expected chunk_overlap >= chunk_size to be rejected")
+	}
+}
+
+func TestValidateChunkStrategy(t *testing.T) {
+	for _, ok := range []string{"", "auto", "adaptive", "recursive", "markdown", "semantic"} {
+		cfg := validConfig("debug")
+		cfg.RAG.ChunkStrategy = ok
+		if _, err := cfg.Validate(); err != nil {
+			t.Errorf("strategy %q should be accepted: %v", ok, err)
+		}
+	}
+	cfg := validConfig("debug")
+	cfg.RAG.ChunkStrategy = "fixed"
+	_, err := cfg.Validate()
+	if err == nil {
+		t.Fatal("an unknown chunk strategy silently chunked differently than configured; it must be rejected")
+	}
+	if !strings.Contains(err.Error(), "rag.chunk_strategy") {
+		t.Errorf("error should name the setting: %v", err)
 	}
 }
 

@@ -10,7 +10,6 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"eino_agent/internal/database/repository"
-	"eino_agent/internal/docreader"
 )
 
 func (h *Handler) ensureWikiAccess(c *gin.Context) (*repository.KnowledgeBase, bool) {
@@ -124,7 +123,7 @@ func (h *Handler) uploadWikiDocumentURL(c *gin.Context, kb *repository.Knowledge
 		return
 	}
 
-	parseOpts := docreader.DefaultParseOptions()
+	parseOpts := h.parseOptions()
 	parseOpts.EnableMultimodal = enableMultimodal
 	result, err := h.docReaderCli.ParseURL(ctx, sourceURL, title, parseOpts)
 	if err != nil {

@@ -239,9 +239,14 @@ type ParseResult struct {
 
 // ParseOptions 解析选项。
 type ParseOptions struct {
-	ChunkSize        int
-	ChunkOverlap     int
-	Separators       []string
+	ChunkSize    int
+	ChunkOverlap int
+	Separators   []string
+	// Strategy only applies to the local engine, which splits text itself.
+	// MinerU and gRPC engines chunk in their own service and ignore it.
+	// "" and "auto" pick a structure-aware split per document; "recursive"
+	// splits by separators only.
+	Strategy         string
 	EnableMultimodal bool
 }
 
@@ -251,6 +256,7 @@ func DefaultParseOptions() *ParseOptions {
 		ChunkSize:        500,
 		ChunkOverlap:     50,
 		Separators:       []string{"\n\n", "\n", "。", ".", " "},
+		Strategy:         "auto",
 		EnableMultimodal: false,
 	}
 }

@@ -54,7 +54,7 @@ flowchart LR
 - **多租户**：JWT 鉴权 + 租户隔离，知识库和会话均按租户隔离
 - **MCP 工具**：通过 MCP 协议动态挂载远程工具（Streamable HTTP / SSE / Stdio）
 - **Eino Skill**：渐进式披露（Progressive Disclosure）skill 中间件，支持按请求动态选择技能
-- **智能分块**：支持 recursive / markdown / semantic / auto 四种分块策略，可选上下文增强（LLM 生成分块摘要前缀）
+- **智能分块**：默认 `auto`(=`adaptive`) 按文档结构自适应切分（Markdown 标题 / 章节编号 / 段落句子；代码块、表格、公式、链接不会被切断；块首带标题路径；结果不合格自动降级），`rag.chunk_size` / `rag.chunk_overlap` 对所有文档来源生效。另有 recursive / markdown / semantic 可选，可选上下文增强（LLM 生成分块摘要前缀）。分块器改编自 WeKnora（MIT），见 `internal/chunking/NOTICE.md`
 - **Wiki 模式**：知识库可选 `wiki` 模式，LLM 将文件/URL 编译为可浏览的 Markdown 页面和交叉链接，并使用 PostgreSQL FTS/ILIKE 检索（适合长期沉淀的结构化知识库）
 - **记忆系统**：Redis 短期缓存 + PostgreSQL 长期记忆（跨会话）+ 会话内 Evidence Memory（追问复用上一轮 sources）
 - **安全防护**：Prompt Injection 检测 + SSRF 防护（URL 白名单/黑名单）
@@ -134,7 +134,8 @@ eino_agent/
 │   ├── cache/               # 缓存接口定义
 │   ├── rediscache/          # Redis 缓存实现（Session/Retrieval/ImportState）
 │   ├── database/            # PostgreSQL Repository
-│   ├── document/            # 文档处理（语义分块、上下文增强）
+│   ├── chunking/            # 结构感知分块（改编自 WeKnora）
+│   ├── document/            # 文档处理（分块器适配、语义分块、上下文增强）
 │   ├── docreader/           # 多模式文档解析客户端
 │   ├── codegraph/           # 代码知识图谱（索引/解析/存储）
 │   ├── graphrag/            # Neo4j GraphRAG

@@ -103,7 +103,7 @@ func TestReplacingADocxIndexesItsTextAndOnlyEmbedsWhatChanged(t *testing.T) {
 		t.Fatalf("replace: %v", err)
 	}
 
-	parsed, err := cli.ParseBytes(ctx, v2, "report.docx", "docx", docreader.DefaultParseOptions())
+	parsed, err := cli.ParseBytes(ctx, v2, "report.docx", "docx", env.h.parseOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestSyncOfADocxFileParsesItLikeAnUpload(t *testing.T) {
 		t.Fatalf("second sync: %v", err)
 	}
 
-	parsed, err := cli.ParseBytes(ctx, v2, "report.docx", "docx", docreader.DefaultParseOptions())
+	parsed, err := cli.ParseBytes(ctx, v2, "report.docx", "docx", env.h.parseOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
