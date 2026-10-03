@@ -25,7 +25,7 @@ func NewAdaptiveChunker(chunkSize, chunkOverlap int) *AdaptiveChunker {
 
 // Chunk implements Chunker.
 func (c *AdaptiveChunker) Chunk(_ context.Context, doc *RawDocument) ([]*container.Document, error) {
-	text := chunking.NormalizeLineEndings(strings.TrimSpace(doc.Content))
+	text := strings.TrimSpace(chunking.NormalizeHTMLTables(chunking.NormalizeLineEndings(doc.Content)))
 	pieces := chunking.Split(text, chunking.SplitterConfig{
 		ChunkSize:    c.ChunkSize,
 		ChunkOverlap: max(c.ChunkOverlap, 0),

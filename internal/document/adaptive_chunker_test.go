@@ -125,3 +125,38 @@ func TestAdaptiveChunkerNormalizesLineEndings(t *testing.T) {
 		}
 	}
 }
+
+func TestAdaptiveChunkerSplitsAnInlineHTMLTableBetweenRows(t *testing.T) {
+	var table strings.Builder
+	table.WriteString(`<table><tr><td colspan="3">汇总</td></tr>`)
+	for i := 0; i < 150; i++ {
+		fmt.Fprintf(&table, "<tr><td>项目%03d</td><td>数值%03d</td><td>备注说明%03d</td></tr>", i, i, i)
+	}
+	table.WriteString("</table>")
+
+	const size = 256
+	contents := chunkContents(t, "auto", "ocr.md", "# 数据\n\n"+table.String(), size, 0)
+
+	if len(contents) < 4 {
+		t.Fatalf("want the table split into several chunks, got %d", len(contents))
+	}
+	for i, c := range contents {
+		if n := utf8.RuneCountInString(c); n > 2*size {
+			t.Fatalf("chunk %d has %d runes, over 2*%d", i, n, size)
+		}
+		for _, line := range strings.Split(c, "\n") {
+			line = strings.TrimSuffix(strings.TrimSpace(line), "</table>")
+			if strings.HasPrefix(line, "<tr") && !strings.HasSuffix(line, "</tr>") {
+				t.Fatalf("chunk %d cuts a row: %q", i, line)
+			}
+		}
+	}
+}
+
+func TestAdaptiveChunkerTurnsAnInlineHTMLTableIntoMarkdown(t *testing.T) {
+	text := "# 报告\n\n<table><tr><td>指标</td><td>数值</td></tr><tr><td>营收</td><td>10亿</td></tr></table>\n\n结尾。"
+	joined := strings.Join(chunkContents(t, "auto", "ocr.md", text, 400, 0), "\n")
+	if strings.Contains(joined, "<table") || !strings.Contains(joined, "| 营收 | 10亿 |") {
+		t.Fatalf("expected a Markdown table in the chunks, got:\n%s", joined)
+	}
+}

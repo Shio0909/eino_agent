@@ -8,6 +8,11 @@ Changes from the original: the package is renamed, parent-child chunking and
 image-reference extraction are removed, logging is removed, and overlap is no
 longer cut from inside a protected span (code fence, table, math, link).
 
+The single-line, length-bounded Markdown link and image patterns follow
+WeKnora commit 473c8726b (#3404). `html_tables.go` re-implements that commit's
+HTML table normalization on `golang.org/x/net/html` instead of
+`html-to-markdown`, and pairs nested `<table>` tags.
+
 ```
 Copyright (C) 2025 Tencent. All rights reserved.
 

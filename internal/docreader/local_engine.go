@@ -365,7 +365,7 @@ func docxStyleLevel(style string) int {
 }
 
 func chunkText(text string, opts *ParseOptions) *ParseResult {
-	text = chunking.NormalizeLineEndings(strings.TrimSpace(text))
+	text = strings.TrimSpace(chunking.NormalizeHTMLTables(chunking.NormalizeLineEndings(text)))
 	if text == "" {
 		return &ParseResult{}
 	}

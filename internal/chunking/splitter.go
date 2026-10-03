@@ -108,10 +108,14 @@ func DefaultConfig() SplitterConfig {
 }
 
 // protectedPatterns are regex patterns for content that must not be split.
+//
+// Markdown links and images stay on one line and are length-bounded. Without
+// that, a stray '[' left behind by OCR pairs with a distant '](' and one
+// "protected" span swallows whole paragraphs, which then cannot be split.
 var protectedPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?s)\$\$.*?\$\$`),                                                               // LaTeX block math
-	regexp.MustCompile(`!\[[^\]]*\]\([^)]+\)`),                                                          // Markdown images
-	regexp.MustCompile(`\[[^\]]*\]\([^)]+\)`),                                                           // Markdown links
+	regexp.MustCompile(`!\[[^\]\n]{0,200}\]\([^)\n]{1,500}\)`),                                          // Markdown images
+	regexp.MustCompile(`\[[^\]\n]{1,200}\]\([^)\n]{1,500}\)`),                                           // Markdown links
 	regexp.MustCompile("(?m)[ ]*(?:\\|[^|\\n]*)+\\|[\\r\\n]+\\s*(?:\\|\\s*:?-{3,}:?\\s*)+\\|[\\r\\n]+"), // Table header+separator
 	regexp.MustCompile("(?m)[ ]*(?:\\|[^|\\n]*)+\\|[\\r\\n]+"),                                          // Table rows
 	regexp.MustCompile("(?s)```(?:\\w+)?[\\r\\n].*?```"),                                                // Fenced code blocks
