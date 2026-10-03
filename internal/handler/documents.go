@@ -296,25 +296,32 @@ func (h *Handler) UpdateDocumentChunk(c *gin.Context) {
 	}
 	var req struct {
 		Content string `json:"content" binding:"required"`
+		// ExpectedContentHash is the content_hash the editor loaded. When set,
+		// the edit is refused if the chunk has changed since, so two people
+		// editing the same text cannot silently overwrite each other.
+		ExpectedContentHash string `json:"expected_content_hash"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Content) == "" {
 		respondError(c, http.StatusBadRequest, "content 不能为空")
 		return
 	}
-	chunks, err := h.chunkRepo.GetByKnowledgeID(c.Request.Context(), docID)
+	unlock, err := h.lockDocument(c.Request.Context(), docID)
+	if err != nil {
+		respondError(c, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	defer unlock()
+	current, err := h.findDocumentChunk(c.Request.Context(), kbID, docID, chunkID)
 	if err != nil {
 		respondError(c, http.StatusInternalServerError, err.Error())
 		return
 	}
-	belongs := false
-	for _, chunk := range chunks {
-		if chunk != nil && chunk.ID == chunkID && chunk.KnowledgeBaseID == kbID {
-			belongs = true
-			break
-		}
-	}
-	if !belongs {
+	if current == nil {
 		respondError(c, http.StatusNotFound, "chunk 不存在")
+		return
+	}
+	if req.ExpectedContentHash != "" && req.ExpectedContentHash != current.ContentHash {
+		respondError(c, http.StatusConflict, "chunk 已被他人修改，请刷新后再编辑")
 		return
 	}
 	updated, err := editor.UpdateContent(c.Request.Context(), chunkID, req.Content)
@@ -353,13 +360,19 @@ func (h *Handler) RestoreChunkRevision(c *gin.Context) {
 	if _, ok := h.ensureKnowledgeBaseWriteAccess(c, c.Param("id")); !ok {
 		return
 	}
-	if !h.chunkBelongsToDocument(c, c.Param("id"), c.Param("docId"), c.Param("chunkId")) {
-		respondError(c, http.StatusNotFound, "chunk 不存在")
-		return
-	}
 	editor, ok := h.chunkRepo.(repository.ChunkEditor)
 	if !ok {
 		respondError(c, http.StatusNotImplemented, "chunk revision 未启用")
+		return
+	}
+	unlock, err := h.lockDocument(c.Request.Context(), c.Param("docId"))
+	if err != nil {
+		respondError(c, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	defer unlock()
+	if !h.chunkBelongsToDocument(c, c.Param("id"), c.Param("docId"), c.Param("chunkId")) {
+		respondError(c, http.StatusNotFound, "chunk 不存在")
 		return
 	}
 	updated, err := editor.RestoreRevision(c.Request.Context(), c.Param("chunkId"), c.Param("revisionId"))
@@ -374,20 +387,33 @@ func (h *Handler) chunkBelongsToDocument(c *gin.Context, kbID, docID, chunkID st
 	if h.chunkRepo == nil {
 		return false
 	}
-	chunks, err := h.chunkRepo.GetByKnowledgeID(c.Request.Context(), docID)
+	chunk, err := h.findDocumentChunk(c.Request.Context(), kbID, docID, chunkID)
+	return err == nil && chunk != nil
+}
+
+// findDocumentChunk returns the stored chunk with this id if it belongs to the
+// document and knowledge base, and nil if it does not exist there.
+func (h *Handler) findDocumentChunk(ctx context.Context, kbID, docID, chunkID string) (*repository.Chunk, error) {
+	chunks, err := h.chunkRepo.GetByKnowledgeID(ctx, docID)
 	if err != nil {
-		return false
+		return nil, err
 	}
 	for _, chunk := range chunks {
 		if chunk != nil && chunk.ID == chunkID && chunk.KnowledgeBaseID == kbID {
-			return true
+			return chunk, nil
 		}
 	}
-	return false
+	return nil, nil
 }
 
 // ReindexEditedChunk rebuilds only the selected chunk from its current stored
 // content, so a manual edit is not overwritten by re-parsing the source file.
+//
+// Embedding is slow and happens outside the document lock, so the text it was
+// computed from can be stale by the time it returns: the chunk may have been
+// edited again, or removed by a sync or a delete. The vector is therefore only
+// written under the lock, and only if the stored chunk still has the text that
+// was embedded. Otherwise the request fails with 409 and nothing is written.
 func (h *Handler) ReindexEditedChunk(c *gin.Context) {
 	kbID, docID, chunkID := c.Param("id"), c.Param("docId"), c.Param("chunkId")
 	if _, ok := h.ensureKnowledgeBaseWriteAccess(c, kbID); !ok {
@@ -397,33 +423,63 @@ func (h *Handler) ReindexEditedChunk(c *gin.Context) {
 		respondError(c, http.StatusServiceUnavailable, "向量索引组件未启用")
 		return
 	}
-	chunks, err := h.chunkRepo.GetByKnowledgeID(c.Request.Context(), docID)
+	ctx := c.Request.Context()
+	target, err := h.findDocumentChunk(ctx, kbID, docID, chunkID)
 	if err != nil {
 		respondError(c, http.StatusInternalServerError, err.Error())
 		return
-	}
-	var target *repository.Chunk
-	for _, chunk := range chunks {
-		if chunk != nil && chunk.ID == chunkID && chunk.KnowledgeBaseID == kbID {
-			target = chunk
-			break
-		}
 	}
 	if target == nil {
 		respondError(c, http.StatusNotFound, "chunk 不存在")
 		return
 	}
-	vectors, err := container.BatchEmbedFloat32(c.Request.Context(), h.currentEmbedder(), []string{target.Content})
+	vectors, err := container.BatchEmbedFloat32(ctx, h.currentEmbedder(), []string{target.Content})
 	if err != nil {
 		respondError(c, http.StatusBadGateway, fmt.Sprintf("embedding 失败: %v", err))
 		return
 	}
-	doc := &container.Document{ID: target.ID, Content: target.Content, Vector: vectors[0], Metadata: map[string]interface{}{
-		"knowledge_base_id": kbID, "knowledge_id": docID, "chunk_index": target.ChunkIndex,
-	}}
-	if err := h.vectorDB.Upsert(c.Request.Context(), []*container.Document{doc}); err != nil {
+
+	unlock, err := h.lockDocument(ctx, docID)
+	if err != nil {
+		respondError(c, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	defer unlock()
+	if h.knowledgeRepo != nil {
+		k, err := h.knowledgeRepo.GetByID(ctx, docID)
+		if err != nil {
+			respondError(c, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if k == nil || k.KnowledgeBaseID != kbID {
+			respondError(c, http.StatusNotFound, "文档不存在")
+			return
+		}
+	}
+	current, err := h.findDocumentChunk(ctx, kbID, docID, chunkID)
+	if err != nil {
 		respondError(c, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if current == nil {
+		respondError(c, http.StatusNotFound, "chunk 已不存在")
+		return
+	}
+	if current.Content != target.Content {
+		respondError(c, http.StatusConflict, "chunk 在重建期间被修改，本次结果已丢弃，请重新触发")
+		return
+	}
+	doc := &container.Document{ID: current.ID, Content: current.Content, Vector: vectors[0], Metadata: map[string]interface{}{
+		"knowledge_base_id": kbID, "knowledge_id": docID, "chunk_index": current.ChunkIndex,
+	}}
+	if err := h.vectorDB.Upsert(ctx, []*container.Document{doc}); err != nil {
+		respondError(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if h.retrievalCache != nil {
+		if err := h.retrievalCache.InvalidateKnowledgeBase(ctx, kbID); err != nil {
+			log.Printf("[Cache] chunk 重建后失效检索缓存失败: kb=%s doc=%s err=%v", kbID, docID, err)
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"chunk_id": chunkID, "indexed": true})
 }

@@ -678,7 +678,10 @@ KB role: viewer. `200`:
 
 ### `PATCH /api/v1/knowledge-bases/{id}/documents/{docId}/chunks/{chunkId}`
 
-KB role: editor. Body: `{"content": "..."}` (required, non-empty after trim).
+KB role: editor. Body: `{"content": "...", "expected_content_hash": "..."}`. `content` is
+required (non-empty after trim). `expected_content_hash` is optional: send the `content_hash`
+you loaded and the edit is refused with `409` if the chunk has changed since, so two editors
+cannot silently overwrite each other. The edit runs under the document's update lock.
 Edits the stored chunk text only; vectors are **not** rebuilt automatically. `200`:
 
 ```json
@@ -688,8 +691,9 @@ Edits the stored chunk text only; vectors are **not** rebuilt automatically. `20
 }
 ```
 
-`404` when the chunk does not belong to this KB/document; `501` when chunk editing is not
-enabled server-side (repository lacks the editor capability).
+`404` when the chunk does not belong to this KB/document; `409` when `expected_content_hash`
+no longer matches; `501` when chunk editing is not enabled server-side (repository lacks the
+editor capability).
 
 ### `GET /api/v1/knowledge-bases/{id}/documents/{docId}/chunks/{chunkId}/revisions`
 
@@ -716,8 +720,11 @@ KB role: editor. Restores the chunk content from a revision. `200`:
 ### `POST /api/v1/knowledge-bases/{id}/documents/{docId}/chunks/{chunkId}/reindex`
 
 KB role: editor. Re-embeds and upserts only this chunk from its current stored content.
-`200`: `{"chunk_id": "...", "indexed": true}`. `503` when embedding/vector components are
-disabled; `502` on embedding provider failure.
+`200`: `{"chunk_id": "...", "indexed": true}`. Embedding runs first; the vector is then written
+under the document's update lock, and only if the stored chunk still has the text that was
+embedded. `409` means the chunk was edited while the request was waiting on the model (nothing
+was written; trigger it again). `404` when the chunk, or its document, no longer exists.
+`503` when embedding/vector components are disabled; `502` on embedding provider failure.
 
 ### `POST /api/v1/knowledge-bases/{id}/documents/{docId}/reindex`
 
