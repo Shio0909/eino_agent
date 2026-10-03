@@ -276,6 +276,9 @@ type ChunkRepository interface {
 	GetHashesByKnowledgeID(ctx context.Context, knowledgeID string) (map[string]string, error) // content_hash → chunk_id
 	DeleteByIDs(ctx context.Context, ids []string) error
 	DeleteByKnowledgeID(ctx context.Context, knowledgeID string) error
+	// UpdateChunkIndexes renumbers chunks that stay in a document when text is
+	// inserted or removed before them (chunk id → new chunk_index).
+	UpdateChunkIndexes(ctx context.Context, indexes map[string]int) error
 }
 
 // ChunkEditor provides the optional manual-edit surface for chunk iteration.
@@ -871,7 +874,7 @@ func (r *pgChunkRepo) GetByKnowledgeID(ctx context.Context, knowledgeID string) 
 	rows, err := r.db.Query(ctx, `
 		SELECT id, knowledge_id, knowledge_base_id, chunk_index, content, content_length, content_hash, metadata, created_at
 		FROM chunks WHERE knowledge_id = $1
-		ORDER BY chunk_index
+		ORDER BY chunk_index, created_at, id
 	`, knowledgeID)
 	if err != nil {
 		return nil, err
@@ -964,6 +967,24 @@ func (r *pgChunkRepo) GetHashesByKnowledgeID(ctx context.Context, knowledgeID st
 		result[hash] = id
 	}
 	return result, rows.Err()
+}
+
+func (r *pgChunkRepo) UpdateChunkIndexes(ctx context.Context, indexes map[string]int) error {
+	if len(indexes) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(indexes))
+	positions := make([]int32, 0, len(indexes))
+	for id, index := range indexes {
+		ids = append(ids, id)
+		positions = append(positions, int32(index))
+	}
+	_, err := r.db.Pool().Exec(ctx, `
+		UPDATE chunks AS c SET chunk_index = v.idx
+		FROM (SELECT unnest($1::text[]) AS id, unnest($2::int[]) AS idx) AS v
+		WHERE c.id = v.id
+	`, ids, positions)
+	return err
 }
 
 func (r *pgChunkRepo) DeleteByIDs(ctx context.Context, ids []string) error {

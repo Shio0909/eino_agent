@@ -231,6 +231,7 @@ func (r *memoryChunkRepo) DeleteByIDs(_ context.Context, ids []string) error {
 	r.deleted = append(r.deleted, ids...)
 	return nil
 }
+func (r *memoryChunkRepo) UpdateChunkIndexes(context.Context, map[string]int) error { return nil }
 func (r *memoryChunkRepo) DeleteByKnowledgeID(_ context.Context, knowledgeID string) error {
 	r.deleteAll = append(r.deleteAll, knowledgeID)
 	return nil
@@ -280,12 +281,9 @@ func TestIncrementalSyncHandlesDuplicateChunkHashes(t *testing.T) {
 		{ID: "old-2", KnowledgeID: "doc-1", KnowledgeBaseID: "kb-1", ChunkIndex: 1, Content: chunkContent, ContentHash: oldHash},
 	}
 
-	retainedIDs, removeIDs, addIndices, err := diffChunksByOccurrence(oldChunks, []string{chunkContent, chunkContent})
-	if err != nil {
-		t.Fatalf("diffChunksByOccurrence error = %v", err)
-	}
-	if len(addIndices) != 0 || len(removeIDs) != 0 || len(retainedIDs) != 2 {
-		t.Fatalf("diff result retained=%v removed=%v added=%v, want 2 retained only", retainedIDs, removeIDs, addIndices)
+	plan := planChunkSync("doc-1", oldChunks, []indexChunk{{Content: chunkContent}, {Content: chunkContent}}, false)
+	if len(plan.Added) != 0 || len(plan.Removed) != 0 || len(plan.Retained) != 2 {
+		t.Fatalf("plan retained=%v removed=%v added=%v, want 2 retained only", plan.Retained, plan.Removed, plan.Added)
 	}
 }
 

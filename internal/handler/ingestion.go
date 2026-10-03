@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 
 	cachepkg "eino_agent/internal/cache"
 	"eino_agent/internal/config"
@@ -139,7 +138,7 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 			docreader.DefaultParseOptions(),
 		)
 		if err != nil {
-			h.markKnowledgeFailed(c.Request.Context(), knowledge.ID, 0, err)
+			h.markKnowledgeImportFailed(c.Request.Context(), knowledge.ID, err)
 			h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error(), "filename": header.Filename})
 			respondError(c, http.StatusInternalServerError, "文档解析失败: "+err.Error())
 			return
@@ -161,7 +160,7 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 		}
 		if err != nil {
 			log.Printf("[Upload] 向量化失败（文档已解析 %d 块）: %v", chunkCount, err)
-			h.markKnowledgeFailed(c.Request.Context(), knowledge.ID, chunkCount, err)
+			h.markKnowledgeImportFailed(c.Request.Context(), knowledge.ID, err)
 			h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error(), "filename": header.Filename})
 			c.JSON(http.StatusOK, gin.H{
 				"message":      "文档已解析，但向量化失败（请在设置中配置有效的 API Key）",
@@ -189,7 +188,7 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 	if replaced {
 		syncResult, syncErr := h.incrementalSync(c.Request.Context(), kbID, knowledge.ID, header.Filename, content, docHash)
 		if syncErr != nil {
-			h.markKnowledgeFailed(c.Request.Context(), knowledge.ID, 0, syncErr)
+			h.markKnowledgeImportFailed(c.Request.Context(), knowledge.ID, syncErr)
 			h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": syncErr.Error()})
 			respondError(c, http.StatusInternalServerError, "文档更新失败: "+syncErr.Error())
 			return
@@ -208,7 +207,7 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 
 	chunkCount, err := h.processPlainTextDocument(c.Request.Context(), kbID, knowledge.ID, header.Filename, content)
 	if err != nil {
-		h.markKnowledgeFailed(c.Request.Context(), knowledge.ID, chunkCount, err)
+		h.markKnowledgeImportFailed(c.Request.Context(), knowledge.ID, err)
 		h.audit(c, "doc.upload", kbID, false, map[string]interface{}{"error": err.Error()})
 		respondError(c, http.StatusInternalServerError, "文档处理失败: "+err.Error())
 		return
@@ -304,7 +303,7 @@ func (h *Handler) UploadDocumentURL(c *gin.Context) {
 
 	result, err := h.docReaderCli.ParseURL(c.Request.Context(), parsedURL.String(), title, parseOpts)
 	if err != nil {
-		h.markKnowledgeFailed(c.Request.Context(), knowledge.ID, 0, err)
+		h.markKnowledgeImportFailed(c.Request.Context(), knowledge.ID, err)
 		h.audit(c, "doc.upload_url", kbID, false, map[string]interface{}{"error": err.Error(), "url": parsedURL.String()})
 		respondError(c, http.StatusInternalServerError, "网页解析失败: "+err.Error())
 		return
@@ -325,7 +324,7 @@ func (h *Handler) UploadDocumentURL(c *gin.Context) {
 	}
 	if err != nil {
 		log.Printf("[UploadURL] 向量化失败（URL 已解析 %d 块）: %v", chunkCount, err)
-		h.markKnowledgeFailed(c.Request.Context(), knowledge.ID, chunkCount, err)
+		h.markKnowledgeImportFailed(c.Request.Context(), knowledge.ID, err)
 		h.audit(c, "doc.upload_url", kbID, false, map[string]interface{}{"error": err.Error(), "url": parsedURL.String()})
 		c.JSON(http.StatusOK, gin.H{
 			"message":      "网页已解析，但向量化失败（请在设置中配置有效的 API Key）",
@@ -503,6 +502,28 @@ func (h *Handler) markKnowledgeCompleted(ctx context.Context, knowledge *reposit
 	h.scheduleContextualEnrichment(knowledge.ID, knowledge.KnowledgeBaseID)
 }
 
+// markKnowledgeProcessing flags a document as being worked on without touching
+// its chunk count: the count is what the knowledge base total already includes.
+func (h *Handler) markKnowledgeProcessing(ctx context.Context, knowledgeID string) {
+	if knowledgeID == "" || h.knowledgeRepo == nil {
+		return
+	}
+	if err := h.knowledgeRepo.UpdateParseStatus(ctx, knowledgeID, "processing", "", h.storedChunkCount(ctx, knowledgeID)); err != nil {
+		log.Printf("[Handler] 标记文档处理中失败: id=%s err=%v", knowledgeID, err)
+	}
+}
+
+func (h *Handler) storedChunkCount(ctx context.Context, knowledgeID string) int {
+	if h.knowledgeRepo == nil {
+		return 0
+	}
+	existing, err := h.knowledgeRepo.GetByID(ctx, knowledgeID)
+	if err != nil || existing == nil {
+		return 0
+	}
+	return existing.ChunkCount
+}
+
 func (h *Handler) markKnowledgeFailed(ctx context.Context, knowledgeID string, chunkCount int, err error) {
 	if knowledgeID == "" || h.knowledgeRepo == nil || err == nil {
 		return
@@ -516,6 +537,14 @@ func (h *Handler) markKnowledgeFailed(ctx context.Context, knowledgeID string, c
 		state.ChunkCount = chunkCount
 		state.Error = err.Error()
 	})
+}
+
+// markKnowledgeImportFailed records a failed import or update and keeps the
+// stored chunk count. The count only changes when an import completes, so a
+// failed update of a document that still has its old chunks does not drift the
+// knowledge base total.
+func (h *Handler) markKnowledgeImportFailed(ctx context.Context, knowledgeID string, err error) {
+	h.markKnowledgeFailed(ctx, knowledgeID, h.storedChunkCount(ctx, knowledgeID), err)
 }
 
 func (h *Handler) enqueueFileImport(ctx context.Context, kbID, filename string, fileSize int64, reader io.Reader) (*repository.Knowledge, bool, bool, error) {
@@ -555,7 +584,7 @@ func (h *Handler) enqueueFileImport(ctx context.Context, kbID, filename string, 
 	}
 	if err := h.importQueue.Enqueue(ctx, task); err != nil {
 		_ = os.Remove(tempPath)
-		h.markKnowledgeFailed(ctx, knowledge.ID, 0, err)
+		h.markKnowledgeImportFailed(ctx, knowledge.ID, err)
 		return nil, false, false, err
 	}
 
@@ -584,7 +613,7 @@ func (h *Handler) enqueueURLImport(ctx context.Context, kbID, title, sourceURL s
 		ReplaceExisting:  replaced,
 	}
 	if err := h.importQueue.Enqueue(ctx, task); err != nil {
-		h.markKnowledgeFailed(ctx, knowledge.ID, 0, err)
+		h.markKnowledgeImportFailed(ctx, knowledge.ID, err)
 		return nil, replaced, err
 	}
 
@@ -667,26 +696,6 @@ func contentHashBytes(content []byte) string {
 	return hex.EncodeToString(h[:])
 }
 
-// deterministicChunkID 基于文档 ID、序号与内容生成稳定的 chunk ID，使重复导入/重试幂等。
-func deterministicChunkID(knowledgeID string, index int, content string) string {
-	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(fmt.Sprintf("%s:%d:%s", knowledgeID, index, contentHash(content)))).String()
-}
-
-// resetKnowledgeChunks 在全量写入前清理该文档已有的 chunk 与向量，避免重试或重建时残留旧数据。
-func (h *Handler) resetKnowledgeChunks(ctx context.Context, knowledgeID string) error {
-	if h.chunkRepo != nil {
-		if err := h.chunkRepo.DeleteByKnowledgeID(ctx, knowledgeID); err != nil {
-			return fmt.Errorf("清理旧 chunks 失败: %w", err)
-		}
-	}
-	if h.vectorDB != nil {
-		if err := h.vectorDB.DeleteByKnowledgeID(ctx, knowledgeID); err != nil {
-			return fmt.Errorf("清理旧向量失败: %w", err)
-		}
-	}
-	return nil
-}
-
 func (h *Handler) findDuplicateFileByHash(ctx context.Context, kbID, hash string) (*repository.Knowledge, error) {
 	if h.knowledgeRepo == nil || hash == "" {
 		return nil, nil
@@ -725,97 +734,16 @@ func (h *Handler) enrichChunks(ctx context.Context, docContent string, chunks []
 }
 
 func (h *Handler) processPlainTextDocument(ctx context.Context, kbID, knowledgeID, filename string, content []byte) (int, error) {
-	rawDoc := &document.RawDocument{
-		ID:      knowledgeID,
-		Source:  filename,
-		Content: string(content),
-		Metadata: map[string]interface{}{
-			"filename":     filename,
-			"size":         len(content),
-			"knowledge_id": knowledgeID,
-		},
-	}
-
-	// 构建分块器选项（语义分块需要 embedder）
-	var chunkerOpts []document.ChunkerOption
-	if (h.cfg.RAG.ChunkStrategy == "semantic" || h.cfg.RAG.ChunkStrategy == "auto") && h.currentEmbedder() != nil {
-		chunkerOpts = append(chunkerOpts, document.WithEmbedder(h.currentEmbedder()))
-		if h.cfg.RAG.SemanticSimilarityPct > 0 {
-			chunkerOpts = append(chunkerOpts, document.WithSimilarityPct(h.cfg.RAG.SemanticSimilarityPct))
-		}
-	}
-
-	chunker := document.NewChunker(
-		h.cfg.RAG.ChunkStrategy,
-		h.cfg.RAG.ChunkSize,
-		h.cfg.RAG.ChunkOverlap,
-		filename,
-		chunkerOpts...,
-	)
-	chunks, err := chunker.Chunk(ctx, rawDoc)
+	chunks, err := h.chunkPlainText(ctx, knowledgeID, filename, content)
 	if err != nil {
 		return 0, fmt.Errorf("文档分块失败: %w", err)
 	}
-
 	// 上下文富化由后台任务异步覆盖向量库内容，不阻塞基础索引。
-	contents := make([]string, len(chunks))
-	for i, chunk := range chunks {
-		contents[i] = chunk.Content
-	}
-
-	vectors, err := container.BatchEmbedFloat32(ctx, h.currentEmbedder(), contents)
+	result, err := h.applySync(ctx, kbID, knowledgeID, filename, chunks, contentHash(string(content)), syncOptions{})
 	if err != nil {
-		return len(chunks), fmt.Errorf("向量化失败: %w", err)
-	}
-
-	if err := h.resetKnowledgeChunks(ctx, knowledgeID); err != nil {
 		return len(chunks), err
 	}
-
-	for i, chunk := range chunks {
-		chunk.ID = deterministicChunkID(knowledgeID, i, chunk.Content)
-		chunk.Vector = vectors[i]
-		chunk.Metadata["knowledge_base_id"] = kbID
-		chunk.Metadata["knowledge_id"] = knowledgeID
-		chunk.Metadata["source_filename"] = filename
-		chunk.Metadata["uploaded_at"] = time.Now().Format(time.RFC3339)
-	}
-
-	// PG chunks 是 chunk 预览与增量 diff 的事实来源，先写 PG 再写向量；任一失败都返回错误，
-	// 由调用方重试（chunk ID 确定且写入前会清理旧数据，重试是幂等的）。
-	if h.chunkRepo != nil {
-		pgChunks := make([]*repository.Chunk, len(chunks))
-		for i, ch := range chunks {
-			pgChunks[i] = &repository.Chunk{
-				ID:              ch.ID,
-				KnowledgeID:     knowledgeID,
-				KnowledgeBaseID: kbID,
-				ChunkIndex:      i,
-				Content:         ch.Content,
-				ContentLength:   len(ch.Content),
-				ContentHash:     contentHash(ch.Content),
-			}
-		}
-		if err := h.chunkRepo.BatchCreate(ctx, pgChunks); err != nil {
-			return len(chunks), fmt.Errorf("写入 chunks 失败: %w", err)
-		}
-	}
-
-	if err := h.vectorDB.Upsert(ctx, chunks); err != nil {
-		return len(chunks), fmt.Errorf("存储向量失败: %w", err)
-	}
-
-	// 更新文档级内容哈希
-	if h.knowledgeRepo != nil {
-		docHash := contentHash(string(content))
-		if err := h.knowledgeRepo.UpdateContentHash(ctx, knowledgeID, docHash); err != nil {
-			log.Printf("[DualWrite][WARN] 文档 content_hash 更新失败: knowledge=%s err=%v", knowledgeID, err)
-		}
-	}
-
-	h.markContextualEnrichmentPending(ctx, knowledgeID)
-
-	return len(chunks), nil
+	return result.Added + result.Retained, nil
 }
 
 func (h *Handler) storeParsedChunks(ctx context.Context, kbID, knowledgeID, sourceFilename string, chunks []docreader.ParsedChunk) (int, error) {
@@ -870,7 +798,7 @@ func (h *Handler) ProcessImportTask(ctx context.Context, task importqueue.Task) 
 
 	if err != nil {
 		log.Printf("[ImportWorker] 失败 (attempt %d/%d): %s (%v) [%v]", task.Attempt, importqueue.MaxAttempts, task.FileName, err, elapsed)
-		h.markKnowledgeFailed(ctx, task.KnowledgeID, chunkCount, err)
+		h.markKnowledgeImportFailed(ctx, task.KnowledgeID, err)
 		return err
 	}
 
@@ -1111,85 +1039,16 @@ func (h *Handler) processAndStoreChunks(ctx context.Context, kbID, knowledgeID, 
 		state.Error = ""
 	})
 
-	// 转换为内部格式
-	if err := h.resetKnowledgeChunks(ctx, knowledgeID); err != nil {
+	result, err := h.syncChunks(ctx, kbID, knowledgeID, sourceFilename, parsedToIndexChunks(chunks), syncOptions{})
+	if err != nil {
 		return err
-	}
-
-	docs := make([]*container.Document, len(chunks))
-	contents := make([]string, len(chunks))
-	for i, chunk := range chunks {
-		chunkID := deterministicChunkID(knowledgeID, i, chunk.Content)
-		docs[i] = &container.Document{
-			ID:      chunkID,
-			Content: chunk.Content,
-			Metadata: map[string]interface{}{
-				"knowledge_base_id": kbID,
-				"knowledge_id":      knowledgeID,
-				"chunk_id":          chunkID,
-				"chunk_index":       chunk.Seq,
-				"start_pos":         chunk.Start,
-				"end_pos":           chunk.End,
-				"source_filename":   sourceFilename,
-				"uploaded_at":       time.Now().Format(time.RFC3339),
-			},
-		}
-	}
-
-	for i, doc := range docs {
-		contents[i] = doc.Content
-		doc.Metadata["source_content"] = doc.Content
-	}
-
-	// 批量向量化
-	const maxEmbedBatchSize = 64
-	vectors := make([][]float32, len(contents))
-	for start := 0; start < len(contents); start += maxEmbedBatchSize {
-		end := start + maxEmbedBatchSize
-		if end > len(contents) {
-			end = len(contents)
-		}
-
-		batchVectors, err := container.BatchEmbedFloat32(ctx, h.currentEmbedder(), contents[start:end])
-		if err != nil {
-			return err
-		}
-		copy(vectors[start:end], batchVectors)
-	}
-
-	for i, doc := range docs {
-		doc.Vector = vectors[i]
-	}
-
-	if h.chunkRepo != nil {
-		pgChunks := make([]*repository.Chunk, len(docs))
-		for i, d := range docs {
-			pgChunks[i] = &repository.Chunk{
-				ID:              d.ID,
-				KnowledgeID:     knowledgeID,
-				KnowledgeBaseID: kbID,
-				ChunkIndex:      i,
-				Content:         d.Content,
-				ContentLength:   len(d.Content),
-				ContentHash:     contentHash(d.Content),
-				StartPos:        chunks[i].Start,
-				EndPos:          chunks[i].End,
-			}
-		}
-		if err := h.chunkRepo.BatchCreate(ctx, pgChunks); err != nil {
-			return fmt.Errorf("写入 chunks 失败: %w", err)
-		}
-	}
-
-	if err := h.vectorDB.Upsert(ctx, docs); err != nil {
-		return fmt.Errorf("存储向量失败: %w", err)
 	}
 
 	// 异步构建 GraphRAG 图谱
 	if h.graphRAGService != nil {
-		graphChunks := make([]*graphrag.ChunkForGraph, len(docs))
-		for i, d := range docs {
-			graphChunks[i] = &graphrag.ChunkForGraph{ID: d.ID, Content: d.Content}
+		graphChunks := make([]*graphrag.ChunkForGraph, len(result.Chunks))
+		for i, c := range result.Chunks {
+			graphChunks[i] = &graphrag.ChunkForGraph{ID: c.ID, Content: c.Content}
 		}
 		go func() {
 			bgCtx := context.Background()
@@ -1204,6 +1063,14 @@ func (h *Handler) processAndStoreChunks(ctx context.Context, kbID, knowledgeID, 
 
 	h.markContextualEnrichmentPending(ctx, knowledgeID)
 	return nil
+}
+
+func parsedToIndexChunks(chunks []docreader.ParsedChunk) []indexChunk {
+	out := make([]indexChunk, len(chunks))
+	for i, c := range chunks {
+		out[i] = indexChunk{Content: c.Content, Start: c.Start, End: c.End}
+	}
+	return out
 }
 
 func parsedChunkContents(chunks []docreader.ParsedChunk) []string {

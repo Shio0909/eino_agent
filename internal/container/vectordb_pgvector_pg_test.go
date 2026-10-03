@@ -134,3 +134,53 @@ func TestPgVectorSearchScopedToDocumentsFindsFarAwayChunks(t *testing.T) {
 		t.Errorf("keyword search returned %v, want %v", ids(kw), want)
 	}
 }
+
+// Renumbering chunks that stay in a document must change their chunk_index and
+// nothing else: not the text, not the vector, not other chunks, and no chunk
+// outside the given ids.
+func TestPgVectorUpdateChunkIndexesTouchesOnlyTheIndex(t *testing.T) {
+	db := pgVectorTestDB(t, 3)
+	ctx := context.Background()
+
+	meta := func(doc string, index int) map[string]interface{} {
+		return map[string]interface{}{"knowledge_base_id": "kb-1", "knowledge_id": doc, "chunk_index": index, "source_filename": "a.md"}
+	}
+	if err := db.Upsert(ctx, []*Document{
+		{ID: "a", Content: "alpha", Vector: []float32{1, 0, 0}, Metadata: meta("doc", 0)},
+		{ID: "b", Content: "beta", Vector: []float32{0, 1, 0}, Metadata: meta("doc", 1)},
+		{ID: "c", Content: "gamma", Vector: []float32{0, 0, 1}, Metadata: meta("doc", 2)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.UpdateChunkIndexes(ctx, map[string]int{"a": 5, "c": 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := db.Search(ctx, []float32{1, 1, 1}, 10, SearchFilter{KnowledgeIDs: []string{"doc"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]*Document{}
+	for _, d := range got {
+		byID[d.ID] = d
+	}
+	for id, want := range map[string]float64{"a": 5, "b": 1, "c": 1} {
+		d := byID[id]
+		if d == nil {
+			t.Fatalf("chunk %s missing after renumbering", id)
+		}
+		if d.Metadata["chunk_index"] != want {
+			t.Errorf("chunk %s chunk_index = %v, want %v", id, d.Metadata["chunk_index"], want)
+		}
+		if d.Metadata["source_filename"] != "a.md" || d.Metadata["knowledge_id"] != "doc" {
+			t.Errorf("chunk %s lost other metadata: %v", id, d.Metadata)
+		}
+	}
+	if byID["a"].Content != "alpha" {
+		t.Errorf("content changed: %q", byID["a"].Content)
+	}
+	if err := db.UpdateChunkIndexes(ctx, nil); err != nil {
+		t.Errorf("empty update: %v", err)
+	}
+}

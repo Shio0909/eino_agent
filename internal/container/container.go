@@ -59,6 +59,12 @@ type VectorDBProvider interface {
 	Close() error
 }
 
+// ChunkIndexUpdater 由能就地改写 chunk 序号元数据的向量库实现。
+// 增量同步在文档中间插入内容后，保留下来的 chunk 位置会变，用它让向量里的 chunk_index 跟上。
+type ChunkIndexUpdater interface {
+	UpdateChunkIndexes(ctx context.Context, indexes map[string]int) error
+}
+
 // Document 文档
 type Document struct {
 	ID       string                 `json:"id"`

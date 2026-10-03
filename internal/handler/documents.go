@@ -7,12 +7,9 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"sort"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 
 	"eino_agent/internal/container"
 	"eino_agent/internal/database/repository"
@@ -597,7 +594,7 @@ func (h *Handler) SyncDocument(c *gin.Context) {
 		result, syncErr := h.incrementalSync(bgCtx, kbID, docID, k.FileName, newContent, newDocHash)
 		if syncErr != nil {
 			log.Printf("[Sync] 增量同步失败: doc=%s err=%v", docID, syncErr)
-			h.markKnowledgeFailed(bgCtx, docID, 0, syncErr)
+			h.markKnowledgeImportFailed(bgCtx, docID, syncErr)
 			return
 		}
 		log.Printf("[Sync] 增量同步完成: doc=%s added=%d removed=%d retained=%d",
@@ -611,63 +608,42 @@ func (h *Handler) SyncDocument(c *gin.Context) {
 	})
 }
 
-type syncResult struct {
-	Added    int
-	Removed  int
-	Retained int
-}
-
-func diffChunksByOccurrence(oldChunks []*repository.Chunk, newContents []string) ([]string, []string, []int, error) {
-	newKeyToIndex := make(map[string]int, len(newContents))
-	newHashCounts := make(map[string]int)
-	for i, content := range newContents {
-		hash := contentHash(content)
-		occurrence := newHashCounts[hash]
-		newHashCounts[hash] = occurrence + 1
-		newKeyToIndex[fmt.Sprintf("%s#%d", hash, occurrence)] = i
-	}
-
-	oldKeyToID := make(map[string]string, len(oldChunks))
-	oldHashCounts := make(map[string]int)
-	for _, chunk := range oldChunks {
-		if chunk.ContentHash == "" {
-			return nil, nil, nil, fmt.Errorf("chunk %s missing content hash", chunk.ID)
-		}
-		occurrence := oldHashCounts[chunk.ContentHash]
-		oldHashCounts[chunk.ContentHash] = occurrence + 1
-		oldKeyToID[fmt.Sprintf("%s#%d", chunk.ContentHash, occurrence)] = chunk.ID
-	}
-
-	var retainedIDs []string
-	var removeIDs []string
-	var addIndices []int
-	for oldKey, oldID := range oldKeyToID {
-		if _, exists := newKeyToIndex[oldKey]; exists {
-			retainedIDs = append(retainedIDs, oldID)
-			delete(newKeyToIndex, oldKey)
-		} else {
-			removeIDs = append(removeIDs, oldID)
-		}
-	}
-	for _, idx := range newKeyToIndex {
-		addIndices = append(addIndices, idx)
-	}
-	return retainedIDs, removeIDs, addIndices, nil
-}
-
-// incrementalSync 执行 chunk 级增量同步
+// incrementalSync re-chunks plain text with the chunker the first import uses
+// and brings the document's index in line with it.
 func (h *Handler) incrementalSync(ctx context.Context, kbID, knowledgeID, filename string, content []byte, docHash string) (*syncResult, error) {
-	if err := h.knowledgeRepo.UpdateParseStatus(ctx, knowledgeID, "processing", "", 0); err != nil {
+	chunks, err := h.chunkPlainText(ctx, knowledgeID, filename, content)
+	if err != nil {
+		return nil, fmt.Errorf("分块失败: %w", err)
+	}
+	return h.applySync(ctx, kbID, knowledgeID, filename, chunks, docHash, syncOptions{})
+}
+
+// applySync is the one way a document's chunks reach the index, for a first
+// import as much as for an update.
+func (h *Handler) applySync(ctx context.Context, kbID, knowledgeID, filename string, chunks []indexChunk, docHash string, opts syncOptions) (*syncResult, error) {
+	h.markKnowledgeProcessing(ctx, knowledgeID)
+	result, err := h.syncChunks(ctx, kbID, knowledgeID, filename, chunks, opts)
+	if err != nil {
 		return nil, err
 	}
+	if h.knowledgeRepo != nil && docHash != "" {
+		if err := h.knowledgeRepo.UpdateContentHash(ctx, knowledgeID, docHash); err != nil {
+			log.Printf("[Sync] 更新文档 content_hash 失败: knowledge=%s err=%v", knowledgeID, err)
+		}
+	}
+	h.markContextualEnrichmentPending(ctx, knowledgeID)
+	return result, nil
+}
 
-	// 重新分块
+// chunkPlainText splits text with the configured chunker.
+func (h *Handler) chunkPlainText(ctx context.Context, knowledgeID, filename string, content []byte) ([]indexChunk, error) {
 	rawDoc := &document.RawDocument{
 		ID:      knowledgeID,
 		Source:  filename,
 		Content: string(content),
 		Metadata: map[string]interface{}{
 			"filename":     filename,
+			"size":         len(content),
 			"knowledge_id": knowledgeID,
 		},
 	}
@@ -679,138 +655,15 @@ func (h *Handler) incrementalSync(ctx context.Context, kbID, knowledgeID, filena
 		}
 	}
 	chunker := document.NewChunker(h.cfg.RAG.ChunkStrategy, h.cfg.RAG.ChunkSize, h.cfg.RAG.ChunkOverlap, filename, chunkerOpts...)
-	newChunks, err := chunker.Chunk(ctx, rawDoc)
-	if err != nil {
-		return nil, fmt.Errorf("分块失败: %w", err)
-	}
-
-	newContents := make([]string, len(newChunks))
-	for i, ch := range newChunks {
-		newContents[i] = ch.Content
-	}
-
-	// Layer 2: 获取旧 chunk 哈希
-	oldChunks, err := h.chunkRepo.GetByKnowledgeID(ctx, knowledgeID)
-	if err != nil {
-		log.Printf("[Sync] 获取旧 chunk 失败，回退全量: %v", err)
-		return h.fullReindex(ctx, kbID, knowledgeID, filename, content, docHash)
-	}
-
-	retainedIDs, removeIDs, addIndices, err := diffChunksByOccurrence(oldChunks, newContents)
-	if err != nil {
-		log.Printf("[Sync] 旧 chunk 哈希不可用，回退全量: %v", err)
-		return h.fullReindex(ctx, kbID, knowledgeID, filename, content, docHash)
-	}
-
-	result := &syncResult{
-		Added:    len(addIndices),
-		Removed:  len(removeIDs),
-		Retained: len(retainedIDs),
-	}
-
-	// 删除过期 chunk（vectorDB + PG）
-	if len(removeIDs) > 0 {
-		if h.vectorDB != nil {
-			if err := h.vectorDB.Delete(ctx, removeIDs); err != nil {
-				log.Printf("[Sync] 删除旧向量失败: %v", err)
-			}
-		}
-		if err := h.chunkRepo.DeleteByIDs(ctx, removeIDs); err != nil {
-			log.Printf("[Sync] 删除旧 PG chunks 失败: %v", err)
-		}
-	}
-
-	// 嵌入并存储新 chunk
-	if len(addIndices) > 0 {
-		sort.Ints(addIndices)
-		addDocs := make([]*container.Document, len(addIndices))
-		addContents := make([]string, len(addIndices))
-		for j, idx := range addIndices {
-			ch := newChunks[idx]
-			chunkID := uuid.NewString()
-			addDocs[j] = &container.Document{
-				ID:      chunkID,
-				Content: ch.Content,
-				Metadata: map[string]interface{}{
-					"knowledge_base_id": kbID,
-					"knowledge_id":      knowledgeID,
-					"chunk_id":          chunkID,
-					"chunk_index":       idx,
-					"source_filename":   filename,
-					"uploaded_at":       time.Now().Format(time.RFC3339),
-				},
-			}
-			addContents[j] = ch.Content
-		}
-
-		// 批量向量化
-		const maxEmbedBatchSize = 64
-		vectors := make([][]float32, len(addContents))
-		for start := 0; start < len(addContents); start += maxEmbedBatchSize {
-			end := start + maxEmbedBatchSize
-			if end > len(addContents) {
-				end = len(addContents)
-			}
-			batchVectors, err := container.BatchEmbedFloat32(ctx, h.currentEmbedder(), addContents[start:end])
-			if err != nil {
-				return nil, fmt.Errorf("向量化新 chunk 失败: %w", err)
-			}
-			copy(vectors[start:end], batchVectors)
-		}
-
-		for j, doc := range addDocs {
-			doc.Vector = vectors[j]
-		}
-
-		if err := h.vectorDB.Upsert(ctx, addDocs); err != nil {
-			return nil, fmt.Errorf("存储新向量失败: %w", err)
-		}
-
-		// 双写 PG
-		pgChunks := make([]*repository.Chunk, len(addDocs))
-		for j, d := range addDocs {
-			pgChunks[j] = &repository.Chunk{
-				ID:              d.ID,
-				KnowledgeID:     knowledgeID,
-				KnowledgeBaseID: kbID,
-				ChunkIndex:      addIndices[j],
-				Content:         d.Content,
-				ContentLength:   len(d.Content),
-				ContentHash:     contentHash(d.Content),
-			}
-		}
-		if err := h.chunkRepo.BatchCreate(ctx, pgChunks); err != nil {
-			log.Printf("[Sync] PG chunks 写入失败（向量已存储）: %v", err)
-		}
-	}
-
-	// 更新文档级哈希
-	if err := h.knowledgeRepo.UpdateContentHash(ctx, knowledgeID, docHash); err != nil {
-		log.Printf("[Sync] 更新文档 content_hash 失败: %v", err)
-	}
-
-	return result, nil
-}
-
-// fullReindex 全量重建回退（当旧哈希不可用时）
-func (h *Handler) fullReindex(ctx context.Context, kbID, knowledgeID, filename string, content []byte, _ string) (*syncResult, error) {
-	// 清除所有旧数据
-	if h.vectorDB != nil {
-		if err := h.vectorDB.DeleteByKnowledgeID(ctx, knowledgeID); err != nil {
-			log.Printf("[Reindex] 清除向量旧数据失败: knowledge=%s err=%v", knowledgeID, err)
-		}
-	}
-	if h.chunkRepo != nil {
-		if err := h.chunkRepo.DeleteByKnowledgeID(ctx, knowledgeID); err != nil {
-			log.Printf("[Reindex] 清除 PG chunks 旧数据失败: knowledge=%s err=%v", knowledgeID, err)
-		}
-	}
-
-	chunkCount, err := h.processPlainTextDocument(ctx, kbID, knowledgeID, filename, content)
+	docs, err := chunker.Chunk(ctx, rawDoc)
 	if err != nil {
 		return nil, err
 	}
-	return &syncResult{Added: chunkCount, Removed: 0, Retained: 0}, nil
+	chunks := make([]indexChunk, len(docs))
+	for i, d := range docs {
+		chunks[i] = indexChunk{Content: d.Content}
+	}
+	return chunks, nil
 }
 
 // fetchDocumentContent 获取文档最新内容

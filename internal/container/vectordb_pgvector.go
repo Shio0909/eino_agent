@@ -369,6 +369,28 @@ func (db *PgVectorDB) Delete(ctx context.Context, ids []string) error {
 	return nil
 }
 
+// UpdateChunkIndexes 只改 metadata 里的 chunk_index，不动向量与内容。
+func (db *PgVectorDB) UpdateChunkIndexes(ctx context.Context, indexes map[string]int) error {
+	if len(indexes) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(indexes))
+	positions := make([]int32, 0, len(indexes))
+	for id, index := range indexes {
+		ids = append(ids, id)
+		positions = append(positions, int32(index))
+	}
+	query := fmt.Sprintf(`
+UPDATE %s AS t
+SET metadata = jsonb_set(t.metadata, '{chunk_index}', to_jsonb(v.idx)), updated_at = CURRENT_TIMESTAMP
+FROM (SELECT unnest($1::text[]) AS id, unnest($2::int[]) AS idx) AS v
+WHERE t.id = v.id`, db.tableName)
+	if err := db.pg.Exec(ctx, query, ids, positions); err != nil {
+		return fmt.Errorf("更新向量 chunk 序号失败: %w", err)
+	}
+	return nil
+}
+
 func (db *PgVectorDB) DeleteByKnowledgeID(ctx context.Context, knowledgeID string) error {
 	if err := db.pg.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE knowledge_id = $1`, db.tableName), knowledgeID); err != nil {
 		return fmt.Errorf("按文档ID删除向量失败: %w", err)

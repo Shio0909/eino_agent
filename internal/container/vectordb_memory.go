@@ -166,6 +166,21 @@ func (db *MemoryVectorDB) Delete(_ context.Context, ids []string) error {
 	return nil
 }
 
+func (db *MemoryVectorDB) UpdateChunkIndexes(_ context.Context, indexes map[string]int) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	for id, index := range indexes {
+		doc, ok := db.docs[id]
+		if !ok {
+			continue
+		}
+		meta := cloneMetadata(doc.Metadata)
+		meta["chunk_index"] = index
+		doc.Metadata = meta
+	}
+	return nil
+}
+
 func (db *MemoryVectorDB) DeleteByKnowledgeID(_ context.Context, knowledgeID string) error {
 	return db.deleteWhere("knowledge_id", knowledgeID)
 }
